@@ -216,8 +216,9 @@ password access and omits it for trusted proxy without a password.
 
 The optional `EnvironmentFile=-<agentDir>/env` is operator-owned and never read
 or written by the Driver. Provision model/channel credential lines there and
-reference them through native environment SecretRefs. Systemd reads this file
-as root; keep it `root:root 0600`. Protect the state root and SSH identity and
+reference them through native environment SecretRefs. OCC does not validate
+unbound channel references, so verify channel access separately. Systemd reads
+this file as root; keep it `root:root 0600`. Protect the state root and SSH identity and
 never put plaintext credentials in native Configuration or Installation YAML.
 
 The revision records only `{ "method": "runtime" }`; there is no Secret source,

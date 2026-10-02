@@ -39,6 +39,10 @@ identity and workspace. HTTP mode skips the app-token check. Disabled Slack
 accounts make no provider call. Validation has an eight-second request budget
 and never opens a Socket Mode connection or sends a message.
 
+A Compute Driver that cannot deliver OCC Secrets, such as SSH Compute, accepts
+an unbound environment reference as operator-provisioned and skips both checks
+for it.
+
 Failures return sanitized `CHANNEL_CREDENTIAL_*` errors with the native field
 path. App-token prefixes do not prove validity, scopes, or app/bot pairing.
 Validation checks the current values; credentials can change before runtime

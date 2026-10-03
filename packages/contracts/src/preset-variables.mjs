@@ -112,7 +112,7 @@ function tokens(text, definitions, path) {
     } else {
       const name = token[1];
       if (!Object.hasOwn(definitions, name)) {
-        fail(path, `variable ${name} is undeclared.`);
+        fail(path, `variable ${name} is undeclared; declare it under variables.`);
       }
       parts.push({ name });
     }
@@ -212,7 +212,7 @@ export function validatePresetTemplate(template) {
     }
     closedObject(definition, ["type", "description", "default"], `variables.${name}`);
     if (!["string", "number", "boolean", "password"].includes(definition.type)) {
-      fail(`variables.${name}`, "unsupported type.");
+      fail(`variables.${name}`, "type must be string, number, boolean, or password.");
     }
     if (Object.hasOwn(definition, "description") && typeof definition.description !== "string") {
       fail(`variables.${name}`, "description must be a string.");
@@ -221,7 +221,7 @@ export function validatePresetTemplate(template) {
       fail(`variables.${name}`, "password variables cannot have stored defaults.");
     }
     if (Object.hasOwn(definition, "default") && !scalar(definition.default, definition.type)) {
-      fail(`variables.${name}`, "default must match its declared type.");
+      fail(`variables.${name}`, `default must match its declared type, ${definition.type}.`);
     }
   }
   if (Object.hasOwn(template, "agent")) {

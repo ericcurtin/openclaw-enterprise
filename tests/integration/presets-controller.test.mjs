@@ -16,7 +16,13 @@ async function createFixture(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), "occ-presets-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const audit = new InMemoryAuditSink();
-  const state = new InMemoryPlatformState({ auditSink: audit });
+  let policy;
+  const state = new InMemoryPlatformState({
+    auditSink: audit,
+    // Live lookup, so people enrolled by the fixture can be bound as in Postgres.
+    resolveIAMIdentity: (identityId) =>
+      policy?.identities.find((identity) => identity.id === identityId),
+  });
   // The real filesystem Driver enforces native credential rules, including bootstrap defaults.
   const configurationDriver = new FilesystemConfigurationDriver(root);
   const fixture = await createConsoleAppFixture(t, {
@@ -25,6 +31,7 @@ async function createFixture(t, options = {}) {
     configurationDriver,
     ...options,
   });
+  policy = fixture.policy;
   await fixture.bootstrap();
   const session = await fixture.signIn();
   return { ...fixture, audit, session, state };
@@ -361,6 +368,58 @@ test("Preset admission rejects malformed templates and credential leaks while pr
   assert.ok(presetMutations.length > 0);
   assert.ok(presetMutations.every((event) => !JSON.stringify(event).includes("secretId")));
   assert.ok(presetMutations.every((event) => !JSON.stringify(event).includes(secret.ref.id)));
+});
+
+test("Preset write errors name the template field and the shape it expects", async (t) => {
+  const fixture = await createFixture(t);
+  const namespace = await fixture.createNamespace("Preset errors", { ready: true });
+  const contract = "The request does not match the operation contract:";
+  // Each rejection names one field and what it accepts, so a CLI or API user can fix it directly.
+  const cases = [
+    [
+      { agent: { name: "{{ vars.missing }}" } },
+      "Preset agent.name: variable missing is undeclared; declare it under variables.",
+    ],
+    [
+      { variables: { model: { type: "string", default: 123 } } },
+      "Preset variables.model: default must match its declared type, string.",
+    ],
+    [
+      { variables: { key: { type: "password", default: "stored" } } },
+      "Preset variables.key: password variables cannot have stored defaults.",
+    ],
+    [
+      { variables: { model: { type: "strng" } } },
+      `${contract} body /template/variables/model/type has an unsupported value (expected one of "string", "number", "boolean", "password").`,
+      [{ path: "/template/variables/model/type", code: "INVALID_VALUE" }],
+    ],
+    // A number fails each string literal on both type and value; the accepted values are still named once.
+    [
+      { variables: { model: { type: 5 } } },
+      `${contract} body /template/variables/model/type has an unsupported value (expected one of "string", "number", "boolean", "password").`,
+      [{ path: "/template/variables/model/type", code: "INVALID_VALUE" }],
+    ],
+    [
+      { variables: { model: { type: "string", default: { nested: true } } } },
+      `${contract} body /template/variables/model/default has the wrong type (expected one of string, number, boolean).`,
+      [{ path: "/template/variables/model/default", code: "INVALID_TYPE" }],
+    ],
+    [
+      { variables: { model: { type: "number", extra: 1 } } },
+      `${contract} body /template/variables/model/extra is not an accepted field.`,
+      [{ path: "/template/variables/model/extra", code: "UNKNOWN_FIELD" }],
+    ],
+  ];
+  for (const [template, message, details] of cases) {
+    const rejected = await fixture.request("POST", collection(namespace.id), {
+      body: { name: "Rejected", template },
+    });
+    assert.equal(rejected.status, 400, JSON.stringify(rejected.body));
+    assert.equal(rejected.body.error.code, "INVALID_REQUEST");
+    assert.equal(rejected.body.error.message, message);
+    assert.deepEqual(rejected.body.error.details, details);
+  }
+  assert.deepEqual((await fixture.request("GET", collection(namespace.id))).data, []);
 });
 
 test("method-only Preset authentication is a default, not an Agent credential", async (t) => {
@@ -986,6 +1045,22 @@ test("Namespace deletion removes unmodified default Presets and names what still
   const pristine = await fixture.createNamespace("Pristine defaults", { ready: true });
   const seeded = (await fixture.request("GET", collection(pristine.id))).data;
   assert.equal(seeded.length, runtime.defaultPresets.length);
+  // A grant on a seeded default is removed with it and named in its delete event.
+  const { principal: reader } = await fixture.createAccountWithPolicy("preset-grantee", () => {});
+  const role = await fixture.request("POST", `/namespaces/${pristine.id}/iam/roles`, {
+    body: { name: "Preset reader", permissions: [{ action: "read", resourceKind: "preset" }] },
+  });
+  assert.equal(role.status, 201, JSON.stringify(role.body));
+  const binding = await fixture.request("POST", `/namespaces/${pristine.id}/iam/access-bindings`, {
+    body: {
+      subjectKind: "identity",
+      subjectId: reader.id,
+      roleId: role.data.id,
+      resourceKind: "preset",
+      resourceId: seeded[0].id,
+    },
+  });
+  assert.equal(binding.status, 201, JSON.stringify(binding.body));
   const deleted = await fixture.request("DELETE", `/namespaces/${pristine.id}`);
   assert.equal(deleted.status, 202, JSON.stringify(deleted.body));
   assert.equal(deleted.data.status, "deleting");
@@ -1002,6 +1077,23 @@ test("Namespace deletion removes unmodified default Presets and names what still
   assert.deepEqual(
     cascaded.map((event) => event.resource.id).sort(),
     seeded.map((preset) => preset.id).sort(),
+  );
+  assert.deepEqual(
+    cascaded.find((event) => event.resource.id === seeded[0].id).details.removedAccessBindings,
+    [
+      {
+        id: binding.data.id,
+        subjectKind: "identity",
+        subjectId: reader.id,
+        roleId: role.data.id,
+        resourceKind: "preset",
+        resourceId: seeded[0].id,
+      },
+    ],
+  );
+  assert.equal(
+    cascaded.filter((event) => event.details.removedAccessBindings !== undefined).length,
+    1,
   );
 
   // An operator-edited default is real content: keep it and say what blocks deletion.

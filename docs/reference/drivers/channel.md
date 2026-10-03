@@ -23,7 +23,8 @@ channel credentials before API provisioning or deployment. `withSecret(binding,
 path, validate)` authorizes the exact same-Namespace Secret and supplies its value
 only inside the SecretDriver callback. Without a binding it fails, unless the
 selected Compute Driver sets `operatorProvisionedSecrets` because it cannot
-deliver OCC Secrets; then it returns without calling `validate`. Provider calls
+deliver OCC Secrets; then it returns without calling `validate`, except for
+names that a bound Secret could not target, which still fail. Provider calls
 run before the write transaction. Validation does not pin Secret versions or
 revalidate queued work.
 

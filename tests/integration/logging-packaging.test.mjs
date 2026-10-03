@@ -1,75 +1,14 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
 import { composeConfiguration } from "../helpers/compose.mjs";
-
-const execute = promisify(execFile);
-const repository = fileURLToPath(new URL("../../", import.meta.url));
-const helm = process.env.OCC_HELM_BIN ?? "helm";
-const collectorImage =
-  "docker.io/otel/opentelemetry-collector-contrib:0.159.0@sha256:1f2c54a30e713fac6b3ae77a1ec84010c2007e29ced8ec666214fc2f6739c1cc";
-const commonValues = {
-  "images.controller": `registry.example.invalid/controller@sha256:${"a".repeat(64)}`,
-  "auth.baseUrl": "https://occ.example.invalid",
-  "auth.secretName": "occ-auth",
-  "auth.secretKey": "secret",
-  "bootstrap.adminEmail": "admin@example.invalid",
-  "bootstrap.password.claimName": "occ-bootstrap-admin-password",
-  "api.clients[0].namespace": "operator-tools",
-  "api.clients[0].podLabels.app": "operator",
-  "database.cidrs[0]": "10.45.0.12/32",
-  "cluster.cidrs[0]": "10.43.0.1/32",
-};
-const loggingValues = {
-  "logging.collector.enabled": "true",
-  "logging.collector.image": collectorImage,
-  "logging.collector.configSecretName": "occ-otel-collector-config",
-  "logging.collector.envSecretName": "occ-otel-collector-exporter",
-  "logging.collector.exporter.cidr": "203.0.113.10/32",
-};
-
-async function helmAvailable() {
-  try {
-    await execute(helm, ["version", "--short"], { cwd: repository });
-    await execute("yq", ["--version"], { cwd: repository });
-    return { skip: false };
-  } catch {
-    return {
-      skip: "Install Helm and yq, or set OCC_HELM_BIN, to verify rendered logging packaging.",
-    };
-  }
-}
-
-async function render(overrides = {}) {
-  const args = [
-    "template",
-    "oce",
-    "deploy/helm/openclaw-enterprise",
-    "--namespace",
-    "openclaw-system",
-  ];
-  for (const [key, value] of Object.entries({ ...commonValues, ...overrides })) {
-    args.push("--set", `${key}=${value}`);
-  }
-  return execute(helm, args, { cwd: repository, maxBuffer: 2_000_000 });
-}
-
-async function objects(manifests) {
-  const parsed = await new Promise((resolve, reject) => {
-    const child = execFile(
-      "yq",
-      ["eval-all", "-o=json", "-I=0", ".", "-"],
-      { cwd: repository, maxBuffer: 2_000_000 },
-      (error, stdout) => (error ? reject(error) : resolve(stdout)),
-    );
-    child.stdin.end(manifests);
-  });
-  return parsed.trim().split("\n").map(JSON.parse);
-}
+import {
+  chartTooling,
+  parseProductionChart as objects,
+  productionCollectorValues as loggingValues,
+  renderProductionChart as render,
+} from "../helpers/production-chart.mjs";
 
 function composeLoggingConfiguration(environment = {}) {
   return composeConfiguration(["compose.yaml", "compose.logging.yaml"], {
@@ -102,7 +41,7 @@ function globExpression(pattern) {
   return new RegExp(`^${escaped}$`);
 }
 
-const helmTooling = await helmAvailable();
+const helmTooling = await chartTooling();
 
 test("development logging override routes only OCC-owned services through the private Collector", async () => {
   assert.equal(
@@ -178,7 +117,7 @@ test(
     const container = pod.containers[0];
 
     assert.equal(serviceAccount.automountServiceAccountToken, true);
-    assert.equal(container.image, collectorImage);
+    assert.equal(container.image, loggingValues["logging.collector.image"]);
     assert.deepEqual(container.envFrom, [{ secretRef: { name: "occ-otel-collector-exporter" } }]);
     assert.deepEqual(container.env, [
       { name: "K8S_NODE_NAME", valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } },
@@ -311,6 +250,56 @@ test(
         ({ code, stderr }) => code !== 0 && stderr.length > 0,
         description,
       );
+    }
+    const oidc = {
+      "auth.oidc.enabled": "true",
+      "auth.recoveryUserId": "Xk3u9pQ2rT7vW1yZ",
+      "auth.oidc.issuer": "https://idp.example.invalid/realms/occ",
+      "auth.oidc.authorizationUrl": "https://idp.example.invalid/realms/occ/auth",
+      "auth.oidc.tokenUrl": "https://idp.example.invalid/realms/occ/token",
+      "auth.oidc.jwksUrl": "https://idp.example.invalid/realms/occ/certs",
+    };
+    const gatewayRouting = {
+      "gatewayRouting.enabled": "true",
+      "gatewayRouting.gatewayClassName": "private-envoy-gateway",
+      "gatewayRouting.apiKeySecretName": "occ-gateway-api-key",
+    };
+    const repositoryCredentials = {
+      "repositoryCredentials.enabled": "true",
+      "repositoryCredentials.image": `registry.example.invalid/repository-credentials@sha256:${"b".repeat(64)}`,
+      "repositoryCredentials.backendId": "github-primary",
+      "repositoryCredentials.registryConfigMapName": "repository-registry-v1",
+      "repositoryCredentials.serviceConfigSecretName": "repository-config",
+      "repositoryCredentials.appKeySecretName": "repository-app-key",
+      "repositoryCredentials.tlsSecretName": "repository-tls",
+      "repositoryCredentials.publicCaSecretName": "repository-public-ca",
+      "repositoryCredentials.upstreamCidrs[0]": "198.51.100.0/24",
+    };
+    const executionCluster = {
+      "executionCluster.enabled": "true",
+      "executionCluster.apiKubeconfigSecretName": "execution-api",
+      "executionCluster.workerKubeconfigSecretName": "execution-worker",
+      "executionCluster.apiCidrs[0]": "10.44.0.2/32",
+    };
+    for (const [feature, secrets] of [
+      [oidc, ["occ-oidc-login"]],
+      [gatewayRouting, ["occ-gateway-api-key"]],
+      [
+        repositoryCredentials,
+        ["repository-config", "repository-app-key", "repository-tls", "repository-public-ca"],
+      ],
+      [executionCluster, ["execution-api", "execution-worker"]],
+    ]) {
+      await render({ ...loggingValues, ...feature });
+      for (const secret of secrets) {
+        for (const field of ["configSecretName", "envSecretName"]) {
+          await assert.rejects(
+            render({ ...loggingValues, ...feature, [`logging.collector.${field}`]: secret }),
+            ({ stderr }) => /logging\.collector Secrets must be dedicated/.test(stderr),
+            `${field}=${secret}`,
+          );
+        }
+      }
     }
   },
 );

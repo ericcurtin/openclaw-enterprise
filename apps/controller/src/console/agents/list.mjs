@@ -48,7 +48,15 @@ export function message(error, mutation = false) {
     ? "Outcome unknown. The result could not be confirmed. Refresh and inspect the saved state before trying again."
     : error.name === "TypeError" || error.name === "TimeoutError"
       ? "Request interrupted. Retry to check current access and saved state."
-      : "Service unavailable. The read could not be completed. Please retry.";
+      : "Service unavailable. The read could not be completed. Try again.";
+}
+
+// A rejected write shows the API's own sentence, which names the field to fix (for example
+// an inline model credential); other failures keep the generic status text.
+export function rejectionMessage(error, mutation = false) {
+  return error.status === 400 && error.serverMessage !== undefined
+    ? error.serverMessage
+    : message(error, mutation);
 }
 
 export function assertReadableConfiguration(resource) {

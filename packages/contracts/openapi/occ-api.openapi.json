@@ -18537,7 +18537,7 @@
         ]
       },
       "post": {
-        "description": "Requires administer permission on the requested Installation. Requires read permission on the requested Namespace. Requires read permission on the request body Agent when the AccessBinding targets that resource kind. Requires read permission on the request body AgentRevision when the AccessBinding targets that resource kind. Requires read permission on the request body Configuration when the AccessBinding targets that resource kind. Requires read permission on the request body Namespace when the AccessBinding targets that resource kind. Requires read permission on the request body Secret when the AccessBinding targets that resource kind. Requires read permission on the request body ServiceAccount when the AccessBinding targets that resource kind.",
+        "description": "Requires administer permission on the requested Installation. Requires read permission on the requested Namespace. Requires read permission on the request body Agent when the AccessBinding targets that resource kind. Requires read permission on the request body AgentRevision when the AccessBinding targets that resource kind. Requires read permission on the request body Configuration when the AccessBinding targets that resource kind. Requires read permission on the request body CredentialSource when the AccessBinding targets that resource kind. Requires read permission on the request body Namespace when the AccessBinding targets that resource kind. Requires read permission on the request body Preset when the AccessBinding targets that resource kind. Requires read permission on the request body Secret when the AccessBinding targets that resource kind. Requires read permission on the request body ServiceAccount when the AccessBinding targets that resource kind.",
         "operationId": "createIAMAccessBinding",
         "parameters": [
           {
@@ -18753,7 +18753,19 @@
           {
             "action": "read",
             "condition": "iam_binding_target",
+            "resourceKind": "credential_source",
+            "scope": "request_body"
+          },
+          {
+            "action": "read",
+            "condition": "iam_binding_target",
             "resourceKind": "namespace",
+            "scope": "request_body"
+          },
+          {
+            "action": "read",
+            "condition": "iam_binding_target",
+            "resourceKind": "preset",
             "scope": "request_body"
           },
           {
@@ -19690,47 +19702,28 @@
                               },
                               "variables": {
                                 "additionalProperties": {
-                                  "anyOf": [
-                                    {
-                                      "additionalProperties": false,
-                                      "properties": {
-                                        "description": { "type": "string" },
-                                        "type": { "const": "password", "type": "string" }
-                                      },
-                                      "required": ["type"],
-                                      "type": "object"
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "default": {
+                                      "anyOf": [
+                                        { "type": "string" },
+                                        { "type": "number" },
+                                        { "type": "boolean" }
+                                      ],
+                                      "description": "A value of the declared type. Password variables take no default."
                                     },
-                                    {
-                                      "additionalProperties": false,
-                                      "properties": {
-                                        "default": { "type": "string" },
-                                        "description": { "type": "string" },
-                                        "type": { "const": "string", "type": "string" }
-                                      },
-                                      "required": ["type"],
-                                      "type": "object"
-                                    },
-                                    {
-                                      "additionalProperties": false,
-                                      "properties": {
-                                        "default": { "type": "number" },
-                                        "description": { "type": "string" },
-                                        "type": { "const": "number", "type": "string" }
-                                      },
-                                      "required": ["type"],
-                                      "type": "object"
-                                    },
-                                    {
-                                      "additionalProperties": false,
-                                      "properties": {
-                                        "default": { "type": "boolean" },
-                                        "description": { "type": "string" },
-                                        "type": { "const": "boolean", "type": "string" }
-                                      },
-                                      "required": ["type"],
-                                      "type": "object"
+                                    "description": { "type": "string" },
+                                    "type": {
+                                      "anyOf": [
+                                        { "const": "string", "type": "string" },
+                                        { "const": "number", "type": "string" },
+                                        { "const": "boolean", "type": "string" },
+                                        { "const": "password", "type": "string" }
+                                      ]
                                     }
-                                  ]
+                                  },
+                                  "required": ["type"],
+                                  "type": "object"
                                 },
                                 "type": "object"
                               }
@@ -19895,47 +19888,28 @@
                       },
                       "variables": {
                         "additionalProperties": {
-                          "anyOf": [
-                            {
-                              "additionalProperties": false,
-                              "properties": {
-                                "description": { "type": "string" },
-                                "type": { "const": "password", "type": "string" }
-                              },
-                              "required": ["type"],
-                              "type": "object"
+                          "additionalProperties": false,
+                          "properties": {
+                            "default": {
+                              "anyOf": [
+                                { "type": "string" },
+                                { "type": "number" },
+                                { "type": "boolean" }
+                              ],
+                              "description": "A value of the declared type. Password variables take no default."
                             },
-                            {
-                              "additionalProperties": false,
-                              "properties": {
-                                "default": { "type": "string" },
-                                "description": { "type": "string" },
-                                "type": { "const": "string", "type": "string" }
-                              },
-                              "required": ["type"],
-                              "type": "object"
-                            },
-                            {
-                              "additionalProperties": false,
-                              "properties": {
-                                "default": { "type": "number" },
-                                "description": { "type": "string" },
-                                "type": { "const": "number", "type": "string" }
-                              },
-                              "required": ["type"],
-                              "type": "object"
-                            },
-                            {
-                              "additionalProperties": false,
-                              "properties": {
-                                "default": { "type": "boolean" },
-                                "description": { "type": "string" },
-                                "type": { "const": "boolean", "type": "string" }
-                              },
-                              "required": ["type"],
-                              "type": "object"
+                            "description": { "type": "string" },
+                            "type": {
+                              "anyOf": [
+                                { "const": "string", "type": "string" },
+                                { "const": "number", "type": "string" },
+                                { "const": "boolean", "type": "string" },
+                                { "const": "password", "type": "string" }
+                              ]
                             }
-                          ]
+                          },
+                          "required": ["type"],
+                          "type": "object"
                         },
                         "type": "object"
                       }
@@ -20043,47 +20017,28 @@
                             },
                             "variables": {
                               "additionalProperties": {
-                                "anyOf": [
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "description": { "type": "string" },
-                                      "type": { "const": "password", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
+                                "additionalProperties": false,
+                                "properties": {
+                                  "default": {
+                                    "anyOf": [
+                                      { "type": "string" },
+                                      { "type": "number" },
+                                      { "type": "boolean" }
+                                    ],
+                                    "description": "A value of the declared type. Password variables take no default."
                                   },
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "default": { "type": "string" },
-                                      "description": { "type": "string" },
-                                      "type": { "const": "string", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
-                                  },
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "default": { "type": "number" },
-                                      "description": { "type": "string" },
-                                      "type": { "const": "number", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
-                                  },
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "default": { "type": "boolean" },
-                                      "description": { "type": "string" },
-                                      "type": { "const": "boolean", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
+                                  "description": { "type": "string" },
+                                  "type": {
+                                    "anyOf": [
+                                      { "const": "string", "type": "string" },
+                                      { "const": "number", "type": "string" },
+                                      { "const": "boolean", "type": "string" },
+                                      { "const": "password", "type": "string" }
+                                    ]
                                   }
-                                ]
+                                },
+                                "required": ["type"],
+                                "type": "object"
                               },
                               "type": "object"
                             }
@@ -20366,47 +20321,28 @@
                             },
                             "variables": {
                               "additionalProperties": {
-                                "anyOf": [
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "description": { "type": "string" },
-                                      "type": { "const": "password", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
+                                "additionalProperties": false,
+                                "properties": {
+                                  "default": {
+                                    "anyOf": [
+                                      { "type": "string" },
+                                      { "type": "number" },
+                                      { "type": "boolean" }
+                                    ],
+                                    "description": "A value of the declared type. Password variables take no default."
                                   },
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "default": { "type": "string" },
-                                      "description": { "type": "string" },
-                                      "type": { "const": "string", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
-                                  },
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "default": { "type": "number" },
-                                      "description": { "type": "string" },
-                                      "type": { "const": "number", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
-                                  },
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "default": { "type": "boolean" },
-                                      "description": { "type": "string" },
-                                      "type": { "const": "boolean", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
+                                  "description": { "type": "string" },
+                                  "type": {
+                                    "anyOf": [
+                                      { "const": "string", "type": "string" },
+                                      { "const": "number", "type": "string" },
+                                      { "const": "boolean", "type": "string" },
+                                      { "const": "password", "type": "string" }
+                                    ]
                                   }
-                                ]
+                                },
+                                "required": ["type"],
+                                "type": "object"
                               },
                               "type": "object"
                             }
@@ -20579,47 +20515,28 @@
                       },
                       "variables": {
                         "additionalProperties": {
-                          "anyOf": [
-                            {
-                              "additionalProperties": false,
-                              "properties": {
-                                "description": { "type": "string" },
-                                "type": { "const": "password", "type": "string" }
-                              },
-                              "required": ["type"],
-                              "type": "object"
+                          "additionalProperties": false,
+                          "properties": {
+                            "default": {
+                              "anyOf": [
+                                { "type": "string" },
+                                { "type": "number" },
+                                { "type": "boolean" }
+                              ],
+                              "description": "A value of the declared type. Password variables take no default."
                             },
-                            {
-                              "additionalProperties": false,
-                              "properties": {
-                                "default": { "type": "string" },
-                                "description": { "type": "string" },
-                                "type": { "const": "string", "type": "string" }
-                              },
-                              "required": ["type"],
-                              "type": "object"
-                            },
-                            {
-                              "additionalProperties": false,
-                              "properties": {
-                                "default": { "type": "number" },
-                                "description": { "type": "string" },
-                                "type": { "const": "number", "type": "string" }
-                              },
-                              "required": ["type"],
-                              "type": "object"
-                            },
-                            {
-                              "additionalProperties": false,
-                              "properties": {
-                                "default": { "type": "boolean" },
-                                "description": { "type": "string" },
-                                "type": { "const": "boolean", "type": "string" }
-                              },
-                              "required": ["type"],
-                              "type": "object"
+                            "description": { "type": "string" },
+                            "type": {
+                              "anyOf": [
+                                { "const": "string", "type": "string" },
+                                { "const": "number", "type": "string" },
+                                { "const": "boolean", "type": "string" },
+                                { "const": "password", "type": "string" }
+                              ]
                             }
-                          ]
+                          },
+                          "required": ["type"],
+                          "type": "object"
                         },
                         "type": "object"
                       }
@@ -20726,47 +20643,28 @@
                             },
                             "variables": {
                               "additionalProperties": {
-                                "anyOf": [
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "description": { "type": "string" },
-                                      "type": { "const": "password", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
+                                "additionalProperties": false,
+                                "properties": {
+                                  "default": {
+                                    "anyOf": [
+                                      { "type": "string" },
+                                      { "type": "number" },
+                                      { "type": "boolean" }
+                                    ],
+                                    "description": "A value of the declared type. Password variables take no default."
                                   },
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "default": { "type": "string" },
-                                      "description": { "type": "string" },
-                                      "type": { "const": "string", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
-                                  },
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "default": { "type": "number" },
-                                      "description": { "type": "string" },
-                                      "type": { "const": "number", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
-                                  },
-                                  {
-                                    "additionalProperties": false,
-                                    "properties": {
-                                      "default": { "type": "boolean" },
-                                      "description": { "type": "string" },
-                                      "type": { "const": "boolean", "type": "string" }
-                                    },
-                                    "required": ["type"],
-                                    "type": "object"
+                                  "description": { "type": "string" },
+                                  "type": {
+                                    "anyOf": [
+                                      { "const": "string", "type": "string" },
+                                      { "const": "number", "type": "string" },
+                                      { "const": "boolean", "type": "string" },
+                                      { "const": "password", "type": "string" }
+                                    ]
                                   }
-                                ]
+                                },
+                                "required": ["type"],
+                                "type": "object"
                               },
                               "type": "object"
                             }

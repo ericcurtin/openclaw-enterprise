@@ -2,12 +2,12 @@ import { sha256Hex } from "../../packages/utils/src/index.ts";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import pg from "pg";
 import { NativeIAMDriver } from "../../packages/iam/src/index.ts";
 import { PostgresPlatformState } from "../../packages/occ/src/index.ts";
@@ -700,6 +700,126 @@ async function assertDeniedTraffic(description, namespaceName, podName, operatio
     }
     assert.equal(error.code, 1, `${description} must be denied by enforced NetworkPolicies`);
   }
+}
+
+async function createDnsTrafficFixture(context, peer) {
+  const namespace = peer.namespace;
+  const name = `dns-traffic-${hash(randomUUID())}`;
+  const directory = await mkdtemp(join(tmpdir(), "oce-dns-traffic-"));
+  const manifestPath = join(directory, "resources.json");
+  const image = (await resource("deployment", "coredns", "kube-system")).spec.template.spec
+    .containers[0].image;
+  const dnsService = await resource("service", "kube-dns", namespace);
+  assert.equal(dnsService.spec.publishNotReadyAddresses ?? false, false);
+  const items = [
+    {
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      metadata: { name, namespace },
+      data: {
+        Corefile: [5353, 5354]
+          .map(
+            (port) => `.:${port} {\n  hosts {\n    192.0.2.53 openshift-dns.example.test\n  }\n}`,
+          )
+          .join("\n"),
+      },
+    },
+    ...["selected", "unselected", "control"].map((role) => ({
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: {
+        name: `${name}-${role}`,
+        namespace,
+        labels: role === "selected" ? peer.podLabels : { "app.kubernetes.io/name": name },
+      },
+      spec: {
+        automountServiceAccountToken: false,
+        securityContext: {
+          runAsNonRoot: true,
+          runAsUser: 1000,
+          seccompProfile: { type: "RuntimeDefault" },
+        },
+        ...(role === "control"
+          ? {}
+          : {
+              // Keep these selected DNS peers out of the cluster DNS Service's ready endpoints.
+              // Their container readiness still verifies that the DNS listener is available.
+              readinessGates: [{ conditionType: "openclaw.dev/dns-fixture" }],
+              volumes: [{ name: "config", configMap: { name } }],
+            }),
+        containers: [
+          {
+            name: role,
+            image: role === "control" ? fixtureImage : image,
+            command:
+              role === "control"
+                ? ["node", "-e", "setInterval(() => {}, 1000)"]
+                : ["/coredns", "-conf", "/config/Corefile"],
+            securityContext: {
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: {
+                drop: ["ALL"],
+                // CoreDNS's binary has this file capability even when listening above port 1024.
+                ...(role === "control" ? {} : { add: ["NET_BIND_SERVICE"] }),
+              },
+            },
+            resources: {
+              requests: { cpu: "10m", memory: "32Mi" },
+              limits: { cpu: "100m", memory: "64Mi" },
+            },
+            ...(role === "control"
+              ? {}
+              : {
+                  volumeMounts: [{ name: "config", mountPath: "/config", readOnly: true }],
+                  readinessProbe: { tcpSocket: { port: 5353 }, periodSeconds: 1 },
+                }),
+          },
+        ],
+      },
+    })),
+  ];
+  await writeFile(manifestPath, JSON.stringify({ apiVersion: "v1", kind: "List", items }));
+  context.after(async () => {
+    try {
+      await kubectl("delete", "-f", manifestPath, "--ignore-not-found=true", "--wait=true");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+  await kubectl("create", "-f", manifestPath);
+  const [selected, unselected, control] = await Promise.all(
+    ["selected", "unselected", "control"].map((role) =>
+      waitFor(`DNS ${role} fixture listener`, async () => {
+        const pod = await resource("pod", `${name}-${role}`, namespace);
+        return pod.status.podIP !== undefined && pod.status.containerStatuses?.[0].ready
+          ? pod
+          : undefined;
+      }),
+    ),
+  );
+  const script = await readFile(
+    new URL("../fixtures/kubernetes/probe.mjs", import.meta.url),
+    "utf8",
+  );
+  const query = (source, target, protocol, port) =>
+    kubectl(
+      "exec",
+      source.metadata.name,
+      "-n",
+      source.metadata.namespace,
+      "--",
+      "node",
+      "--input-type=module",
+      "-e",
+      script,
+      "probe.mjs",
+      `dns-${protocol}`,
+      target.status.podIP,
+      String(port),
+      "openshift-dns.example.test",
+    );
+  return { selected, unselected, control, query };
 }
 
 async function assertExplicitNetworkProfile(context, namespaceName, sourcePod) {
@@ -3124,50 +3244,77 @@ test(
         const placement = placements.get(namespaceId);
         await assertReadyGateway(placement, agent.id, namespaceId, candidate);
         const imagePath = `/namespaces/${namespaceId}/agents/${agent.id}/runtime-images`;
-        const imageRead = await request("GET", imagePath);
-        assert.equal(imageRead.status, 200, JSON.stringify(imageRead.error));
-        assert.equal(imageRead.data.status, "observed");
-        const observedPods = (
-          await Promise.all(
-            [...new Set([placement, kubernetesGatewayNamespaceName(namespaceId)])].map(
-              (namespace) => resources("pods", namespace),
-            ),
-          )
-        )
-          .flat()
-          .filter(
-            (pod) =>
-              pod.metadata.labels?.["openclaw.dev/agent"] === agent.id &&
-              pod.metadata.labels?.["openclaw.dev/revision"] === candidate.id &&
-              !pod.metadata.deletionTimestamp,
-          );
-        const expectedImages = observedPods.flatMap((pod) =>
-          [
-            [pod.spec.containers, pod.status.containerStatuses],
-            [pod.spec.initContainers, pod.status.initContainerStatuses],
-            [pod.spec.ephemeralContainers, pod.status.ephemeralContainerStatuses],
-          ].flatMap(([containers = [], statuses = []]) =>
-            containers.map((container) => ({
-              workload: `${pod.metadata.namespace}/${pod.metadata.name}`,
-              container: container.name,
-              image: container.image,
-              imageId: statuses.find((state) => state.name === container.name)?.imageID ?? null,
-            })),
-          ),
-        );
-        assert.ok(expectedImages.length > 0);
         const byContainer = (a, b) =>
           `${a.workload}/${a.container}`.localeCompare(`${b.workload}/${b.container}`);
-        assert.deepEqual(
-          imageRead.data.images
-            .map(({ commit, openclawCommit, ...identity }) => {
-              assert.ok(commit === null || /^[a-f0-9]{40}$/.test(commit));
-              assert.ok(openclawCommit === null || /^[a-f0-9]{40}$/.test(openclawCommit));
-              return identity;
-            })
-            .sort(byContainer),
-          expectedImages.sort(byContainer),
-        );
+        const podImages = async () =>
+          (
+            await Promise.all(
+              [...new Set([placement, kubernetesGatewayNamespaceName(namespaceId)])].map(
+                (namespace) => resources("pods", namespace),
+              ),
+            )
+          )
+            .flat()
+            .filter(
+              (pod) =>
+                pod.metadata.labels?.["openclaw.dev/agent"] === agent.id &&
+                pod.metadata.labels?.["openclaw.dev/revision"] === candidate.id &&
+                !pod.metadata.deletionTimestamp,
+            )
+            .flatMap((pod) =>
+              [
+                [pod.spec.containers, pod.status.containerStatuses],
+                [pod.spec.initContainers, pod.status.initContainerStatuses],
+                [pod.spec.ephemeralContainers, pod.status.ephemeralContainerStatuses],
+              ].flatMap(([containers = [], statuses = []]) =>
+                containers.map((container) => ({
+                  workload: `${pod.metadata.namespace}/${pod.metadata.name}`,
+                  container: container.name,
+                  image: container.image,
+                  // Kubernetes reports an unknown image ID as "", which the API returns as null.
+                  imageId: statuses.find((state) => state.name === container.name)?.imageID || null,
+                })),
+              ),
+            )
+            .sort(byContainer);
+        // The read lists live Pods through the Kubernetes API on every call, and its
+        // contract reports a failed Kubernetes read as 503 DEPENDENCY_UNAVAILABLE for
+        // the caller to retry, so activation cannot make a single read infallible.
+        // Pod snapshots taken before and after each read bound what it could see:
+        // when they agree the Pods did not change, and the API must match exactly.
+        const imagesDeadline = Date.now() + 60_000;
+        for (;;) {
+          const before = await podImages();
+          const imageRead = await request("GET", imagePath);
+          const after = await podImages();
+          const retry = Date.now() < imagesDeadline;
+          if (
+            retry &&
+            imageRead.status === 503 &&
+            imageRead.error?.code === "DEPENDENCY_UNAVAILABLE"
+          ) {
+            await delay(500);
+            continue;
+          }
+          assert.equal(imageRead.status, 200, JSON.stringify(imageRead.error));
+          assert.equal(imageRead.data.status, "observed");
+          if (retry && !isDeepStrictEqual(before, after)) {
+            await delay(500);
+            continue;
+          }
+          assert.ok(after.length > 0);
+          assert.deepEqual(
+            imageRead.data.images
+              .map(({ commit, openclawCommit, ...identity }) => {
+                assert.ok(commit === null || /^[a-f0-9]{40}$/.test(commit));
+                assert.ok(openclawCommit === null || /^[a-f0-9]{40}$/.test(openclawCommit));
+                return identity;
+              })
+              .sort(byContainer),
+            after,
+          );
+          break;
+        }
         assert.equal((await request("GET", imagePath, undefined, { session: false })).status, 401);
         if (runtimeImage !== undefined) {
           // These bytes came through normal HTTP creation, PostgreSQL and the worker;
@@ -3260,6 +3407,68 @@ test(
         }
       }),
     );
+
+    // Use the API-deployed embedded runtime, dedicated Harness, and dedicated Gateway.
+    // Reachable CoreDNS listeners outside the peer/port grant distinguish CNI denial from an absent server.
+    const dns = await createDnsTrafficFixture(
+      context,
+      configuration.drivers.compute.configuration.network.dns,
+    );
+    const dnsSources = await Promise.all([
+      workloadPod(
+        placements.get(namespaceIds[0]),
+        `app.kubernetes.io/name=${revisionName(admitted[0])}`,
+      ),
+      workloadPod(
+        kubernetesGatewayNamespaceName(namespaceIds[0]),
+        `app.kubernetes.io/name=${gatewayName(first.id)}`,
+      ),
+      workloadPod(
+        placements.get(namespaceIds[1]),
+        `app.kubernetes.io/name=${gatewayName(embeddedDelete.id)}`,
+      ),
+    ]);
+    assert.ok(dnsSources.every(Boolean), "all API-deployed DNS source Pods must be running");
+    for (const protocol of ["udp", "tcp"]) {
+      for (const [target, port] of [
+        [dns.selected, 5353],
+        [dns.selected, 5354],
+        [dns.unselected, 5353],
+      ]) {
+        assert.equal(
+          JSON.parse(await dns.query(dns.control, target, protocol, port)).address,
+          "192.0.2.53",
+        );
+      }
+    }
+    for (const protocol of ["udp", "tcp"]) {
+      for (const source of dnsSources) {
+        assert.equal(
+          JSON.parse(await dns.query(source, dns.selected, protocol, 5353)).address,
+          "192.0.2.53",
+          `${source.metadata.name} must resolve over ${protocol} port 5353`,
+        );
+        for (const [target, port] of [
+          [dns.selected, 5354],
+          [dns.unselected, 5353],
+        ]) {
+          await assert.rejects(
+            dns.query(source, target, protocol, port),
+            (error) => {
+              assert.equal(error.code, 1);
+              assert.match(error.stderr, /ETIMEOUT|ETIMEDOUT|timed out|ECONNREFUSED/);
+              return true;
+            },
+            `${source.metadata.name} must not reach ${target.metadata.name} over ${protocol} port ${port}`,
+          );
+        }
+        assert.equal(
+          JSON.parse(await dns.query(source, dns.selected, protocol, 5353)).address,
+          "192.0.2.53",
+          "the allowed DNS control must still work after denied queries",
+        );
+      }
+    }
 
     const deploymentPath = `/namespaces/${namespaceIds[0]}/agents/${first.id}/deployments/${admitted[0].id}`;
     const persistedBefore = await waitFor("first revision deployment to settle", async () => {
@@ -3647,6 +3856,38 @@ test(
     worker = undefined;
     workerPool = undefined;
     const replacementPlacement = kubernetesNamespaceName(namespaceIds[0]);
+    // A controller upgrade leaves ready Namespaces and their old DNS grants in place.
+    // Preparing one replacement must add backend ports without narrowing access for other Agents.
+    const readyNamespace = await request("GET", `/namespaces/${namespaceIds[0]}`);
+    assert.equal(readyNamespace.data.status, "ready");
+    const legacyDnsPolicies = [];
+    for (const target of [replacementPlacement, kubernetesGatewayNamespaceName(namespaceIds[0])]) {
+      await kubectl(
+        "patch",
+        "networkpolicy",
+        "allow-dns",
+        "-n",
+        target,
+        "--type=json",
+        "-p",
+        JSON.stringify([
+          { op: "replace", path: "/spec/podSelector", value: {} },
+          {
+            op: "replace",
+            path: "/spec/egress/0/ports",
+            value: [
+              { protocol: "UDP", port: 53 },
+              { protocol: "TCP", port: 53 },
+            ],
+          },
+        ]),
+      );
+      legacyDnsPolicies.push(await resource("networkpolicy", "allow-dns", target));
+    }
+    const otherAgentPods = (await resources("pods", replacementPlacement))
+      .filter(({ metadata }) => metadata.labels?.["openclaw.dev/agent"] === second.id)
+      .map(({ metadata }) => metadata.uid)
+      .sort();
     const replacementClaim = await assertHarnessWorkspaceClaim(
       replacementPlacement,
       namespaceIds[0],
@@ -3667,6 +3908,28 @@ test(
     const replacement = await deploy(namespaceIds[0], first.id);
     await startWorker();
     await waitForActive(namespaceIds[0], first.id, replacement.id);
+    for (const previous of legacyDnsPolicies) {
+      const current = await resource("networkpolicy", "allow-dns", previous.metadata.namespace);
+      const expected = structuredClone(previous.spec);
+      expected.egress[0].ports.push(
+        { protocol: "UDP", port: 5353 },
+        { protocol: "TCP", port: 5353 },
+      );
+      assert.equal(current.metadata.uid, previous.metadata.uid);
+      assert.deepEqual(
+        current.spec,
+        expected,
+        "DNS upgrade must preserve the old selectors and other rules",
+      );
+    }
+    assert.deepEqual(
+      (await resources("pods", replacementPlacement))
+        .filter(({ metadata }) => metadata.labels?.["openclaw.dev/agent"] === second.id)
+        .map(({ metadata }) => metadata.uid)
+        .sort(),
+      otherAgentPods,
+      "preparing one Agent must not restart another Agent's Pods",
+    );
     const placement = kubernetesNamespaceName(namespaceIds[0]);
     await waitFor(`old revision deployment ${revisionName(admitted[0])} to be deleted`, () =>
       missing("deployment", revisionName(admitted[0]), placement),

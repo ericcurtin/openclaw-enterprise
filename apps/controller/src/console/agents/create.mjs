@@ -9,7 +9,7 @@ import { createPresetFields } from "./presets.mjs";
 import { createPluginDiscovery } from "./plugin-discovery.mjs";
 import { createSlackApproverField } from "./slack-approvers.mjs";
 import { renderChannels } from "../channels.mjs";
-import { link, message, namespacePath } from "./list.mjs";
+import { link, message, namespacePath, rejectionMessage } from "./list.mjs";
 
 // TODO: This starter list is intentionally hardcoded for the initial Console release.
 // Revisit catalog refresh and credential-aware discovery after the basic creation flow ships.
@@ -154,6 +154,21 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Failed provisioning codes that a retry of the same job cannot fix: the worker rejected
+// the request (a taken name, a scope or authorization rejection, a Namespace or Agent
+// lifecycle change) or the job was cancelled. Every other code, including the worker's
+// PROVISIONING_FAILED and PROVISIONING_WORK_NOT_FOUND, keeps Retry.
+const PERMANENT_PROVISIONING_CODES = new Set(["PROVISIONING_REJECTED", "PROVISIONING_CANCELLED"]);
+
+function canRetryFailedProvisioning(job) {
+  // A rejection after the job created its Agent (stopped, no versions) still owns that name;
+  // only the job's retry can finish it.
+  return (
+    !PERMANENT_PROVISIONING_CODES.has(job.error?.code) ||
+    (job.error?.code === "PROVISIONING_REJECTED" && typeof job.agentId === "string")
+  );
+}
+
 async function waitForProvisioning({ request, status, first }) {
   let current = first.provisioning ?? first;
   const jobUrl = current?.url;
@@ -170,7 +185,8 @@ async function waitForProvisioning({ request, status, first }) {
   if (current?.status !== "succeeded") {
     const error = new Error(current?.error?.message ?? "Provisioning did not complete.");
     error.provisioningTerminal = true;
-    error.canRetryProvisioning = current?.status === "failed";
+    error.provisioningFailed = current?.status === "failed";
+    error.canRetryProvisioning = error.provisioningFailed && canRetryFailedProvisioning(current);
     error.provisioningUrl = current?.url ?? jobUrl;
     throw error;
   }
@@ -898,7 +914,10 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
   let capabilityDiscoveryFailed = false;
   const provisionableExecutionModes = new Set();
   let nativeWorkersAvailable = false;
-  const provisioningRequestId = createClientRequestId();
+  let provisioningRequestId = createClientRequestId();
+  // The API admitted (or may have admitted) a job under provisioningRequestId. Create Agent
+  // must then resend the same plan: the API answers an edited one with 409 "different plan".
+  let requestAdmitted = false;
   let provisioningAttempt = null;
   const capabilityStatus = element(
     "p",
@@ -1263,12 +1282,17 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
     mode.value === "dedicated" && provisionableExecutionModes.has(mode.value);
   const updateControls = () => {
     const saved = Boolean(savedConfiguration || savedAgent || provisioningAttempt);
+    const planLocked =
+      pending ||
+      Boolean(savedAgent) ||
+      Boolean(provisioningAttempt) ||
+      outcomeUnknown ||
+      requestAdmitted;
     for (const node of form.querySelectorAll("button, input, select, textarea")) {
       if (repositories?.section.contains(node)) {
         continue;
       }
-      node.disabled =
-        pending || Boolean(savedAgent) || Boolean(provisioningAttempt) || outcomeUnknown;
+      node.disabled = planLocked;
     }
     // Unsaved Agent fields remain editable after a known rejection; reuse the saved Configuration.
     for (const node of [
@@ -1287,10 +1311,8 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
       node.disabled = pending;
     }
     updatePluginDiscovery();
-    pluginFields.setDisabled(
-      pending || Boolean(savedAgent) || Boolean(provisioningAttempt) || outcomeUnknown,
-    );
-    channelEditor.toggleAttribute("inert", pending || saved || outcomeUnknown);
+    pluginFields.setDisabled(planLocked);
+    channelEditor.toggleAttribute("inert", planLocked || saved);
     channelEditor.setAttribute("aria-busy", pending ? "true" : "false");
     const usesPat = (binding?.method ?? authMethod.value) === "codex_pat";
     const usesOAuth = (binding?.method ?? authMethod.value) === "oauth";
@@ -1299,7 +1321,7 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
       modelCredentialSecret = oauthLogin.source;
     }
     oauthLogin.setActive(usesOAuth && !binding);
-    oauthLogin.setDisabled(pending || saved || outcomeUnknown);
+    oauthLogin.setDisabled(planLocked || saved);
     mode.disabled ||=
       harness.value === "codex" ||
       nativeProvider.value === "anthropic" ||
@@ -1370,16 +1392,7 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
       : "API key Secret";
     modelCredentialPicker.setRequired(!binding && !passwordAuth && !usesOAuth);
     modelCredentialPicker.setDisabled(
-      pending ||
-        Boolean(
-          binding ||
-          passwordAuth ||
-          usesOAuth ||
-          savedConfiguration ||
-          savedAgent ||
-          provisioningAttempt,
-        ) ||
-        outcomeUnknown,
+      planLocked || Boolean(binding || passwordAuth || usesOAuth || savedConfiguration),
     );
     if (usesPat) {
       apiKey.placeholder = "at-…";
@@ -1423,13 +1436,7 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
     }
     reloadRepositories.disabled = pending || outcomeUnknown;
     startNewDraft.disabled = pending || outcomeUnknown;
-    repositories.setDisabled(
-      pending ||
-        outcomeUnknown ||
-        Boolean(savedAgent) ||
-        Boolean(provisioningAttempt) ||
-        repositoryRetryLocked(),
-    );
+    repositories.setDisabled(planLocked || repositoryRetryLocked());
     submit.disabled =
       (!savedAgent &&
         (repositoryRetryLocked() ||
@@ -1507,6 +1514,12 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
   }
   void loadInstallationCapabilities();
   async function submitProvisioningAttempt(attempt) {
+    // A retry of a job known to have failed. Read before the request: an admitted first
+    // attempt also gains a retry URL, and after an unknown outcome the job may have
+    // succeeded (recovering), so a refusal there must keep the request ID to recover it.
+    const viaRetry = attempt.retryUrl !== undefined;
+    const retrying = viaRetry && !outcomeUnknown;
+    const recovering = viaRetry && outcomeUnknown;
     pending = true;
     outcomeUnknown = false;
     updateControls();
@@ -1538,17 +1551,30 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
         mutationStarted &&
         !error.provisioningTerminal &&
         ![400, 403, 404, 409, 429].includes(error.status);
+      // The API refuses to retry a job whose Namespace or Agent lifecycle changed, or
+      // that was cancelled or handed off; that job can never finish.
+      const retryRefused = retrying && error.status === 409;
       const detail =
         outcomeUnknown && attempt.acknowledged
-          ? "Outcome unknown after provisioning admission. Retry resubmits the same request ID and saved references so the API can recover the job."
+          ? "Outcome unknown after provisioning admission. Retry resumes the accepted provisioning job, or retries it if it failed. If the API refuses because the job finished, select Create Agent to resend the same request ID."
           : outcomeUnknown
             ? "Outcome unknown. Retry resubmits the same request ID and saved references."
             : error.provisioningTerminal && error.canRetryProvisioning
               ? `${error.message} Retry uses the accepted provisioning job.`
-              : error.status === undefined && error.message
-                ? error.message
-                : message(error, mutationStarted);
+              : error.provisioningFailed
+                ? `${error.message} Select Create Agent to submit a new request.`
+                : retryRefused
+                  ? "The provisioning job can no longer be retried. Select Create Agent to submit a new request."
+                  : error.status === undefined && error.message
+                    ? error.message
+                    : recovering && error.status === 409
+                      ? "The provisioning job can no longer be retried; it may have finished. Select Create Agent to resend the same request ID and open its result."
+                      : rejectionMessage(error, mutationStarted);
       feedback.textContent = detail + (error.requestId ? ` Request ID: ${error.requestId}` : "");
+      // A 400 to an unacknowledged request means the API never admitted it: a resend of
+      // an admitted request returns that job before validation.
+      requestAdmitted =
+        attempt.acknowledged || outcomeUnknown || (requestAdmitted && error.status !== 400);
       if (error.provisioningTerminal && error.canRetryProvisioning) {
         provisioningAttempt = {
           ...attempt,
@@ -1556,6 +1582,11 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
         };
       } else if (!outcomeUnknown) {
         provisioningAttempt = null;
+        if (error.provisioningFailed || retryRefused) {
+          // The failed job keeps this request ID; an edited form needs a new one.
+          provisioningRequestId = createClientRequestId();
+          requestAdmitted = false;
+        }
       }
     } finally {
       if (context.isCurrent()) {
@@ -1662,13 +1693,16 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
     updateControls();
     feedback.textContent = "";
     let mutationStarted = false;
+    let creatingSecret = false;
     try {
       if (passwordAuth && !usesOAuth && !savedSecret) {
         mutationStarted = true;
+        creatingSecret = true;
         savedSecret = await request(`${namespacePath(namespaceId)}/secrets`, {
           method: "POST",
           body: { name: body.name, value: apiKey.value },
         });
+        creatingSecret = false;
         apiKey.value = "";
         apiKey.required = false;
         if (!context.isCurrent()) {
@@ -1747,9 +1781,11 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
       }
       const detail = savedAgent
         ? `The Agent was created, but credential access is not confirmed. ${message(error)} Retry credential access, or open the saved Agent and ask an administrator to check access to its saved model and channel Secrets.`
-        : error.status === 409 && savedConfiguration
-          ? "Agent creation conflicts with the saved state. Check the Agent name and selections, then try again."
-          : message(error, mutationStarted);
+        : error.status === 409 && creatingSecret && error.code !== "NAMESPACE_NOT_READY"
+          ? `A Secret named "${body.name}" already exists in this Namespace, possibly from an earlier Agent with this name. Choose another Agent name, delete that Secret, or select Start over, choose the Preset again, and set its Secret source to Use existing Secret.`
+          : error.status === 409 && savedConfiguration
+            ? "Agent creation conflicts with the saved state. Check the Agent name and selections, then try again."
+            : rejectionMessage(error, mutationStarted);
       outcomeUnknown = mutationStarted && ![400, 403, 404, 409, 429].includes(error.status);
       const knownRejection = [400, 403, 404, 409, 429].includes(error.status);
       if (!savedAgent && savedConfiguration && knownRejection) {

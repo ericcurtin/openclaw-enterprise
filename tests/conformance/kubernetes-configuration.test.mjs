@@ -9,6 +9,7 @@ import {
   KubernetesConfigurationDriver,
   kubernetesConfigurationName,
 } from "../../apps/controller/src/drivers/configuration/kubernetes/index.ts";
+import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
 
 const namespaceId = "ns_00000000-0000-4000-8000-000000000001";
 const configuration = {
@@ -339,7 +340,15 @@ test("the official Kubernetes client rejects ambiguous identities and insecure A
     { name: "missing-user", users: [] },
     { name: "plaintext-api", server: "http://127.0.0.1:1" },
     { name: "unverified-tls", skipTLSVerify: true },
-    { name: "embedded-credentials", server: "https://user:password@127.0.0.1:1" },
+    {
+      name: "embedded-credentials",
+      server: syntheticCredentialUrl({
+        username: "user",
+        password: "password",
+        host: "127.0.0.1",
+        port: 1,
+      }),
+    },
     { name: "unexpected-api-path", server: "https://127.0.0.1:1/untrusted" },
   ]) {
     const path = join(directory, `${scenario.name}.json`);
@@ -401,7 +410,10 @@ test("Kubernetes Configuration rejects literal model credentials before writes a
     const unsafe = { ...configuration, values };
     for (const operation of ["create", "update"]) {
       await assert.rejects(driver[operation](unsafe), (error) => {
-        assert.match(error.message, /Model credentials must use unresolved references/);
+        assert.match(
+          error.message,
+          /holds a credential value inline, where a reference is required/,
+        );
         assert.equal(error.message.includes(sentinel), false);
         return true;
       });

@@ -20,6 +20,7 @@ import {
   namespacePath,
   link,
   message,
+  rejectionMessage,
   assertReadableConfiguration,
 } from "./list.mjs";
 import {
@@ -205,6 +206,13 @@ function createDeploymentStatusPanel(
   const section = element("section", { className: "agent-card deployment-status" });
   const state = { loading: false, status: null, error: null, overviewError: false };
   let pollTimer = null;
+
+  // A poll that fired while the view was retained stopped; restoring the view re-arms it.
+  context.onResume?.(() => {
+    if (section.isConnected) {
+      schedulePoll();
+    }
+  });
 
   // Queued and running records are reread until they record a result or a read fails.
   function schedulePoll() {
@@ -664,6 +672,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
   context.setTitle(agent.name);
   let deleting = agent.status === "deleting";
   let currentRevisionId = agent.activeRevisionId;
+  let currentRuntimeState = agent.desiredRuntimeState;
   let visibleRevisions = [];
   // True once the readable version list loaded; until then nothing counts as hidden.
   let visibleRevisionsLoaded = false;
@@ -852,13 +861,14 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
     tabs.append(control);
   }
   detailPane.append(detailHeading, versionEvidence, tabs, content);
+  const nativeAdmin = renderNativeAdminAccess(context, path);
   view.replaceChildren(
     header,
     identity,
     currentSummary,
     statusLine,
     deploymentStatus,
-    renderNativeAdminAccess(context, path),
+    nativeAdmin.section,
     // Sharing policy reads need Installation administration and a denial is audited, so
     // skip the panel when the session probe already showed that access is missing.
     ...(context.installationAdmin === false ? [] : [renderAgentAccess(context, agent)]),
@@ -1067,8 +1077,16 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
       showDeleting();
       return;
     }
+    const servingChanged =
+      freshAgent.activeRevisionId !== currentRevisionId ||
+      freshAgent.desiredRuntimeState !== currentRuntimeState;
     currentRevisionId = freshAgent.activeRevisionId;
+    currentRuntimeState = freshAgent.desiredRuntimeState;
     stopPanel.updateAgent(freshAgent);
+    if (servingChanged) {
+      // Native admin access depends on the serving version, so a finished deployment rereads it.
+      nativeAdmin.refresh();
+    }
     renderOverview({ status: "fulfilled", value: revisions }, snapshot);
     renderDetailHeading();
     const notice = content.querySelector(".version-selection-notice");
@@ -2013,6 +2031,14 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
         if (!form.reportValidity() || save.disabled) {
           return;
         }
+        let harnessAuth;
+        try {
+          harnessAuth = savedAuthentication?.harnessAuth ?? (await auth.readBinding());
+        } catch (error) {
+          // Incomplete fields (no Secret, unfinished ChatGPT sign-in) say what to do next.
+          feedback.textContent = error.message;
+          return;
+        }
         save.disabled = true;
         pending = true;
         reload.disabled = true;
@@ -2024,7 +2050,6 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
           : "Saving authentication…";
         let mutationStarted = false;
         try {
-          const harnessAuth = savedAuthentication?.harnessAuth ?? (await auth.readBinding());
           const current = await request(path);
           if (!context.isCurrent()) {
             return;
@@ -2482,7 +2507,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
           context.onExpired();
           return;
         }
-        feedback.textContent = message(error, mutationStarted);
+        feedback.textContent = rejectionMessage(error, mutationStarted);
         feedbackLocked = true;
         outcomeUnknown = mutationStarted && ![400, 403, 404, 409, 429].includes(error.status);
       } finally {

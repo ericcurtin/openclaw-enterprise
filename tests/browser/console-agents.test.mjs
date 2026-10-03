@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { FilesystemConfigurationDriver } from "../../apps/controller/src/drivers/configuration/filesystem/index.ts";
 import { CodexPluginDriver } from "../../apps/controller/src/drivers/plugin/index.ts";
 import {
   WORKSPACE_DEFAULTS,
@@ -30,6 +33,7 @@ import {
   secretPostRequests,
   selectSecret,
   repositoryCheckbox,
+  waitForInputValue,
 } from "./console-agents-browser-helpers.mjs";
 import {
   STARTER_CONTROL_UI,
@@ -402,11 +406,7 @@ test("Agent creation stores its API key separately, grants exact access, and sav
   await page.getByRole("button", { name: "Credentials", exact: true }).click();
   const savedSecretInput = page.getByLabel("API key Secret");
   assert.equal(await savedSecretInput.evaluate((node) => node.tagName), "INPUT");
-  await page.waitForFunction(
-    (name) => globalThis.document.querySelector("#harness-auth-secret")?.value === name,
-    secret.name,
-  );
-  assert.equal(await savedSecretInput.inputValue(), secret.name);
+  await waitForInputValue(savedSecretInput, secret.name);
   const deniedBinding = page.waitForResponse(
     (response) =>
       response.url() === `${fixture.origin}/namespaces/${namespace.id}/agents/${created.data.id}` &&
@@ -1961,6 +1961,300 @@ test("Dedicated Agent creation reuses separately saved Secret references after p
   );
 });
 
+test("Dedicated Agent creation offers Retry only for a transient provisioning failure", async (t) => {
+  const fixture = await createConsoleAppFixture(t);
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Provision outcomes", { ready: true });
+  const { page } = await newPage(t, fixture);
+  await routeInstallationProvisioning(page, fixture);
+  await page.route(`**/namespaces/${namespace.id}/agents/repository-options`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [], meta: { requestId: "req_repository_choices" } }),
+    }),
+  );
+  const updatedAt = new Date().toISOString();
+  const json = (data, status = 200) => ({
+    status,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data,
+      meta: { requestId: "req_00000000-0000-4000-8000-000000000001" },
+    }),
+  });
+  // Each accepted request fails in the worker: first a taken name (permanent), then an
+  // unavailable dependency (transient). Its retry is then rejected after the job created
+  // the Agent, which only the job's retry can finish, and the next retry is refused
+  // because the Agent's lifecycle changed. The third job is cancelled by Stop after it
+  // created its Agent (permanent). The fourth job's status is first unreadable, then it
+  // has succeeded.
+  // Each job that gets far enough creates its own Agent.
+  const agentIds = [2, 3, 4].map((job) => `agt_00000000-0000-4000-8000-00000000c0d${job}`);
+  const failures = [
+    {
+      code: "PROVISIONING_REJECTED",
+      message: "An Agent with this name already exists in this Namespace. Choose a different name.",
+    },
+    {
+      code: "PROVISIONING_DEPENDENCY_UNAVAILABLE",
+      message: "Agent provisioning could not complete.",
+    },
+    {
+      code: "PROVISIONING_CANCELLED",
+      message: "Provisioning was cancelled. Create a new Agent to provision again.",
+      agentId: agentIds[1],
+    },
+  ];
+  const bodies = [];
+  let provisionPosts = 0;
+  await page.route(`**/namespaces/${namespace.id}/agents/provision`, async (route, request) => {
+    provisionPosts += 1;
+    // The first request is lost in transit and its resend is rejected at admission, so
+    // the API never admitted that request ID.
+    if (provisionPosts === 1) {
+      await route.abort("failed");
+      return;
+    }
+    if (provisionPosts === 2) {
+      await route.fulfill({
+        status: 400,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: {
+            code: "INVALID_REQUEST",
+            message: "The request does not match the operation contract: /name is too long.",
+          },
+          meta: { requestId: "req_00000000-0000-4000-8000-000000000400" },
+        }),
+      });
+      return;
+    }
+    const body = request.postDataJSON();
+    // Like the API, a known request ID returns its existing job.
+    const work =
+      bodies.findIndex((earlier) => earlier.requestId === body.requestId) + 1 || bodies.length + 1;
+    bodies.push(body);
+    const url = `/namespaces/${namespace.id}/agents/provision/work_${work}`;
+    await route.fulfill(
+      json(
+        {
+          provisioning: {
+            workId: `work_${bodies.length}`,
+            status: "queued",
+            phase: "accepted",
+            attemptCount: 0,
+            updatedAt,
+            url,
+          },
+        },
+        202,
+      ),
+    );
+  });
+  let retries = 0;
+  await page.route(`**/namespaces/${namespace.id}/agents/provision/work_2/retry`, async (route) => {
+    retries += 1;
+    if (retries > 1) {
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: {
+            code: "RESOURCE_CONFLICT",
+            message: "The requested platform resource already exists.",
+          },
+          meta: { requestId: "req_00000000-0000-4000-8000-000000000409" },
+        }),
+      });
+      return;
+    }
+    await route.fulfill(
+      json(
+        {
+          provisioning: {
+            workId: "work_2",
+            status: "failed",
+            phase: "transport",
+            attemptCount: 2,
+            updatedAt,
+            agentId: agentIds[0],
+            url: `/namespaces/${namespace.id}/agents/provision/work_2`,
+            error: {
+              code: "PROVISIONING_REJECTED",
+              message: "Agent provisioning could not complete.",
+            },
+          },
+        },
+        202,
+      ),
+    );
+  });
+  // The job succeeded while its status was unreadable, so the API refuses its retry.
+  await page.route(`**/namespaces/${namespace.id}/agents/provision/work_4/retry`, (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "RESOURCE_CONFLICT",
+          message: "Provisioning cannot retry after cancellation or deployment handoff.",
+        },
+        meta: { requestId: "req_00000000-0000-4000-8000-000000000409" },
+      }),
+    }),
+  );
+  let work4Reads = 0;
+  await page.route(`**/namespaces/${namespace.id}/agents/provision/work_*`, async (route) => {
+    const index = Number(new URL(route.request().url()).pathname.split("_").at(-1));
+    const url = `/namespaces/${namespace.id}/agents/provision/work_${index}`;
+    if (index === 4) {
+      work4Reads += 1;
+      await route.fulfill(
+        work4Reads === 1
+          ? {
+              status: 503,
+              contentType: "application/json",
+              body: JSON.stringify({
+                error: { code: "DEPENDENCY_UNAVAILABLE", message: "Unavailable." },
+                meta: { requestId: "req_00000000-0000-4000-8000-000000000503" },
+              }),
+            }
+          : json({
+              workId: "work_4",
+              status: "succeeded",
+              phase: "handoff",
+              attemptCount: 1,
+              updatedAt,
+              agentId: agentIds[2],
+              revisionId: "rev_00000000-0000-4000-8000-00000000c0de",
+              url,
+            }),
+      );
+      return;
+    }
+    const { agentId: createdAgentId, ...error } = failures[index - 1];
+    await route.fulfill(
+      json({
+        workId: `work_${index}`,
+        status: "failed",
+        phase: "accepted",
+        attemptCount: 1,
+        updatedAt,
+        ...(createdAgentId === undefined ? {} : { agentId: createdAgentId }),
+        url,
+        error,
+      }),
+    );
+  });
+
+  await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
+  await page.getByRole("heading", { name: "Create Agent" }).waitFor();
+  await page.getByRole("button", { name: "Start without Preset" }).click();
+  await page.getByLabel("Agent name").fill("Taken name");
+  await page.getByLabel("Authentication method").selectOption("codex_pat");
+  await createModelCredentialSecret(page, "model-secret-value");
+  await page.getByLabel("Model", { exact: true }).selectOption("gpt-6-sol");
+  const retry = page.getByRole("button", { name: "Retry provisioning request" });
+  // Longer than the API's 200-character limit, so a resend that reaches validation fails.
+  await page.getByLabel("Agent name").fill("n".repeat(201));
+  await page.getByRole("button", { name: "Create Agent" }).click();
+  await page
+    .getByText(/^Outcome unknown\. Retry resubmits the same request ID and saved references\./)
+    .waitFor();
+  assert.equal(await page.getByLabel("Agent name").isDisabled(), true);
+  // A 400 to the resend shows the request was never admitted, so the form unlocks.
+  await retry.click();
+  await page
+    .getByText(/^The request does not match the operation contract: \/name is too long\./)
+    .waitFor();
+  assert.equal(await retry.isVisible(), false);
+  assert.equal(await page.getByLabel("Agent name").isDisabled(), false);
+  await page.getByLabel("Agent name").fill("Taken name");
+  await page.getByRole("button", { name: "Create Agent" }).click();
+  await page
+    .getByText(
+      "An Agent with this name already exists in this Namespace. Choose a different name. Select Create Agent to submit a new request.",
+    )
+    .waitFor();
+  assert.equal(await retry.isVisible(), false);
+  assert.equal(await page.getByLabel("Agent name").isDisabled(), false);
+
+  await page.getByLabel("Agent name").fill("Free name");
+  await page.getByRole("button", { name: "Create Agent" }).click();
+  await page
+    .getByText("Agent provisioning could not complete. Retry uses the accepted provisioning job.")
+    .waitFor();
+  assert.equal(await retry.isVisible(), true);
+  assert.equal(await page.getByLabel("Agent name").isDisabled(), true);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[1].name, "Free name");
+  // The failed job keeps its request ID, so the edited form submits a new one with the
+  // same saved credential.
+  assert.notEqual(bodies[1].requestId, bodies[0].requestId);
+  assert.deepEqual(bodies[1].harnessAuth, bodies[0].harnessAuth);
+
+  const retried = page.waitForResponse((response) => response.url().endsWith("/work_2/retry"));
+  await retry.click();
+  await retried;
+  await page.getByRole("button", { name: "Retry provisioning request", disabled: false }).waitFor();
+  assert.equal(retries, 1);
+  assert.equal(await retry.isVisible(), true);
+  assert.equal(await page.getByLabel("Agent name").isDisabled(), true);
+
+  // A refused retry ends that job: Create Agent submits a new request ID instead of
+  // replaying the failed job.
+  await retry.click();
+  await page
+    .getByText(
+      "The provisioning job can no longer be retried. Select Create Agent to submit a new request.",
+    )
+    .waitFor();
+  assert.equal(retries, 2);
+  assert.equal(await retry.isVisible(), false);
+  assert.equal(await page.getByLabel("Agent name").isDisabled(), false);
+  await page.getByRole("button", { name: "Create Agent" }).click();
+  await page
+    .getByText(
+      "Provisioning was cancelled. Create a new Agent to provision again. Select Create Agent to submit a new request.",
+    )
+    .waitFor();
+  assert.equal(bodies.length, 3);
+  assert.notEqual(bodies[2].requestId, bodies[1].requestId);
+  // A cancelled job cannot be retried either; the next submit uses a new request ID.
+  assert.equal(await retry.isVisible(), false);
+  assert.equal(await page.getByLabel("Agent name").isDisabled(), false);
+  await page.getByRole("button", { name: "Create Agent" }).click();
+  // Retry calls the job's retry endpoint, which cannot recover a finished job; the text
+  // must point at Create Agent for that case.
+  await page
+    .getByText(
+      /^Outcome unknown after provisioning admission\. Retry resumes the accepted provisioning job, or retries it if it failed\. If the API refuses because the job finished, select Create Agent to resend the same request ID\./,
+    )
+    .waitFor();
+  assert.equal(bodies.length, 4);
+  assert.notEqual(bodies[3].requestId, bodies[2].requestId);
+  // After an unknown outcome a refused retry may mean the job succeeded, so the request
+  // ID is kept and Create Agent recovers the job instead of starting a new one.
+  await retry.click();
+  await page
+    .getByText(
+      /^The provisioning job can no longer be retried; it may have finished\. Select Create Agent to resend the same request ID and open its result\./,
+    )
+    .waitFor();
+  // The kept request ID names the admitted job, so the plan stays locked: an edited
+  // form would get 409 "different plan" from the API on every Create Agent.
+  assert.equal(await retry.isVisible(), false);
+  assert.equal(await page.getByLabel("Agent name").isDisabled(), true);
+  assert.equal(await page.getByLabel("Service account token Secret").isDisabled(), true);
+  assert.equal(await page.getByRole("button", { name: "Create Agent" }).isDisabled(), false);
+  assert.equal(await page.getByRole("button", { name: "Start over" }).isDisabled(), false);
+  await page.getByRole("button", { name: "Create Agent" }).click();
+  await page.waitForURL(new RegExp(`/agents/${agentIds[2]}\\?`));
+  assert.equal(bodies.length, 5);
+  assert.equal(bodies[4].requestId, bodies[3].requestId);
+});
+
 test("Agent creation rejects non-object native Configuration JSON before Configuration or Agent writes", async (t) => {
   const fixture = await createConsoleAppFixture(t);
   await fixture.bootstrap();
@@ -2247,6 +2541,49 @@ test("Agent creation accepts a manual model outside the static list and saves th
   );
   assert.equal(configuration.data.values.agents.defaults.model, "codex/gpt-manual-account-model");
   assert.equal(JSON.stringify(configuration.data).includes("manual-model-key"), false);
+});
+
+test("Agent creation names the Configuration field that holds an inline model credential without showing it", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "occ-create-inline-credential-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const fixture = await createConsoleAppFixture(t, {
+    configurationDriver: new FilesystemConfigurationDriver(root),
+  });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Create inline credential", { ready: true });
+  const { page } = await newPage(t, fixture);
+  await routeInstallationWithoutProvisioning(page, fixture);
+  const requests = apiRequests(page, fixture.origin);
+  await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
+  await page.getByRole("button", { name: "Start without Preset" }).click();
+  await page.getByLabel("Agent name").fill("Inline credential Agent");
+  await enterManualModel(page, "inline-credential-model-key", "gpt-inline-credential");
+  await openAdvancedSettings(page);
+  // A pasted provider key is a value, not the Secret reference the field requires.
+  const sentinel = `synthetic-inline-key-${randomUUID()}`;
+  const configuration = page.getByLabel("Configuration JSON");
+  const edited = JSON.parse(await configuration.inputValue());
+  edited.models = {
+    ...edited.models,
+    providers: { ...edited.models?.providers, openai: { apiKey: sentinel } },
+  };
+  await configuration.fill(JSON.stringify(edited, null, 2));
+  const rejected = page.waitForResponse(
+    (response) =>
+      response.url() === `${fixture.origin}/namespaces/${namespace.id}/configurations` &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Create Agent" }).click();
+  assert.equal((await rejected).status(), 400);
+  const feedback = page.getByRole("alert").filter({
+    hasText:
+      "Configuration field /models/providers/openai/apiKey holds a credential value inline, where a reference is required. Store the key as a Secret and select it as the Agent's model credential instead.",
+  });
+  await feedback.waitFor();
+  // Only the editor holds the key; the explanation never repeats it.
+  assert.equal((await feedback.textContent()).includes(sentinel), false);
+  assert.equal(agentPostRequests(requests, namespace.id).length, 0);
+  assert.equal(await configuration.isDisabled(), false);
 });
 
 test("Agent creation reports unavailable Secret storage before creating Configuration or Agent", async (t) => {

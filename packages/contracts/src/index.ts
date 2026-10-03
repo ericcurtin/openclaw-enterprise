@@ -1718,7 +1718,7 @@ export interface ConfigurationDriver extends Driver {
   validate(configuration: Configuration): Promise<void>;
 }
 
-export { normalizeSecretBindings } from "./secret-bindings.ts";
+export { isAllowedSecretBindingDestination, normalizeSecretBindings } from "./secret-bindings.ts";
 
 export * from "./api/common.ts";
 export * from "./api/resources.ts";

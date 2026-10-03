@@ -9,7 +9,7 @@ separate migrator-role connection for test-only table contention. The
 `logging-collector` lane also runs real Prometheus/Grafana collection and
 dashboard provisioning. See [metrics testing](metrics.md) for local setup.
 
-The [suite index](../../scripts/ci/test-suites.json) holds lane references and coverage groups. Each `scripts/ci/test-suites/<lane>.json` owns its files, inputs, environment and resources; edit it for test changes, or the index for lane or group changes. The [loader](../../scripts/ci/test-suites.mjs) assembles them. Check that every active test file has one lane owner:
+The [suite index](../../scripts/ci/test-suites.json) holds lane references and coverage groups. Each `scripts/ci/test-suites/<lane>.json` owns its files, inputs, environment and resources; edit it for test changes, or the index for lane or group changes. The [loader](../../scripts/ci/test-suites.mjs) assembles them. Check that every test file under `tests/conformance`, `tests/integration`, `tests/browser` and `tests/docs` has one lane owner:
 
 ```sh
 node scripts/ci/run-tests.mjs audit
@@ -138,14 +138,16 @@ See the [execution flow](../flows/github-actions-testing.md) for entrypoints, re
 Failed browser tests upload
 [diagnostics](local.md#browser-failure-diagnostics).
 
-A retry replaces its lane result artifact; other lanes keep theirs. Preserve failed results before retrying if needed; earlier logs remain. Full-mode reruns require every selected lane and aggregate to pass.
+A retry replaces its lane result artifact; other lanes keep theirs. Each attempt's results also remain as `attempt-<run attempt>-<artifact-prefix>-<lane>`, and each failed case's redacted message is in that attempt's job log. Full-mode reruns require every selected lane and aggregate to pass.
 
 ### Select immutable images for local preparation
 
-Set `OPENCLAW_CI_K3S_IMAGE` to an approved `image@sha256:<digest>` before
-`node scripts/ci/prepare.mjs --lane <lane> --state <private-state-file>`
-to bypass k3d's online release-channel lookup. Otherwise ordinary Kubernetes lanes
-default to `+v1.35`. Both paths require the API server to report Kubernetes 1.35.x;
+Ordinary Kubernetes lanes default to the digest-pinned K3s 1.35 image in
+`defaultK3sImage` (`scripts/ci/prepare.mjs`), so cluster creation never queries
+k3d's online release channel. Set `OPENCLAW_CI_K3S_IMAGE` to another approved
+`image@sha256:<digest>` before
+`node scripts/ci/prepare.mjs --lane <lane> --state <private-state-file>` to
+override it. Both paths require the API server to report Kubernetes 1.35.x;
 OpenShell retains its separately pinned image. Mutable overrides fail before
 resource creation. Clean up a failed run's owned resources before reusing its state path.
 

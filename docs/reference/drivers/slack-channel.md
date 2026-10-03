@@ -41,7 +41,8 @@ and never opens a Socket Mode connection or sends a message.
 
 A Compute Driver that cannot deliver OCC Secrets, such as SSH Compute, accepts
 an unbound environment reference as operator-provisioned and skips both checks
-for it.
+for it. Use native Configuration there; the Console's Slack credentials step
+binds Secrets, which SSH Compute refuses.
 
 Failures return sanitized `CHANNEL_CREDENTIAL_*` errors with the native field
 path. App-token prefixes do not prove validity, scopes, or app/bot pairing.

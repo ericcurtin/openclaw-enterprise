@@ -77,9 +77,6 @@ context is optional in TypeScript; the worker supplies it after authorization.
 `requiresStoppedPredecessors(revision)` opts into [exclusive replacement](#production-revision-stages).
 It must be a side-effect-free declaration derived from the admitted revision.
 
-`operatorProvisionedSecrets` marks a Driver that cannot deliver Secrets;
-channel validation skips unbound environment SecretRefs.
-
 ### Optional startup preflight
 
 `preflight()` checks dependencies before production startup completes. A thrown
@@ -304,7 +301,8 @@ prove readiness. See [Kubernetes startup status](kubernetes-compute.md#plugin-st
   and Harness need not share a cluster or a component that writes their resources.
 - Initial credential helpers cannot rotate credentials, manage model
   authentication, or prove that credentials work or workloads are ready.
-- Selecting a different Driver does not migrate revisions that recorded the
+- Compute reads bounded log pages on demand; it cannot stream, store or export
+  them. Selecting a different Driver does not migrate revisions that recorded the
   previous Driver's identity.
 
 ## Troubleshooting

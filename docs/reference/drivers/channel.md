@@ -21,9 +21,11 @@ callers save IDs. A missing selected Driver makes lookup unavailable.
 The optional `validateCredentials(values, withSecret)` method checks configured
 channel credentials before API provisioning or deployment. `withSecret(binding,
 path, validate)` authorizes the exact same-Namespace Secret and supplies its value
-only inside the SecretDriver callback. With no binding, it returns without
-calling `validate` when the Compute Driver sets `operatorProvisionedSecrets`.
-Provider calls run before the write transaction. Validation does not pin Secret versions or revalidate queued work.
+only inside the SecretDriver callback. Without a binding it fails, unless the
+selected Compute Driver sets `operatorProvisionedSecrets` because it cannot
+deliver OCC Secrets; then it returns without calling `validate`. Provider calls
+run before the write transaction. Validation does not pin Secret versions or
+revalidate queued work.
 
 ## IAM
 

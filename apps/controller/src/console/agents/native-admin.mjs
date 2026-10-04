@@ -80,7 +80,7 @@ export function renderNativeAdminAccess(context, path) {
       }
       failed = false;
       if (current.status === "available") {
-        status.textContent = "Native admin UI is available for this Agent’s active revision.";
+        status.textContent = "Native admin UI is available for this Agent’s current version.";
       } else if (current.status === "disabled" || current.status === "denied") {
         status.textContent = "";
       } else {

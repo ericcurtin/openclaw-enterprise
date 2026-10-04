@@ -1,3 +1,4 @@
+import defaultCodexPreset from "../default-codex-preset.mjs";
 import { element, button } from "../dom.mjs";
 import { WORKSPACE_DEFAULTS, WORKSPACE_DEFAULTS_ID } from "../workspace-defaults.mjs";
 import { configuredHarnessId, harnessAuthDescription } from "./harness-auth.mjs";
@@ -10,6 +11,13 @@ import { createPluginDiscovery } from "./plugin-discovery.mjs";
 import { createSlackApproverField } from "./slack-approvers.mjs";
 import { renderChannels } from "../channels.mjs";
 import { link, message, namespacePath, rejectionMessage } from "./list.mjs";
+
+// The API's duplicate-name sentence. Other Agent conflicts reach the client as generic text,
+// so only this one is shown as sent.
+const AGENT_NAME_CONFLICT =
+  "An Agent with this name already exists in this Namespace. Choose a different name.";
+// The API's text for a conflict whose reason it does not name.
+const GENERIC_CONFLICT = "The requested platform resource already exists.";
 
 // TODO: This starter list is intentionally hardcoded for the initial Console release.
 // Revisit catalog refresh and credential-aware discovery after the basic creation flow ships.
@@ -82,16 +90,9 @@ function configurationTemplate(harnessId, nativeProvider, providerModel) {
     },
   };
 
+  const { plugins, ...base } = structuredClone(defaultCodexPreset.template.configuration.values);
   return {
-    gateway: {
-      mode: "local",
-      bind: "lan",
-      controlUi: {
-        enabled: true,
-        allowedOrigins: ["http://127.0.0.1:18789", "http://localhost:18789"],
-      },
-      http: { endpoints: { chatCompletions: { enabled: true } } },
-    },
+    ...base,
     ...(providerModel
       ? {
           agents: {
@@ -103,29 +104,8 @@ function configurationTemplate(harnessId, nativeProvider, providerModel) {
           models: { providers: provider },
         }
       : {}),
-    ...(harnessId === "codex"
-      ? {
-          // Codex model transport must use its authenticated app server, never direct HTTP.
-          plugins: {
-            allow: ["codex"],
-            entries: {
-              codex: {
-                enabled: true,
-                config: {
-                  appServer: {
-                    mode: "guardian",
-                    approvalPolicy: "on-request",
-                    sandbox: "read-only",
-                    transport: "websocket",
-                    url: "${APP_SERVER_URL}",
-                    authToken: "${APP_SERVER_TOKEN}",
-                  },
-                },
-              },
-            },
-          },
-        }
-      : {}),
+    // Codex model transport must use its authenticated app server, never direct HTTP.
+    ...(harnessId === "codex" ? { plugins } : {}),
   };
 }
 
@@ -231,6 +211,9 @@ export function renderCreateAgent(context, draft) {
   }
   context.setDiscardOnExit(false);
   context.setDraftCapture(null);
+  const presets = createPresetFields(context, (rendered, options, draft) =>
+    renderAgentForm(context, rendered, options, draft),
+  );
   context.view.replaceChildren(
     link("← Agents", "agents", context),
     element(
@@ -242,12 +225,13 @@ export function renderCreateAgent(context, draft) {
         { className: "muted" },
         "Choose a model, connect repositories, and give your Agent a place to work.",
       ),
-      button(
-        "Start without Preset",
-        () => renderAgentForm(context, {}, {}, { withoutPreset: true }),
-        {
-          className: "primary",
-        },
+      element(
+        "div",
+        { className: "launch-actions" },
+        presets.startDefault,
+        button("Start without Preset", () =>
+          renderAgentForm(context, {}, {}, { discardOnExit: true }),
+        ),
       ),
     ),
     element(
@@ -259,16 +243,12 @@ export function renderCreateAgent(context, draft) {
         { className: "muted" },
         "Start from a Preset to reuse your team's configuration.",
       ),
-      createPresetFields(context, (rendered, options) =>
-        renderAgentForm(context, rendered, options),
-      ),
+      presets.section,
     ),
   );
 }
 
 function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
-  context.setDiscardOnExit(Boolean(draft.withoutPreset));
-  context.drafts.forget("preset");
   const { view, request, namespaceId } = context;
   const agent = rendered.agent ?? {};
   const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -502,6 +482,7 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
     createDialogTitle: "Create model credential Secret",
     metadataLabel: "View model credential Secret metadata",
     noSecretLabel: "Choose a model credential Secret",
+    stagedHint: "Secret selected. Create Agent binds it.",
     required: !binding && !passwordAuth,
     disabled: Boolean(binding || passwordAuth),
   });
@@ -1124,8 +1105,8 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
     }
   }
   manualModel = draft.manualModel ?? manualModel;
-  context.setDraftCapture(() => ({
-    withoutPreset: Boolean(draft.withoutPreset),
+  const captureDraft = () => ({
+    discardOnExit: Boolean(draft.discardOnExit),
     rendered,
     presetOptions,
     // Keep raw editor text, including invalid JSON. Password controls are deliberately excluded.
@@ -1143,7 +1124,7 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
     modelCredentialSecret,
     oauthLogin: oauthLogin.capture(),
     repositoryAccess: repositories.access(),
-  }));
+  });
   function parseObject(input, reportInvalid = false) {
     try {
       const values = JSON.parse(input.value);
@@ -1551,9 +1532,15 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
         mutationStarted &&
         !error.provisioningTerminal &&
         ![400, 403, 404, 409, 429].includes(error.status);
-      // The API refuses to retry a job whose Namespace or Agent lifecycle changed, or
-      // that was cancelled or handed off; that job can never finish.
+      // The API refuses to retry a job whose Namespace or Agent lifecycle changed, that was
+      // cancelled or handed off, or whose Secret was deleted; that job can never finish. A
+      // refusal that names its reason is shown as sent; a race in the store can still
+      // answer with the generic conflict text, which keeps the fixed sentence.
       const retryRefused = retrying && error.status === 409;
+      const retryRefusal =
+        error.serverMessage !== undefined && error.serverMessage !== GENERIC_CONFLICT
+          ? error.serverMessage
+          : "The provisioning job can no longer be retried.";
       const detail =
         outcomeUnknown && attempt.acknowledged
           ? "Outcome unknown after provisioning admission. Retry resumes the accepted provisioning job, or retries it if it failed. If the API refuses because the job finished, select Create Agent to resend the same request ID."
@@ -1564,7 +1551,7 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
               : error.provisioningFailed
                 ? `${error.message} Select Create Agent to submit a new request.`
                 : retryRefused
-                  ? "The provisioning job can no longer be retried. Select Create Agent to submit a new request."
+                  ? `${retryRefusal} Select Create Agent to submit a new request.`
                   : error.status === undefined && error.message
                     ? error.message
                     : recovering && error.status === 409
@@ -1784,7 +1771,9 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
         : error.status === 409 && creatingSecret && error.code !== "NAMESPACE_NOT_READY"
           ? `A Secret named "${body.name}" already exists in this Namespace, possibly from an earlier Agent with this name. Choose another Agent name, delete that Secret, or select Start over, choose the Preset again, and set its Secret source to Use existing Secret.`
           : error.status === 409 && savedConfiguration
-            ? "Agent creation conflicts with the saved state. Check the Agent name and selections, then try again."
+            ? error.serverMessage === AGENT_NAME_CONFLICT
+              ? AGENT_NAME_CONFLICT
+              : "Agent creation conflicts with the saved state. Check the Agent name and selections, then try again."
             : rejectionMessage(error, mutationStarted);
       outcomeUnknown = mutationStarted && ![400, 403, 404, 409, 429].includes(error.status);
       const knownRejection = [400, 403, 404, 409, 429].includes(error.status);
@@ -1826,4 +1815,7 @@ function renderAgentForm(context, rendered, presetOptions = {}, draft = {}) {
     recovery,
     actions,
   );
+  context.setDraftCapture(captureDraft);
+  context.drafts.forget("preset");
+  context.setDiscardOnExit(Boolean(draft.discardOnExit));
 }

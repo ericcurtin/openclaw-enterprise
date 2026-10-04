@@ -1,7 +1,7 @@
 import { button, element } from "../dom.mjs";
 import { createPluginDiscovery } from "./plugin-discovery.mjs";
 import { createSlackApproverField } from "./slack-approvers.mjs";
-import { assertReadableConfiguration, message } from "./list.mjs";
+import { assertReadableConfiguration, message, rejectionMessage } from "./list.mjs";
 import { createDeviceLogin } from "./device-login.mjs";
 import { configuredHarnessId } from "./harness-auth.mjs";
 
@@ -43,10 +43,10 @@ export function renderAgentPlugins(
         "p",
         { className: "muted" },
         snapshot.pluginApprovers === undefined
-          ? "No Agent default was set when this revision was admitted; the existing OpenClaw approval routing applies."
+          ? "No Agent default was set when this version was created; the existing OpenClaw approval routing applies."
           : snapshot.pluginApprovers.length === 0
-            ? "Explicit empty list: no Slack user can approve plugins in this revision by default."
-            : "This revision's Agent default approvers are immutable.",
+            ? "Explicit empty list: no Slack user can approve plugins in this version by default."
+            : "This version's Agent default approvers are immutable.",
       ),
       ...(snapshot.pluginApprovers?.length
         ? [
@@ -97,7 +97,7 @@ export function renderAgentPlugins(
     context,
     agentId: agent.id,
     initial: retained?.oauthLogin,
-    hint: "Use a separate ChatGPT login to browse plugins for this revision. This does not replace or refresh the deployed Agent's credential. Discard this login when you finish.",
+    hint: "Use a separate ChatGPT login to browse plugins for this version. This does not replace or refresh the deployed Agent's credential. Discard this login when you finish.",
     onChange() {
       discovery.reset();
     },
@@ -272,6 +272,7 @@ export function renderAgentPlugins(
     feedback.textContent = "Checking saved plugin selections…";
     updateState();
     let mutationStarted = false;
+    let saved = false;
     try {
       const freshAgent = await context.request(path);
       if (!context.isCurrent()) {
@@ -299,6 +300,7 @@ export function renderAgentPlugins(
             : { pluginApprovers }),
         },
       });
+      saved = true;
       if (context.isCurrent()) {
         pending = false;
         updateState();
@@ -320,13 +322,15 @@ export function renderAgentPlugins(
       feedback.textContent =
         error.status === 403
           ? "Access denied. Check Agent update, Configuration read, and access to this Agent's bound Secrets or Service Account."
-          : error.status === 400
-            ? "Plugin selections were rejected. Check plugin IDs and policy JSON, then retry."
-            : error.status === 409
-              ? "Plugin changes conflict with the current Agent state. Refresh this Agent before retrying."
-              : error.status === 501
-                ? "This Installation has no compatible Plugin Driver for these selections. Ask an operator to select or configure one, then retry."
-                : message(error, mutationStarted);
+          : error.status === 400 && !saved && error.serverMessage !== undefined
+            ? rejectionMessage(error, mutationStarted)
+            : error.status === 400
+              ? "Plugin selections were rejected. Check plugin IDs and policy JSON, then retry."
+              : error.status === 409
+                ? "Plugin changes conflict with the current Agent state. Refresh this Agent before retrying."
+                : error.status === 501
+                  ? "This Installation has no compatible Plugin Driver for these selections. Ask an operator to select or configure one, then retry."
+                  : message(error, mutationStarted);
     } finally {
       if (context.isCurrent()) {
         pending = false;

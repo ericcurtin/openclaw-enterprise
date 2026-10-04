@@ -101,7 +101,14 @@ Pod ownership, calls `readNamespacedPodLog` with `tailLines`, `sinceSeconds`,
 `previous`, a 1 MiB `limitBytes` and timestamps, and re-reads the Pod. A cursor
 poll derives `sinceSeconds` from the cursor: from its newest delivered line, or,
 when the view has delivered nothing yet, from the previous read (a full or
-byte-cut tail then emits `window_exceeded`). OCC
+byte-cut tail then emits `window_exceeded`). When a resumed read delivers nothing
+new on every poll because the next line does not fit in the 1 MiB limit (typically
+one oversized line), and that line is more than about 3 seconds older than the read,
+the cursor drops its delivered time and
+continues from this read, as a view that has delivered nothing yet does. The page
+emits `window_exceeded` dated at that line: it and the lines logged after
+it until this read are lost. A carried PEM block then keeps no delivered frontier,
+so it stays masked for the rest of the view. OCC
 drops lines already delivered at the cursor time, emits `stream_replaced`,
 `window_exceeded`, `cursor_expired` or `truncated` gaps, and passes the rest to
 `runtime-logs/sanitize.ts:sanitizeRuntimeLogChunk`, the only producer of
@@ -204,6 +211,8 @@ fixed `RUNTIME_LOGS_*` codes; the whole request has a ten-second deadline.
 [keep this for the user to add notes. do not change between edits]
 
 ## Changelog
+
+- 2026-10-03 22:00: A resumed view moves past a line longer than the 1 MiB read limit instead of re-reading it on every poll. (f349-log-resume)
 
 - 2026-10-03 03:00: A cursor from a page that delivered no line resumes from that page, not the whole tail. (bughunt-1/fix-runtime-logs-quiet-follow)
 

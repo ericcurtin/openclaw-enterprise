@@ -173,6 +173,35 @@ export class ConfigurationHarnessError extends ScopeViolationError {
   }
 }
 
+/**
+ * A request names an invalid Secret binding: Agent provisioning or a Configuration write
+ * with a reserved or invalid environment destination or an unsupported binding shape
+ * (including credential-source Harness authentication in Agent provisioning), or
+ * any of those, an Agent's Harness authentication, a credential source, or plugin discovery
+ * naming a Secret in another Namespace. Messages are static, so HTTP reports them as an
+ * invalid request instead of hiding them as a scope miss; Secret existence is still checked
+ * later and stays a scope miss.
+ */
+export class SecretBindingValidationError extends ScopeViolationError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SecretBindingValidationError";
+  }
+}
+
+/**
+ * Builds a message that names a Configuration field. The error contract caps messages at
+ * 256 characters; a long provider name shortens the path. The cut counts code points, so it
+ * never leaves half of a surrogate pair.
+ */
+function configurationFieldMessage(path: string, message: (path: string) => string): string {
+  const budget = 256 - message("").length;
+  const characters = Array.from(path);
+  return message(
+    characters.length <= budget ? path : `${characters.slice(0, budget - 1).join("")}…`,
+  );
+}
+
 const modelCredentialMessage = (path: string): string =>
   `Configuration field ${path} holds a credential value inline, where a reference is required. Store the key as a Secret and select it as the Agent's model credential instead.`;
 
@@ -184,10 +213,29 @@ export class ModelCredentialValueError extends Error {
   readonly path: string;
 
   constructor(path: string) {
-    // The error contract caps messages at 256 characters; a long provider name shortens the path.
-    const budget = 256 - modelCredentialMessage("").length;
-    super(modelCredentialMessage(path.length <= budget ? path : `${path.slice(0, budget - 1)}…`));
+    super(configurationFieldMessage(path, modelCredentialMessage));
     this.name = "ModelCredentialValueError";
+    this.path = path;
+  }
+}
+
+const modelProviderSettingMessages = {
+  baseUrl: (path: string): string =>
+    `Configuration field ${path} must be an absolute http or https URL.`,
+  api: (path: string): string =>
+    `Configuration field ${path} must name a model API the runtime supports, such as openai-responses, openai-completions or anthropic-messages.`,
+} as const;
+
+/**
+ * A model provider `baseUrl` or `api` in Configuration values that the runtime cannot
+ * use. The message names the field's JSON pointer and the expected form, never the value.
+ */
+export class ModelProviderSettingError extends Error {
+  readonly path: string;
+
+  constructor(path: string, setting: keyof typeof modelProviderSettingMessages) {
+    super(configurationFieldMessage(path, modelProviderSettingMessages[setting]));
+    this.name = "ModelProviderSettingError";
     this.path = path;
   }
 }
@@ -210,9 +258,27 @@ export class ResourceStateConflictError extends ResourceConflictError {
   }
 }
 
-/** Shared by the memory and PostgreSQL stores so both report a duplicate Agent name alike. */
+/*
+ * Duplicate caller-chosen names, shared by the memory and PostgreSQL stores so both report
+ * them alike. Each is raised only after the caller was authorized to create (or rename) that
+ * resource kind in that scope, and the 409 already revealed that the name is taken, so naming
+ * the kind discloses nothing new.
+ */
 export const AGENT_NAME_CONFLICT =
   "An Agent with this name already exists in this Namespace. Choose a different name.";
+export const SECRET_NAME_CONFLICT =
+  "A Secret with this name already exists in this Namespace. Choose a different name.";
+export const PRESET_NAME_CONFLICT =
+  "A Preset with this name already exists in this Namespace. Choose a different name.";
+export const SERVICE_ACCOUNT_NAME_CONFLICT =
+  "A ServiceAccount with this name already exists in this Namespace. Choose a different name.";
+export const CREDENTIAL_SOURCE_NAME_CONFLICT =
+  "A credential source with this name already exists in this Namespace. Choose a different name.";
+export const NAMESPACE_NAME_CONFLICT =
+  "A Namespace with this name already exists. Choose a different name.";
+/** A deleted Namespace's tombstone keeps its name, so a name can be taken by one no longer listed. */
+export const DELETED_NAMESPACE_NAME_CONFLICT =
+  "This name belongs to a deleted Namespace and cannot be reused. Choose a different name.";
 
 export class AgentDeletingError extends ResourceConflictError {
   constructor(message = "The Agent is being deleted.") {
@@ -224,11 +290,21 @@ export class AgentDeletingError extends ResourceConflictError {
 export class NamespaceNotEmptyError extends ResourceConflictError {
   /** Public resource kinds that still occupy the Namespace, such as "Presets". */
   readonly contents: readonly string[];
+  /** IDs of the remaining resources of each kind, so an operator can delete them. */
+  readonly ids: Readonly<Record<string, readonly string[]>>;
 
-  constructor(contents: readonly string[] = []) {
+  constructor(
+    contents: readonly string[] = [],
+    ids: Readonly<Record<string, readonly string[]>> = {},
+  ) {
     super("The Namespace must be empty before deletion.");
     this.name = "NamespaceNotEmptyError";
     this.contents = Object.freeze([...contents]);
+    this.ids = Object.freeze(
+      Object.fromEntries(
+        Object.entries(ids).map(([kind, list]) => [kind, Object.freeze([...list])]),
+      ),
+    );
   }
 }
 
@@ -243,14 +319,18 @@ export class NamespaceNotReadyError extends ResourceConflictError {
 export class NativeWorkerSupportError extends Error {
   constructor() {
     super(
-      "Dedicated native OpenClaw is unavailable: the pinned OpenClaw runtime does not support required worker placement (cloudWorkers.requiredProfile) or native worker inference. See docs/reference/harness-execution.md#native-worker-support.",
+      "Dedicated native OpenClaw is unavailable: the pinned OpenClaw runtime does not support required worker placement (cloudWorkers.requiredProfile) or native worker inference. See https://docs-enterprise.openclaw.org/reference/harness-execution/#native-worker-support",
     );
     this.name = "NativeWorkerSupportError";
   }
 }
 
-/** A platform dependency a Compute Driver reaches while it reconciles a revision. */
-export type TransientDependency = "agent_gateway" | "kubernetes_api";
+/**
+ * A platform dependency a Compute Driver, or the Sandbox Driver it calls, reaches while
+ * it reconciles a revision. `sandbox_admission` is the Sandbox gateway's per-caller
+ * request admission quota, which frees up as completed requests age out.
+ */
+export type TransientDependency = "agent_gateway" | "kubernetes_api" | "sandbox_admission";
 
 /** Why the dependency failed, from a closed set that carries no provider text. */
 export type TransientDependencyReason = "unreachable" | "timeout" | "unavailable";
@@ -258,12 +338,14 @@ export type TransientDependencyReason = "unreachable" | "timeout" | "unavailable
 const TRANSIENT_DEPENDENCY_CODES: Readonly<Record<TransientDependency, string>> = Object.freeze({
   agent_gateway: "AGENT_GATEWAY_UNAVAILABLE",
   kubernetes_api: "KUBERNETES_API_UNAVAILABLE",
+  sandbox_admission: "SANDBOX_ADMISSION_LIMIT_REACHED",
 });
 
 /**
  * A Compute dependency failed in a way that clears without a change to the
- * revision: the Kubernetes API timed out or answered 429/5xx, or the Agent
- * Gateway's route refused or dropped a connection while it converged. The
+ * revision: the Kubernetes API timed out or answered 429/5xx, the Agent
+ * Gateway's route refused or dropped a connection while it converged, or the
+ * Sandbox gateway refused new requests at its request admission limit. The
  * worker retries it within the deployment's convergence deadline instead of
  * spending the attempt budget, and records `code`, which names the dependency.
  * The message stays in the controller; status shows a fixed text.
@@ -376,7 +458,7 @@ export class IAMRoleInUseError extends ResourceConflictError {
 export class CredentialGatewayNotConfiguredError extends Error {
   constructor() {
     super(
-      "This Installation has no Credential Gateway, so credential sources are unavailable. An administrator must select the OpenShell Credential Gateway Driver; see docs/reference/credential-sources.md.",
+      "This Installation has no Credential Gateway, so credential sources are unavailable. An administrator must select the OpenShell Credential Gateway Driver; see https://docs-enterprise.openclaw.org/reference/credential-sources/",
     );
     this.name = "CredentialGatewayNotConfiguredError";
   }

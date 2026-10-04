@@ -93,13 +93,49 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-// Next steps for failure codes whose cause the operator can act on directly.
+// Next steps for failure codes whose cause the operator can act on directly, and the
+// page that holds the setting to change. Model-probe codes come from the runtime
+// wrapper's startup model check (`runtime-entrypoints.ts`). OpenClaw classifies
+// transport errors (refused connection, DNS failure, "fetch failed") as a timeout, so
+// there an unreachable provider reports RUNTIME_MODEL_PROBE_TIMEOUT; Codex reports the
+// same failure as RUNTIME_MODEL_PROBE_FAILED unless the connection hangs until its cap.
 const DEPLOYMENT_FAILURE_GUIDANCE = {
-  RUNTIME_AUTHENTICATION_FAILED:
-    "The model provider rejected this version's credential (HTTP 401 or 403). Check that the key is valid and can use the selected model, update or replace the model credential Secret, then deploy a new version.",
+  RUNTIME_AUTHENTICATION_FAILED: {
+    text: "The model provider rejected this version's credential (HTTP 401 or 403). Check that the key is valid and can use the selected model, update or replace the model credential Secret, then deploy a new version.",
+    link: "credentials",
+  },
+  RUNTIME_MODEL_PROBE_FAILED: {
+    text: "The startup model check failed for a reason other than a rejected credential, such as an unknown model, invalid provider settings, a provider or TLS error, a rate limit or quota, or, with Codex, a provider the runtime cannot reach. Check the model and its provider settings (such as baseUrl and api) in the Configuration, the provider account, and that the runtime can reach the provider, then deploy a new version.",
+    link: "configuration",
+  },
+  RUNTIME_MODEL_PROBE_TIMEOUT: {
+    text: "The startup model check did not get a reply from the model provider in time. With OpenClaw this includes a provider the runtime cannot reach (refused connection or unknown host). Check that the runtime can reach the provider (network egress, proxy, or a custom baseUrl in the Configuration) and that the provider is responding, then deploy a new version.",
+    link: "configuration",
+  },
 };
 
-function deploymentFailure(error, credentialsHref = null, logs = null) {
+// The runtime classifies a failed startup model check into one of these kinds and
+// a fixed detail token such as exit-1, rate_limit or no-reply.
+const RUNTIME_FAILURE_CAUSE_LABELS = {
+  PROCESS_EXIT: "The check process exited with an error",
+  PROBE_STATUS: "The model provider check reported a failure",
+  INVALID_OUTPUT: "The check returned unexpected output",
+  WRAPPER_ERROR: "The runtime could not run the check",
+};
+
+function runtimeFailureCauseText(cause) {
+  const label = Object.hasOwn(RUNTIME_FAILURE_CAUSE_LABELS, cause.kind)
+    ? RUNTIME_FAILURE_CAUSE_LABELS[cause.kind]
+    : cause.kind;
+  return cause.detail ? `${label} (${cause.detail})` : label;
+}
+
+const DEPLOYMENT_FAILURE_LINK_LABELS = {
+  credentials: "Open Credentials",
+  configuration: "Open Configuration",
+};
+
+function deploymentFailure(error, hrefs = {}, logs = null) {
   if (!error) {
     return element("p", { className: "muted" }, "No persisted startup failure.");
   }
@@ -107,6 +143,7 @@ function deploymentFailure(error, credentialsHref = null, logs = null) {
   const guidance = Object.hasOwn(DEPLOYMENT_FAILURE_GUIDANCE, error.code)
     ? DEPLOYMENT_FAILURE_GUIDANCE[error.code]
     : null;
+  const guidanceHref = guidance ? (hrefs[guidance.link] ?? null) : null;
   return element(
     "div",
     {},
@@ -115,9 +152,11 @@ function deploymentFailure(error, credentialsHref = null, logs = null) {
       ? element(
           "p",
           { className: "hint deployment-failure-guidance" },
-          guidance,
-          credentialsHref ? " " : null,
-          credentialsHref ? element("a", { href: credentialsHref }, "Open Credentials") : null,
+          guidance.text,
+          guidanceHref ? " " : null,
+          guidanceHref
+            ? element("a", { href: guidanceHref }, DEPLOYMENT_FAILURE_LINK_LABELS[guidance.link])
+            : null,
         )
       : null,
     // A failed version may never become current, so link its output directly.
@@ -138,6 +177,12 @@ function deploymentFailure(error, credentialsHref = null, logs = null) {
           element("dd", {}, runtimeFailure.check ?? "Unknown"),
           element("dt", {}, "Code"),
           element("dd", {}, runtimeFailure.code ?? "Unknown"),
+          ...(runtimeFailure.cause && typeof runtimeFailure.cause === "object"
+            ? [
+                element("dt", {}, "Cause"),
+                element("dd", {}, runtimeFailureCauseText(runtimeFailure.cause)),
+              ]
+            : []),
           element("dt", {}, "Checked"),
           element("dd", {}, displayDate(runtimeFailure.checkedAt)),
         )
@@ -202,6 +247,7 @@ function createDeploymentStatusPanel(
   onStatusChange,
   credentialsHref = null,
   logsHref = null,
+  configurationHref = null,
 ) {
   const section = element("section", { className: "agent-card deployment-status" });
   const state = { loading: false, status: null, error: null, overviewError: false };
@@ -345,7 +391,7 @@ function createDeploymentStatusPanel(
       element("p", { className: "deployment-outcome" }, `Recorded status: ${state.status.status}`),
       deploymentFailure(
         state.status.error,
-        credentialsHref,
+        { credentials: credentialsHref, configuration: configurationHref },
         logsHref ? { href: logsHref, revision: revision.revision } : null,
       ),
       state.status.warnings?.length
@@ -639,7 +685,7 @@ function createVersionDiagnosticsPanel(context, path, revisionId, recordedStatus
       element(
         "p",
         { className: "muted" },
-        "For Kubernetes Compute, Gateway checks cover only the Slack channel: its configuration, authentication, and connectivity. They do not test model credentials or run a model turn. Pod status, restarts, Events and container output are on this version's Logs tab.",
+        "For Kubernetes Compute, gateway checks cover only the Slack channel: its configuration, authentication, and connectivity. They do not test model credentials or run a model turn. Pod status, restarts, Events and container output are on this version's Logs tab.",
       ),
       ...(error
         ? [
@@ -1239,6 +1285,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
               `agents/${agent.id}?revision=${encodeURIComponent(mostRecent.id)}&tab=logs`,
               namespaceId,
             ),
+            context.pageUrl(`agents/${agent.id}?revision=draft&tab=configuration`, namespaceId),
           )
         : element(
             "section",
@@ -1599,7 +1646,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
               ? "Deployment denied. Check Agent deploy permission and access to selected Secrets. First deployment also needs Agent read and operate permissions to create connection credentials. Ask a Namespace administrator to confirm the required grants."
               : error.status === 409
                 ? "Deployment conflicts with the saved Agent state. Refresh this Agent to check for changed Configuration or missing connection credentials. If credentials are missing after an earlier version, ask an operator to restore them."
-                : message(error, submitted);
+                : rejectionMessage(error, submitted);
           if (!submitted || [400, 403, 404, 409, 429].includes(error.status)) {
             deployPending = false;
           }
@@ -1920,7 +1967,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
               error.name === "TypeError"
             ) {
               if (!configurationSaved) {
-                error.message = message(error, mutationStarted);
+                error.message = rejectionMessage(error, mutationStarted);
               }
             }
             error.outcomeUnknown =
@@ -2097,7 +2144,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
               (mutationStarted && ![400, 403, 404, 409, 429].includes(error.status));
             feedback.textContent = error.outcomeUnknown
               ? error.message
-              : message(error, mutationStarted);
+              : rejectionMessage(error, mutationStarted);
             data.setAuthenticationPending(outcomeUnknown);
           }
         } finally {
@@ -2263,7 +2310,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
         if (error.status === 401) {
           context.onExpired();
         } else {
-          feedback.textContent = message(error, mutationStarted);
+          feedback.textContent = rejectionMessage(error, mutationStarted);
           if (mutationStarted && ![400, 403, 404, 409, 429].includes(error.status)) {
             saveState = "uncertain";
           }
@@ -2335,7 +2382,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
         revision.configurationId === snapshot.id &&
         revision.configurationGeneration === snapshot.generation,
     );
-    const enableGatewayPassword = button("Enable Gateway password access", () => {
+    const enableGatewayPassword = button("Enable gateway password access", () => {
       // Stage the native reference through the same draft and save checks as JSON edits.
       // The Compute Driver delivers the generated value only after deployment.
       editor.value = JSON.stringify(
@@ -2529,7 +2576,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
               ? gatewayPasswordRevision
                 ? `Gateway password access is enabled in the saved Configuration and included in v${gatewayPasswordRevision.revision}.`
                 : "Gateway password access is enabled in the saved Configuration. Deploy a new version to apply it."
-              : "Use generated credentials for direct Gateway password access. Enable access, save Configuration, then deploy a new version.",
+              : "Use generated credentials for direct gateway password access. Enable access, save Configuration, then deploy a new version.",
           ),
           element(
             "div",

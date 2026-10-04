@@ -357,6 +357,32 @@ export function renderPresetTemplate(template, inputs = {}) {
   return render(template, inputs, false);
 }
 
+/** Name declared variables without defaults that the template references; rendering needs them.
+ * @param {import('./presets.ts').PresetTemplate} template
+ * @returns {Set<string>}
+ */
+export function requiredPresetVariables(template) {
+  const definitions = template.variables ?? {};
+  const required = new Set();
+  const visit = (value) => {
+    if (typeof value === "string") {
+      for (const part of tokens(value, definitions, "template")) {
+        if (typeof part !== "string" && !Object.hasOwn(definitions[part.name], "default")) {
+          required.add(part.name);
+        }
+      }
+    } else if (value !== null && typeof value === "object") {
+      for (const [key, child] of Object.entries(value)) {
+        visit(key);
+        visit(child);
+      }
+    }
+  };
+  visit(template.agent);
+  visit(template.configuration);
+  return required;
+}
+
 // Credential admission permits unfilled string references while validating literal/default values.
 export function unresolvedPresetVariableTypes(value, definitions) {
   if (typeof value !== "string") {

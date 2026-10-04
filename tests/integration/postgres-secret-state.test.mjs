@@ -1,11 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-
-const databaseUrl = process.env.OCC_TEST_DATABASE_URL;
-const requiresPostgres = {
-  skip: databaseUrl ? false : "Set OCC_TEST_DATABASE_URL to run real PostgreSQL integration tests.",
-};
+import { databaseUrl, requiresPostgres } from "../helpers/postgres-database.mjs";
 
 function identifier(kind) {
   return `${kind}_${randomUUID()}`;
@@ -222,7 +218,10 @@ async function exerciseRepository(store) {
         backendRef: { ...storedSecret.backendRef, uid: randomUUID() },
       }),
     ),
-    { name: "ResourceConflictError" },
+    {
+      name: "ResourceStateConflictError",
+      message: "A Secret with this name already exists in this Namespace. Choose a different name.",
+    },
   );
 
   await store.transact(async (state) => {

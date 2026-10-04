@@ -27,6 +27,7 @@ import {
 } from "../helpers/bootstrap-installation.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
 import { grantAgentSecretOperate } from "../helpers/postgres-harness-auth.mjs";
+import { waitFor } from "../helpers/wait-for.mjs";
 
 const databaseUrl = process.env.OCC_TEST_DATABASE_URL;
 const adminEmail = "postgres-admin@openclaw.local";
@@ -528,18 +529,6 @@ async function assertSocketClosesAfterMutation(socket, mutate, timeoutMs = 31_00
   return closedAfterMs;
 }
 
-async function waitFor(description, read, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const result = await read();
-    if (result !== undefined) {
-      return result;
-    }
-    await delay(50);
-  }
-  assert.fail(`${description} did not complete within ${timeoutMs}ms`);
-}
-
 async function waitForAuditActions(pool, namespaceId, agentId, actions) {
   const remaining = new Set(actions);
   const deadline = Date.now() + 5_000;
@@ -940,6 +929,7 @@ test(
         );
         return result.rows[0];
       },
+      5_000,
     );
     assert.equal(
       latestConnect.details.nativeAdmin.revisionId,

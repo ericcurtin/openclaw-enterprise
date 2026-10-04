@@ -9,6 +9,7 @@ import type {
 import {
   newRuntimeLogViewId,
   runtimeLogLineHash,
+  runtimeLogTimeKey,
   validRuntimeLogFrontierTime,
   type RuntimeLogCursorBinding,
   type RuntimeLogCursorCodec,
@@ -106,14 +107,9 @@ export class RuntimeLogReadError extends Error {
   }
 }
 
-/** Kubelet RFC 3339 times trim trailing zeros; pad the fraction before comparing. */
 export function compareRuntimeLogTime(left: string, right: string): number {
-  const normal = (value: string) => {
-    const match = /^(.*T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/.exec(value);
-    return match === null ? value : `${match[1]}.${(match[2] ?? "").padEnd(9, "0")}Z`;
-  };
-  const a = normal(left);
-  const b = normal(right);
+  const a = runtimeLogTimeKey(left);
+  const b = runtimeLogTimeKey(right);
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
@@ -291,7 +287,10 @@ export async function readRuntimeLogPage(input: ReadRuntimeLogPageInput): Promis
   // The byte limit cuts the final line; a partial line may end inside a token.
   const completeLines = chunk.truncated ? chunk.lines.slice(0, -1) : chunk.lines;
   let lines = completeLines;
-  const earliest = lines.find((line) => line.time !== null)?.time ?? null;
+  // A line longer than the byte limit fills the page alone; its leading time is intact.
+  const earliest =
+    (completeLines.length === 0 ? chunk.lines : lines).find((line) => line.time !== null)?.time ??
+    null;
   // A full tail since a quiet view's previous read may have dropped its oldest lines.
   // A byte-cut page counts as full: the Driver cuts after applying the tail.
   if (
@@ -336,6 +335,38 @@ export async function readRuntimeLogPage(input: ReadRuntimeLogPageInput): Promis
     }
     delivered.push(line);
   }
+  // A resumed read starts RESUME_OVERLAP_SECONDS (plus up to one second of rounding)
+  // before the newest delivered line. When the overlap and the next line do not fit in
+  // the byte limit (typically one line longer than 1 MiB), the read delivers nothing
+  // new and the cursor never moves. `stalledAt` is that cut line's time, set only when
+  // every poll re-reads the same lines: each complete line is inside the overlap every
+  // read covers. Once the cut line is older than where a poll from this read starts
+  // (overlap plus one second of rounding), drop the frontier and continue in the form
+  // a fresh view already takes after one oversized line: no delivered time, reading
+  // from this read (`issuedAt`). There is no cursor format change. Bounded costs:
+  // - the lines logged after the cut line until this read are lost (no read could
+  //   reach them past the limit); the window_exceeded gap says so;
+  // - a carried PEM context keeps no delivered frontier (`pemAfterTime` null), so an
+  //   open block cannot close and a later BEGIN stays open for the rest of the view:
+  //   more masking, never less;
+  // - the new read has no time de-duplication, so kubelet clock skew behind OCC by
+  //   more than the guard can re-deliver lines near the old frontier;
+  // - until the cut line is past the guard (up to about 3 s) the view stays put.
+  const cutLine = chunk.truncated ? chunk.lines.at(-1) : undefined;
+  const overlapStart =
+    resume === undefined ? 0 : Date.parse(resume.lastTime!) - RESUME_OVERLAP_SECONDS * 1000;
+  const stalledAt =
+    resume !== undefined &&
+    !replacedDuringRead &&
+    delivered.every((line) => line.time === null) &&
+    completeLines.every((line) => line.time === null || Date.parse(line.time) >= overlapStart) &&
+    validRuntimeLogFrontierTime(cutLine?.time) &&
+    compareRuntimeLogTime(cutLine.time, resume.lastTime!) >= 0
+      ? cutLine.time
+      : undefined;
+  const skipStalled =
+    stalledAt !== undefined &&
+    Date.parse(stalledAt) < readStartedAt - (RESUME_OVERLAP_SECONDS + 1) * 1000;
   // Context belongs AFTER the authenticated delivered frontier, never before the
   // fetched overlap. Hashes and equal timestamps cannot prove a new closing line.
   const pemPrior =
@@ -390,17 +421,33 @@ export async function readRuntimeLogPage(input: ReadRuntimeLogPageInput): Promis
       }
     }
   }
+  if (skipStalled) {
+    pemAfterTime = null;
+  }
   const truncated = chunk.truncated || pageCut;
   const records = [
-    ...leading,
+    // The skip's own gap replaces a window_exceeded gap dated at the same cut line.
+    ...(skipStalled
+      ? leading.filter((record) => record.type !== "gap" || record.reason !== "window_exceeded")
+      : leading),
     ...sanitized.records,
-    ...(truncated
-      ? [runtimeLogGap("truncated", observedStream, delivered.at(-1)?.time ?? null)]
-      : []),
+    ...(skipStalled
+      ? [runtimeLogGap("window_exceeded", observedStream, stalledAt, true)]
+      : truncated
+        ? [
+            runtimeLogGap(
+              "truncated",
+              observedStream,
+              delivered.at(-1)?.time ?? null,
+              stalledAt !== undefined,
+            ),
+          ]
+        : []),
   ];
   const last = [...delivered].reverse().find((line) => line.time !== null);
-  let lastTime = resume !== undefined && !replacedDuringRead ? resume.lastTime : null;
-  let lastHashes = resume !== undefined && !replacedDuringRead ? [...resume.lastHashes] : [];
+  const kept = resume !== undefined && !replacedDuringRead && !skipStalled;
+  let lastTime = kept ? resume.lastTime : null;
+  let lastHashes = kept ? [...resume.lastHashes] : [];
   if (last !== undefined) {
     if (lastTime === null || compareRuntimeLogTime(last.time!, lastTime) !== 0) {
       lastHashes = [];

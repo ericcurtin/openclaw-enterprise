@@ -11,6 +11,7 @@ import {
   login,
   nativeValues,
   newPage,
+  settlePageRequests,
   waitForCondition,
 } from "./console-agents-browser-helpers.mjs";
 
@@ -68,7 +69,7 @@ test("the Logs tab shows runtime status, sanitized output and follows with a cur
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search);
+  await login(page, fixture, url);
 
   const card = page.locator(".runtime-pod");
   await card.getByRole("heading", { name: "Gateway" }).waitFor();
@@ -130,7 +131,7 @@ test("startup warnings on a Ready Pod without restarts read as history", async (
   computeDriver.state.lines = [line(1, "gateway ready")];
   const { page } = await newPage(t, fixture);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search);
+  await login(page, fixture, url);
 
   const card = page.locator(".runtime-pod");
   const earlier = card.getByRole("list", { name: "Earlier warning Events" });
@@ -158,7 +159,7 @@ test("a rejected cursor starts one new view and later restarts wait for it", asy
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search);
+  await login(page, fixture, url);
   const pane = page.getByRole("log", { name: "Runtime log output" });
   await pane.getByText("first view line").waitFor();
 
@@ -167,7 +168,6 @@ test("a rejected cursor starts one new view and later restarts wait for it", asy
   const release = Promise.withResolvers();
   t.after(() => release.resolve());
   let state = "untouched";
-  const arrivedWhileHeld = [];
   await page.route(`**/deployments/${revisionId}/runtime/logs?*`, async (route, request) => {
     const target = new URL(request.url());
     const cursor = target.searchParams.get("cursor");
@@ -178,9 +178,7 @@ test("a rejected cursor starts one new view and later restarts wait for it", asy
       await route.continue({ url: target.href });
       return;
     }
-    if (state === "holding") {
-      arrivedWhileHeld.push(target.search);
-    } else if (state === "tampered" && cursor === null) {
+    if (state === "tampered" && cursor === null) {
       state = "holding";
       held.resolve();
       await release.promise;
@@ -192,9 +190,10 @@ test("a rejected cursor starts one new view and later restarts wait for it", asy
   await held.promise;
   // A restart while the replacement read is in flight waits for it.
   computeDriver.state.lines = [line(1, "first view line"), line(2, "debug floor line")];
+  const readsWhileHeld = logRequests(requests, revisionId).length;
   await page.getByLabel("Include debug").check();
-  await page.waitForTimeout(500);
-  assert.deepEqual(arrivedWhileHeld, []);
+  await settlePageRequests(page);
+  assert.equal(logRequests(requests, revisionId).length, readsWhileHeld);
   release.resolve();
   await pane.getByText("debug floor line").waitFor();
   // The queued restart read the new debug view.
@@ -231,7 +230,7 @@ test("level chips and the text filter narrow only the loaded window; download sa
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search);
+  await login(page, fixture, url);
   const pane = page.getByRole("log", { name: "Runtime log output" });
   await pane.getByText("Gateway ready").waitFor();
   await page
@@ -331,7 +330,7 @@ test("an operator without administer sees status but no log text and is never re
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search, operator.credentials);
+  await login(page, fixture, url, operator.credentials);
 
   await page.locator(".runtime-pod").getByRole("heading", { name: "Gateway" }).waitFor();
   await page
@@ -381,7 +380,7 @@ test("a log reader without operate reads log text in the Logs tab without runtim
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search, reader.credentials);
+  await login(page, fixture, url, reader.credentials);
 
   // Runtime status needs operate; log text needs only read_logs, so the tab still reads it.
   await page
@@ -435,7 +434,7 @@ test("the Logs tab explains cluster RBAC, unsupported Drivers and unavailable re
   computeDriver.state.readError = new RuntimeLogsForbiddenByClusterError();
   const { page } = await newPage(t, fixture);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search);
+  await login(page, fixture, url);
   await page
     .getByText(/Ask your platform operator to enable agentRuntimeLogs in the Helm chart/)
     .waitFor();
@@ -532,7 +531,7 @@ test("the Sandbox source shows redacted policy decisions without a Pod picker", 
 
   const { page } = await newPage(t, fixture);
   const url = detailUrl(fixture, namespace.id, agent.id, revision.id, "logs");
-  await login(page, fixture, url.pathname + url.search);
+  await login(page, fixture, url);
   const pane = page.getByRole("log", { name: "Runtime log output" });
   await page.locator("#runtime-log-source").selectOption("sandbox");
   await pane
@@ -591,7 +590,7 @@ test("a Gateway view points at an unready Harness Pod instead of reading as a ne
   computeDriver.state.harnessLines = [line(2, "Harness model authentication probe failed.")];
   const { page } = await newPage(t, fixture);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search);
+  await login(page, fixture, url);
   await page.locator("#runtime-log-source").selectOption("gateway");
   await page
     .getByRole("log", { name: "Runtime log output" })
@@ -629,7 +628,7 @@ test("the Gateway hint skips a rollout's old Harness Pod and covers a Harness wi
   ];
   const { page } = await newPage(t, fixture);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search);
+  await login(page, fixture, url);
   await page
     .locator(".runtime-pod")
     .getByText(`agent-${revisionId.slice(4, 12)}-old`)
@@ -674,7 +673,7 @@ test("a reader without operate learns what log text needs and is asked for statu
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search, reader.credentials);
+  await login(page, fixture, url, reader.credentials);
 
   await page
     .getByText(
@@ -688,8 +687,9 @@ test("a reader without operate learns what log text needs and is asked for statu
   // Every denied read is an audited authorization denial: reopening the tab does not ask again.
   await page.getByRole("button", { name: "Configuration", exact: true }).click();
   await page.getByRole("button", { name: "Logs", exact: true }).click();
+  // The reopened tab shows this text only after its status decision, so a repeat read has started.
   await page.getByText(/Log text needs Agent read_logs/).waitFor();
-  await page.waitForTimeout(500);
+  await settlePageRequests(page);
   assert.equal(statusReads(), 1);
 });
 
@@ -717,7 +717,7 @@ test("a status denial for one operator does not carry over to the next sign-in o
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search, reader.credentials);
+  await login(page, fixture, url, reader.credentials);
   await page.getByText(/Runtime status requires Agent operate/).waitFor();
 
   // Sign out and in as the administrator without reloading the page.
@@ -775,7 +775,7 @@ test("Back restores a followed Logs view without replaying its reads and keeps p
   );
   await page.clock.install({ time: new Date("2026-09-30T12:00:00Z") });
   const url = detailUrl(fixture, namespace.id, agent.id, revisionId, "logs");
-  await login(page, fixture, url.pathname + url.search);
+  await login(page, fixture, url);
   const pane = page.getByRole("log", { name: "Runtime log output" });
   await pane.getByText("before leaving").waitFor();
   await page.getByRole("button", { name: "Follow" }).click();

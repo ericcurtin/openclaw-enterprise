@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { once } from "node:events";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +10,7 @@ import playwright from "playwright";
 
 import { renderMatrixMarkdown } from "../../scripts/generate-compute-matrix.mjs";
 import { watchBrowserContext } from "../helpers/browser-failure-diagnostics.mjs";
+import { stopProcess } from "../helpers/stop-process.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const { chromium } = playwright;
@@ -45,15 +45,8 @@ test("docs preview filters the ComputeDriver matrix in a browser", async (t) => 
       await browser?.close();
     } finally {
       try {
-        if (child && child.exitCode === null && child.signalCode === null) {
-          const exited = once(child, "exit");
-          const killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-          child.kill("SIGTERM");
-          try {
-            await exited;
-          } finally {
-            clearTimeout(killTimer);
-          }
+        if (child) {
+          await stopProcess(child, { graceMs: 5_000 });
         }
       } finally {
         await rm(fixture, { recursive: true, force: true });
@@ -117,24 +110,20 @@ test("docs preview filters the ComputeDriver matrix in a browser", async (t) => 
   const page = await browser.newPage();
   diagnostics = await watchBrowserContext(t, page.context());
   await page.goto(origin);
-  await assert.doesNotReject(
-    page.getByRole("rowheader", { name: /Persist Agent state/ }).waitFor(),
-  );
+  await page.getByRole("rowheader", { name: /Persist Agent state/ }).waitFor();
   await page.getByLabel("Filter ComputeDriver feature matrix by category").selectOption("Storage");
   assert.equal(
     await page.locator("[data-compute-matrix-count]").textContent(),
     `${storageRows} rows`,
   );
-  await assert.doesNotReject(
-    page.getByRole("rowheader", { name: /Share dedicated gateway\/Harness workspace/ }).waitFor(),
-  );
+  await page
+    .getByRole("rowheader", { name: /Share dedicated gateway\/Harness workspace/ })
+    .waitFor();
   await page.getByLabel("Filter ComputeDriver feature matrix by category").selectOption("");
   await page.getByLabel("Search ComputeDriver feature matrix").fill("transport");
-  await assert.doesNotReject(
-    page
-      .getByRole("rowheader", { name: /Persist dedicated transport authentication across retries/ })
-      .waitFor(),
-  );
+  await page
+    .getByRole("rowheader", { name: /Persist dedicated transport authentication across retries/ })
+    .waitFor();
   assert.equal(
     await page.locator("[data-compute-matrix-count]").textContent(),
     `${transportRows} rows`,
@@ -144,7 +133,7 @@ test("docs preview filters the ComputeDriver matrix in a browser", async (t) => 
   });
   const partialDetails = transportRow.locator("details.compute-matrix-status-partial").first();
   await partialDetails.locator("summary").first().click();
-  await assert.doesNotReject(partialDetails.getByText(partialTransportCell.detail).waitFor());
-  await assert.doesNotReject(partialDetails.getByText("Live proof: unknown/not run").waitFor());
-  await assert.doesNotReject(partialDetails.getByText("Source").first().waitFor());
+  await partialDetails.getByText(partialTransportCell.detail).waitFor();
+  await partialDetails.getByText("Live proof: unknown/not run").waitFor();
+  await partialDetails.getByText("Source").first().waitFor();
 });

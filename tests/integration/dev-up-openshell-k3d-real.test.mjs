@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { once } from "node:events";
-import { access, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -11,6 +11,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { openShellProviderName } from "../../apps/controller/src/backends/openshell.ts";
 import { GrpcOpenShellGatewayClient } from "../../apps/controller/src/drivers/sandbox/openshell-gateway-client.ts";
+import { availablePort } from "../helpers/available-port.mjs";
+import { stopProcess } from "../helpers/stop-process.mjs";
 
 const execute = promisify(execFile);
 const repository = resolve(import.meta.dirname, "../..");
@@ -19,32 +21,6 @@ const devUp = join(repository, "scripts", "dev-up");
 const devDown = join(repository, "scripts", "dev-down");
 const selected = process.env.OCC_TEST_DEV_UP_OPENSHELL_REAL === "1";
 const composeSelected = process.env.OCC_TEST_DEV_UP_OPENSHELL_COMPOSE_REAL === "1";
-
-async function unusedPort() {
-  const server = net.createServer();
-  await new Promise((resolveListen, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolveListen);
-  });
-  const address = server.address();
-  assert.ok(address && typeof address === "object");
-  await new Promise((resolveClose, reject) =>
-    server.close((error) => (error === undefined ? resolveClose() : reject(error))),
-  );
-  return address.port;
-}
-
-async function exists(path) {
-  try {
-    await stat(path);
-    return true;
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return false;
-    }
-    throw error;
-  }
-}
 
 async function waitForPort(child, port, stderr) {
   const deadline = Date.now() + 30_000;
@@ -72,19 +48,6 @@ async function waitForPort(child, port, stderr) {
     await delay(100);
   }
   throw new Error(`OpenShell port-forward did not become ready: ${stderr()}`);
-}
-
-async function stopPortForward(child) {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return;
-  }
-  const exited = once(child, "exit");
-  child.kill("SIGTERM");
-  await Promise.race([exited, delay(2_000)]);
-  if (child.exitCode === null && child.signalCode === null) {
-    child.kill("SIGKILL");
-    await exited;
-  }
 }
 
 async function waitForNamespaceReady(environment, apiPort, stateDirectory, namespaceId) {
@@ -219,8 +182,8 @@ test(
     const stateDirectory = join(root, "state");
     const suffix = randomUUID().slice(0, 8);
     const cluster = `occ-dev-openshell-${suffix}`;
-    const apiPort = await unusedPort();
-    const kubernetesPort = await unusedPort();
+    const apiPort = await availablePort();
+    const kubernetesPort = await availablePort();
     const environment = {
       ...process.env,
       OPENCLAW_DEV_PORT: String(apiPort),
@@ -241,7 +204,7 @@ test(
     // Cleanup reuses the state and engine endpoint recorded by this invocation;
     // it must not discover or remove an unrelated cluster.
     t.after(async () => {
-      if (!(await exists(stateDirectory))) {
+      if (!existsSync(stateDirectory)) {
         await rm(root, { recursive: true, force: true });
         return;
       }
@@ -277,7 +240,7 @@ test(
     assert.equal(state.sandboxDriver, "openshell");
     assert.equal(state.deploymentMode, "k3d");
     assert.equal(state.platformNamespace, "oce-system");
-    assert.equal(await exists(join(stateDirectory, "compose.yaml")), false);
+    assert.equal(existsSync(join(stateDirectory, "compose.yaml")), false);
     const kubectl = [
       "--kubeconfig",
       join(stateDirectory, "kubeconfig"),
@@ -450,7 +413,7 @@ test(
 
     // The namespace is not ready until the Sandbox Driver has created and
     // adopted its corresponding Gateway Workspace through the real gRPC API.
-    const gatewayPort = await unusedPort();
+    const gatewayPort = await availablePort();
     const forward = spawn(
       "kubectl",
       [
@@ -467,7 +430,7 @@ test(
     forward.stderr.on("data", (chunk) => {
       forwardError = `${forwardError}${chunk.toString()}`.slice(-4096);
     });
-    t.after(() => stopPortForward(forward));
+    t.after(() => stopProcess(forward));
     await waitForPort(forward, gatewayPort, () => forwardError);
     const gateway = new GrpcOpenShellGatewayClient({
       endpoint: `http://127.0.0.1:${gatewayPort}`,
@@ -663,8 +626,8 @@ test(
     const stateDirectory = join(root, "state");
     const suffix = randomUUID().slice(0, 8);
     const cluster = `occ-dev-os-compose-${suffix}`;
-    const apiPort = await unusedPort();
-    const kubernetesPort = await unusedPort();
+    const apiPort = await availablePort();
+    const kubernetesPort = await availablePort();
     const environment = {
       ...process.env,
       OPENCLAW_DEV_PORT: String(apiPort),
@@ -683,7 +646,7 @@ test(
     delete environment.OCC_DEVELOPMENT_OPENSHELL_WORKSPACE_HELM_CHART;
     delete environment.OCC_DEVELOPMENT_OPENSHELL_AGENT_SANDBOX_MANIFEST;
     t.after(async () => {
-      if (await exists(stateDirectory)) {
+      if (existsSync(stateDirectory)) {
         try {
           await execute(devDown, [], {
             cwd: repository,
@@ -716,7 +679,7 @@ test(
     assert.equal(state.cluster, cluster);
     assert.equal(state.sandboxDriver, "openshell");
     assert.equal(state.deploymentMode, undefined);
-    assert.equal(await exists(join(stateDirectory, "compose.yaml")), true);
+    assert.equal(existsSync(join(stateDirectory, "compose.yaml")), true);
     const kubectl = [
       "--kubeconfig",
       join(stateDirectory, "kubeconfig"),
@@ -761,7 +724,7 @@ test(
       { cwd: repository, env: environment },
     );
 
-    const gatewayPort = await unusedPort();
+    const gatewayPort = await availablePort();
     const forward = spawn(
       "kubectl",
       [
@@ -778,7 +741,7 @@ test(
     forward.stderr.on("data", (chunk) => {
       forwardError = `${forwardError}${chunk.toString()}`.slice(-4096);
     });
-    t.after(() => stopPortForward(forward));
+    t.after(() => stopProcess(forward));
     await waitForPort(forward, gatewayPort, () => forwardError);
     const gateway = new GrpcOpenShellGatewayClient({
       endpoint: `http://127.0.0.1:${gatewayPort}`,
@@ -789,13 +752,13 @@ test(
     assert.equal(workspace?.name, namespace);
     assert.equal(workspace?.labels["app.kubernetes.io/managed-by"], "openclaw-enterprise");
 
-    await stopPortForward(forward);
+    await stopProcess(forward);
     await execute(devDown, [], {
       cwd: repository,
       env: environment,
       timeout: 300_000,
       maxBuffer: 8 * 1024 * 1024,
     });
-    assert.equal(await exists(stateDirectory), false);
+    assert.equal(existsSync(stateDirectory), false);
   },
 );

@@ -371,6 +371,14 @@ test("run fails missing expected tests, skipped expected tests, skips, todos, an
     "unexpected-skip",
     "unexpected-skip",
   ]);
+  // Every issue is named in the job log, which keeps every attempt.
+  for (const line of [
+    "run-tests: issue missing-expected-test tests/integration/skips.test.mjs: expected test did not run: missing named case",
+    "run-tests: issue expected-test-not-passed tests/integration/skips.test.mjs: expected test did not pass: expected but skipped",
+    "run-tests: issue unexpected-skip tests/integration/skips.test.mjs: selected test did not run to completion: todo case",
+  ]) {
+    assert.ok(selected.stderr.split("\n").includes(line), line);
+  }
 });
 
 test("run records failed, skipped, todo, and passed dispositions separately", async (t) => {
@@ -1003,6 +1011,22 @@ test("run redacts arbitrary stdout, stderr, assertion payloads, and stacks from 
           },
         },
         {
+          name: "allowlisted credential service startup reason",
+          diagnostic: {
+            kind: "repository-platform-setup",
+            stage: "credential-service-startup",
+            credentialService: "gateway-listener",
+          },
+        },
+        {
+          name: "rejects unsafe credential service startup reason",
+          diagnostic: {
+            kind: "repository-platform-setup",
+            stage: "credential-service-startup",
+            credentialService: `${secret}-reason`,
+          },
+        },
+        {
           name: "rejects unsafe repository platform setup stage",
           diagnostic: { kind: "repository-platform-setup", stage: `${secret}-stage` },
         },
@@ -1204,6 +1228,22 @@ test("run redacts arbitrary stdout, stderr, assertion payloads, and stacks from 
     kind: "repository-platform-setup",
     stage: "relay-readiness",
   });
+  assert.deepEqual(
+    summary.files[0].tests.find(
+      (entry) => entry.name === "allowlisted credential service startup reason",
+    ).error.diagnostic,
+    {
+      kind: "repository-platform-setup",
+      stage: "credential-service-startup",
+      credentialService: "gateway-listener",
+    },
+  );
+  assert.deepEqual(
+    summary.files[0].tests.find(
+      (entry) => entry.name === "rejects unsafe credential service startup reason",
+    ).error.diagnostic,
+    { kind: "repository-platform-setup", stage: "credential-service-startup" },
+  );
   for (const { name, stage = "relay-readiness", expected } of relayPodCases) {
     const relayFailure = summary.files[0].tests.find((entry) => entry.name === name);
     assert.equal(relayFailure.status, "failed");

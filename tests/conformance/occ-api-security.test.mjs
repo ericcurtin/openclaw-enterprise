@@ -147,7 +147,7 @@ async function createFixture(options = {}) {
             createController(installation) {
               controller = new OpenClawController(installation, {
                 state: new InMemoryPlatformState({ auditSink }),
-                recordOperations: false,
+                recordOperations: true,
                 createId(kind) {
                   if (kind === "configuration") {
                     configurationSequence += 1;
@@ -754,7 +754,17 @@ test("concurrent streaming bootstrap creates one audited Installation", async ()
   assert.equal(bootstrapEvents.length, 1);
   assert.equal(bootstrapEvents[0].resource.id, installation.id);
   assert.equal(bootstrapEvents[0].actorId, fixture.administrator.id);
-  assert.deepEqual(fixture.controller.pendingOperations(), []);
+  // Only the winning bootstrap queues provisioning of the default Namespace.
+  assert.deepEqual(fixture.controller.pendingOperations(), [
+    {
+      kind: "namespace",
+      action: "reconcile",
+      target: "ready",
+      namespaceId: bootstrapDefaultNamespaceId,
+      resourceId: bootstrapDefaultNamespaceId,
+      actorId: fixture.administrator.id,
+    },
+  ]);
 });
 
 test("an existing controller cannot be configured for a different Installation", async () => {

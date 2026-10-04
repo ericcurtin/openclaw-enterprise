@@ -140,6 +140,8 @@ export function createSecretReferenceField({
   createFixedKey,
   metadataLabel = `View ${label} Secret metadata`,
   noSecretLabel = "No Secret bound",
+  // Callers whose form applies the binding with another control name it here.
+  stagedHint = "Secret binding staged. Save changes to apply it.",
   fieldClassName = "form-field",
   selectClassName,
   disabled = false,
@@ -375,7 +377,7 @@ export function createSecretReferenceField({
         secrets.push(secret);
       }
       setSecretOptions();
-      status.textContent = "Secret binding staged. Save changes to apply it.";
+      status.textContent = stagedHint;
     } finally {
       updateValidity();
     }

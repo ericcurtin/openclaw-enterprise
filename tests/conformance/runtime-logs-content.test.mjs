@@ -9,6 +9,7 @@ import {
 } from "../../packages/occ/src/runtime-logs/redact.ts";
 import { sanitizeRuntimeLogChunk } from "../../packages/occ/src/runtime-logs/sanitize.ts";
 import { readRuntimeLogPage } from "../../packages/occ/src/runtime-logs/read.ts";
+import { cpuTimeMs } from "../helpers/cpu-time.mjs";
 import {
   createRuntimeLogCursorCodec,
   RUNTIME_LOG_CURSOR_TTL_MS,
@@ -358,6 +359,93 @@ test("a failed startup phase keeps its fixed cause code", () => {
   );
 });
 
+test("a failed model probe keeps its closed-vocabulary cause, never other cause text", () => {
+  const probe = (event, cause) =>
+    JSON.stringify({ event, elapsedMs: 2340, code: "MODEL_PROBE_FAILED", cause });
+  const { records, withheld } = sanitizeRuntimeLogChunk({
+    stream: { source: "gateway", pod: "gateway-0", container: "gateway" },
+    truncated: false,
+    lines: [
+      {
+        time: lineTime(1),
+        raw: probe("openclaw.model_probe", { kind: "PROBE_STATUS", detail: "format" }),
+      },
+      {
+        time: lineTime(2),
+        raw: probe("codex.model_probe", { kind: "PROBE_STATUS", detail: "error-event" }),
+      },
+      { time: lineTime(3), raw: probe("openclaw.model_probe", { kind: "WRAPPER_ERROR" }) },
+      // Off-vocabulary details, unknown kinds and extra keys drop the cause, never the line.
+      {
+        time: lineTime(4),
+        raw: probe("openclaw.model_probe", { kind: "PROBE_STATUS", detail: "sk-live-abc" }),
+      },
+      { time: lineTime(5), raw: probe("openclaw.model_probe", { kind: "PROVIDER_TEXT" }) },
+      {
+        time: lineTime(6),
+        raw: probe("codex.model_probe", { kind: "PROBE_STATUS", detail: "format", text: "x" }),
+      },
+      { time: lineTime(7), raw: probe("codex.model_probe", "PROBE_STATUS") },
+      {
+        time: lineTime(8),
+        raw: probe("openclaw.model_probe", { kind: "PROBE_STATUS", detail: 42 }),
+      },
+      // Only a failed check carries a cause, and only probe records keep one.
+      {
+        time: lineTime(9),
+        raw: JSON.stringify({
+          event: "codex.model_probe",
+          elapsedMs: 2340,
+          code: "READY",
+          cause: { kind: "PROBE_STATUS", detail: "format" },
+        }),
+      },
+      {
+        time: lineTime(10),
+        raw: JSON.stringify({
+          event: "runtime.startup_phase",
+          phase: "model-probe",
+          outcome: "failed",
+          code: "MODEL_PROBE_FAILED",
+          cause: { kind: "PROBE_STATUS", detail: "format" },
+        }),
+      },
+    ],
+  });
+  assert.equal(withheld, 0);
+  const fields = (event, cause = {}) => ({
+    kind: "wrapper",
+    level: "error",
+    message: event,
+    fields: { elapsedMs: 2340, code: "MODEL_PROBE_FAILED", ...cause },
+  });
+  assert.deepEqual(
+    records.map(({ kind, level, message, fields }) => ({ kind, level, message, fields })),
+    [
+      fields("openclaw.model_probe", { causeKind: "PROBE_STATUS", causeDetail: "format" }),
+      fields("codex.model_probe", { causeKind: "PROBE_STATUS", causeDetail: "error-event" }),
+      fields("openclaw.model_probe", { causeKind: "WRAPPER_ERROR" }),
+      fields("openclaw.model_probe"),
+      fields("openclaw.model_probe"),
+      fields("codex.model_probe"),
+      fields("codex.model_probe"),
+      fields("openclaw.model_probe"),
+      {
+        kind: "wrapper",
+        level: "info",
+        message: "codex.model_probe",
+        fields: { elapsedMs: 2340, code: "READY" },
+      },
+      {
+        kind: "wrapper",
+        level: "error",
+        message: "runtime.startup_phase",
+        fields: { phase: "model-probe", outcome: "failed", code: "MODEL_PROBE_FAILED" },
+      },
+    ],
+  );
+});
+
 test("a Gateway settings override keeps its setting names, never values (D322)", () => {
   const event = (settings) =>
     JSON.stringify({
@@ -595,16 +683,19 @@ test("a PEM block printed over several lines is masked on every line", () => {
   for (const unit of [" ", "a", "A:", "A: ", "-----BEGIN A-----", "-----END A-----"]) {
     const hostile = unit.repeat(Math.ceil((32 * 1024) / unit.length)).slice(0, 32 * 1024 - 1);
     for (const suffix of ["!", " x"]) {
-      const started = performance.now();
-      sanitizeRuntimeLogChunk({
-        stream,
-        truncated: false,
-        lines: ["-----BEGIN X-----", hostile + suffix, hostile + suffix, "-----END X-----"].map(
-          (raw, index) => ({ time: lineTime(index), raw }),
-        ),
-      });
-      const elapsed = performance.now() - started;
-      assert.ok(elapsed < 400, `${JSON.stringify(unit)} took ${elapsed.toFixed(0)} ms`);
+      const budgetMs = 400;
+      const elapsed = cpuTimeMs(
+        () =>
+          sanitizeRuntimeLogChunk({
+            stream,
+            truncated: false,
+            lines: ["-----BEGIN X-----", hostile + suffix, hostile + suffix, "-----END X-----"].map(
+              (raw, index) => ({ time: lineTime(index), raw }),
+            ),
+          }),
+        { budgetMs },
+      );
+      assert.ok(elapsed < budgetMs, `${JSON.stringify(unit)} took ${elapsed.toFixed(0)} ms of CPU`);
     }
   }
 });
@@ -673,28 +764,33 @@ test("redaction stays linear on hostile 32 KiB lines", () => {
   for (const unit of units) {
     for (const suffix of ["", "?", "token", "=x"]) {
       const input = line(unit, suffix);
-      const started = performance.now();
-      redactRuntimeLogText(input);
-      maskRuntimeEventText(input);
-      const elapsed = performance.now() - started;
+      const elapsed = cpuTimeMs(
+        () => {
+          redactRuntimeLogText(input);
+          maskRuntimeEventText(input);
+        },
+        { budgetMs },
+      );
       assert.ok(
         elapsed < budgetMs,
-        `${JSON.stringify(unit)} + ${JSON.stringify(suffix)} took ${elapsed.toFixed(0)} ms`,
+        `${JSON.stringify(unit)} + ${JSON.stringify(suffix)} took ${elapsed.toFixed(0)} ms of CPU`,
       );
     }
   }
   // A whole page of such messages stays well inside one request's budget.
-  const started = performance.now();
-  sanitizeRuntimeLogChunk({
-    stream: { source: "gateway", pod: "gateway-0", container: "gateway" },
-    truncated: false,
-    lines: Array.from({ length: 50 }, (_, index) => ({
-      time: lineTime(index),
-      raw: JSON.stringify({ level: "info", message: "a-".repeat(15 * 1024) }),
-    })),
-  });
-  const elapsed = performance.now() - started;
-  assert.ok(elapsed < 50 * budgetMs, `50 hostile lines took ${elapsed.toFixed(0)} ms`);
+  const elapsed = cpuTimeMs(
+    () =>
+      sanitizeRuntimeLogChunk({
+        stream: { source: "gateway", pod: "gateway-0", container: "gateway" },
+        truncated: false,
+        lines: Array.from({ length: 50 }, (_, index) => ({
+          time: lineTime(index),
+          raw: JSON.stringify({ level: "info", message: "a-".repeat(15 * 1024) }),
+        })),
+      }),
+    { budgetMs: 50 * budgetMs },
+  );
+  assert.ok(elapsed < 50 * budgetMs, `50 hostile lines took ${elapsed.toFixed(0)} ms of CPU`);
 });
 
 test("redaction stays linear on a generated sweep of short repeated units", () => {
@@ -746,10 +842,13 @@ test("redaction stays linear on a generated sweep of short repeated units", () =
   const started = performance.now();
   for (const unit of units) {
     const input = unit.repeat(Math.ceil(length / unit.length)).slice(0, length);
-    const unitStarted = performance.now();
-    redactRuntimeLogText(input);
-    maskRuntimeEventText(input);
-    const elapsed = performance.now() - unitStarted;
+    const elapsed = cpuTimeMs(
+      () => {
+        redactRuntimeLogText(input);
+        maskRuntimeEventText(input);
+      },
+      { budgetMs },
+    );
     if (elapsed > worst.elapsed) {
       worst = { unit, elapsed };
     }
@@ -757,7 +856,7 @@ test("redaction stays linear on a generated sweep of short repeated units", () =
   const total = performance.now() - started;
   assert.ok(
     worst.elapsed < budgetMs,
-    `${JSON.stringify(worst.unit)} took ${worst.elapsed.toFixed(0)} ms (sweep total ${total.toFixed(0)} ms)`,
+    `${JSON.stringify(worst.unit)} took ${worst.elapsed.toFixed(0)} ms of CPU (sweep total ${total.toFixed(0)} ms)`,
   );
 });
 
@@ -1157,6 +1256,134 @@ test("a resumed page cut by the byte limit still reports lines lost before it", 
     overlap.records.map((record) => record.reason ?? record.message),
     ["retrying in 700s", "truncated"],
   );
+  // One line longer than the byte limit fills the page; its leading time still dates the
+  // loss, and the view skips past it (one gap, not a "request fewer lines" truncation).
+  const single = await reader.poll([timedLog("retr", 900)], {
+    elapsed: 900_000,
+    truncated: true,
+  });
+  assert.deepEqual(
+    single.records.map((record) => [record.reason ?? record.message, record.time]),
+    [["window_exceeded", timedLog("", 900).time]],
+  );
+});
+
+test("a resumed view moves past a line longer than the read limit", async () => {
+  const reader = pollReader();
+  const gaps = (page) =>
+    page.records
+      .filter((record) => record.type === "gap")
+      .map(({ reason, time, remedy }) => ({
+        reason,
+        time,
+        remedy,
+      }));
+  // The view delivers second 0 with a PEM block open; `now` is second 600.
+  await reader.poll([timedLog(pemBegin, 0)]);
+  // Every resumed read starts before the cursor time, so it re-reads the overlap line and
+  // then a line over 1 MiB fills the byte limit: nothing new is delivered.
+  const stuck = [timedLog(pemBegin, 0), timedLog("retr", 599)];
+  // Within about 3 s of the read the view stays put; the gap does not ask for fewer lines.
+  const recent = await reader.poll(stuck, { elapsed: 1_000, truncated: true });
+  assert.deepEqual(
+    gaps(recent).map(({ reason }) => reason),
+    ["truncated"],
+  );
+  assert.match(gaps(recent)[0].remedy, /longer than the rest of the 1 MiB read limit/);
+  assert.equal(
+    reader.codec.decode(reader.cursor, reader.binding).position.lastTime,
+    timedLog("", 0).time,
+  );
+  // Once the line is older than where the next read starts, the view skips past it and
+  // says that lines were lost behind it.
+  const skipped = await reader.poll(stuck, { elapsed: 3_000, truncated: true });
+  assert.deepEqual(
+    gaps(skipped).map(({ reason, time }) => [reason, time]),
+    [["window_exceeded", timedLog("", 599).time]],
+  );
+  assert.match(gaps(skipped)[0].remedy, /longer than the rest of the 1 MiB read limit/);
+  assert.doesNotMatch(JSON.stringify(skipped.records), /fewer lines/);
+  const position = reader.codec.decode(reader.cursor, reader.binding).position;
+  assert.equal(position.lastTime, null);
+  // The cursor cannot keep a delivered PEM frontier, so the open block stays masked.
+  assert.equal(position.pemOpen, true);
+  assert.equal(position.pemAfterTime, null);
+  // The next read starts from the previous read, past the oversized line, not from second 0.
+  const next = await reader.poll(
+    [timedLog(syntheticPemTail, 604), timedLog("retrying in 604s", 604)],
+    {
+      elapsed: 5_000,
+    },
+  );
+  assert.equal(reader.requests.at(-1).sinceSeconds, 4);
+  assertTailMasked(next);
+  assert.ok(messages(next).includes("retrying in 604s"));
+  assert.deepEqual(gaps(next), []);
+  // Resume after small lines is unchanged: overlap de-duplication, and a byte cut after a
+  // new line keeps the cursor on that line with the usual remedy.
+  const resumed = await reader.poll(
+    [timedLog("retrying in 604s", 604), timedLog("retrying in 606s", 606), timedLog("retr", 607)],
+    { elapsed: 7_000, truncated: true },
+  );
+  assert.equal(reader.requests.at(-1).sinceSeconds, 5);
+  assert.deepEqual(
+    resumed.records.map((record) => record.reason ?? record.message),
+    ["retrying in 606s", "truncated"],
+  );
+  assert.match(gaps(resumed)[0].remedy, /Request fewer lines/);
+  assert.equal(
+    reader.codec.decode(reader.cursor, reader.binding).position.lastTime,
+    timedLog("", 606).time,
+  );
+  assert.equal(reader.admissions, 1);
+});
+
+test("a resumed view skips a stalled read only when every poll would stall", async () => {
+  const reader = pollReader();
+  const summary = (page) =>
+    page.records.map((record) => [
+      record.reason ?? record.message,
+      ...(record.type === "gap" ? [/fewer lines/.test(record.remedy)] : []),
+    ]);
+  const lastTime = () => reader.codec.decode(reader.cursor, reader.binding).position.lastTime;
+  // `now` is second 600; the view has delivered second 596.
+  await reader.poll([timedLog("retrying in 590s", 590), timedLog("retrying in 596s", 596)]);
+  // A line older than the overlap every read covers is re-read only on some polls, so a
+  // later poll may get past the cut: keep the frontier and the usual remedy.
+  const partial = await reader.poll(
+    [timedLog("retrying in 593s", 593), timedLog("retrying in 596s", 596), timedLog("retr", 606)],
+    { elapsed: 8_000, truncated: true },
+  );
+  assert.deepEqual(summary(partial), [["truncated", true]]);
+  assert.equal(lastTime(), timedLog("", 596).time);
+  // Exactly at the guard the view stays put.
+  const atGuard = await reader.poll([timedLog("retrying in 596s", 596), timedLog("retr", 605)], {
+    elapsed: 8_000,
+    truncated: true,
+  });
+  assert.deepEqual(summary(atGuard), [["truncated", false]]);
+  assert.equal(lastTime(), timedLog("", 596).time);
+  // A cut line at the cursor time also stalls every poll; untimed lines are not progress.
+  const sameTime = await reader.poll(
+    [timedLog("retrying in 596s", 596), timedLog("untimed", null), timedLog("retr", 596)],
+    { elapsed: 8_001, truncated: true },
+  );
+  assert.deepEqual(summary(sameTime), [["untimed"], ["window_exceeded", false]]);
+  assert.equal(sameTime.records.at(-1).time, timedLog("", 596).time);
+  assert.equal(lastTime(), null);
+
+  // A stream replaced during the read is not a stalled read.
+  const replaced = pollReader();
+  await replaced.poll([timedLog("retrying in 0s", 0)]);
+  const page = await replaced.poll([timedLog("retr", 500)], {
+    elapsed: 2_000,
+    truncated: true,
+    stream: { restartCount: 1 },
+  });
+  assert.deepEqual(summary(page), [
+    ["stream_replaced", false],
+    ["truncated", true],
+  ]);
 });
 
 test("runtime log cursor does not let an evicted same-time old END erase a later BEGIN", async () => {

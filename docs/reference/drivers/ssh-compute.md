@@ -223,7 +223,9 @@ reference them through native environment SecretRefs. The Driver sets
 `operatorProvisionedSecrets`, so OCC does not validate unbound channel
 references; verify channel access separately. It still refuses bound Secrets, so
 the Console's Slack credentials step cannot deploy to SSH; set the unbound
-references in native Configuration instead. Systemd reads this file as root;
+references in native Configuration instead. Keep only that Agent's credentials
+in its file, since a Configuration can reference any non-reserved variable
+there. Systemd reads this file as root;
 keep it `root:root 0600`. Protect the state root and SSH identity and never put
 plaintext credentials in native Configuration or Installation YAML.
 

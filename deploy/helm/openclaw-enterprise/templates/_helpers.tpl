@@ -33,6 +33,15 @@
 {{- end -}}
 {{- if not (hasPrefix "https://" .Values.auth.baseUrl) -}}{{- fail "auth.github requires an HTTPS auth.baseUrl" -}}{{- end -}}
 {{- if .Values.agentNativeAdmin.enabled -}}{{- fail "auth.github requires agentNativeAdmin.enabled: false; GitHub sign-in supports host-only cookies only" -}}{{- end -}}
+{{- if not (kindIs "slice" (default list $github.allowedOrgs)) -}}{{- fail "auth.github.allowedOrgs must be a list of GitHub organization logins" -}}{{- end -}}
+{{- range $org := $github.allowedOrgs -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9-]{0,38}$" (lower (trim (toString $org)))) -}}{{- fail "auth.github.allowedOrgs requires GitHub organization logins such as acme" -}}{{- end -}}
+{{- end -}}
+{{- if not (kindIs "slice" (default list $github.allowedTeams)) -}}{{- fail "auth.github.allowedTeams must be a list of org/team-slug entries" -}}{{- end -}}
+{{- range $team := $github.allowedTeams -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9-]{0,38}/[a-z0-9][a-z0-9_-]{0,99}$" (lower (trim (toString $team)))) -}}{{- fail "auth.github.allowedTeams requires org/team-slug entries such as acme/platform" -}}{{- end -}}
+{{- end -}}
+{{- if gt (add (len (default list $github.allowedOrgs)) (len (default list $github.allowedTeams))) 10 -}}{{- fail "auth.github.allowedOrgs and auth.github.allowedTeams list at most 10 entries together" -}}{{- end -}}
 {{- if not (kindIs "slice" (default list $github.egressCidrs)) -}}{{- fail "auth.github.egressCidrs must be a list of IPv4 CIDRs; leave it empty for HTTPS egress to any address" -}}{{- end -}}
 {{- range $cidr := $github.egressCidrs -}}
 {{- if not (regexMatch "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([1-9]|[12][0-9]|3[0-2])$" (toString $cidr)) -}}{{- fail "auth.github.egressCidrs requires explicit IPv4 CIDRs with prefixes 1 through 32" -}}{{- end -}}

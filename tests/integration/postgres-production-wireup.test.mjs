@@ -13,12 +13,14 @@ import { FilesystemConfigurationDriver } from "../../apps/controller/src/drivers
 import { createControllerWorker } from "../../apps/controller/src/worker.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { composeProduction } from "../../apps/controller/src/composition/production.ts";
+import { composePostgresDevelopment } from "../../apps/controller/src/composition/development-postgres.ts";
 import { loadInstallationConfiguration } from "../../apps/controller/src/composition/installation-config.ts";
 import { createOccLogger } from "../../apps/controller/src/logging.ts";
 import { createTestConfigurationDriver } from "../helpers/configuration-driver.mjs";
 import { authenticatedHeaders, signInWithEmailPassword } from "../helpers/auth-session.mjs";
 import { createInstallationDriverConfiguration } from "../helpers/installation-driver-configuration.mjs";
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
+import { normalizePresetTemplate } from "../../packages/contracts/src/index.ts";
 import { BOOTSTRAP_DEFAULT_NAMESPACE_NAME } from "../../packages/occ/src/index.ts";
 
 const databaseUrl = process.env.OCC_PRODUCTION_WIREUP_DATABASE_URL;
@@ -108,9 +110,9 @@ function parseLogEvents(stderr) {
     .map((line) => JSON.parse(line));
 }
 
-async function productionDrivers({ includeDefaults = false, configurationRoot } = {}) {
+async function productionDrivers({ includeDefaults = false, files, configurationRoot } = {}) {
   const configuration = createInstallationDriverConfiguration();
-  configuration.presets = { includeDefaults };
+  configuration.presets = { includeDefaults, ...(files === undefined ? {} : { files }) };
   configuration.drivers.compute.id = "compute-production-wireup";
   configuration.drivers.iam.id = "native-iam";
   const runtime = await loadInstallationConfiguration({
@@ -126,6 +128,7 @@ async function productionDrivers({ includeDefaults = false, configurationRoot } 
   return {
     installation,
     defaultPresets: runtime.defaultPresets,
+    bundledPresetVersions: runtime.bundledPresetVersions,
     computeDriver: createPassiveComputeDriver(),
     configurationDriver: configurationRoot
       ? new FilesystemConfigurationDriver(configurationRoot)
@@ -390,12 +393,14 @@ test(
       assert.equal(privileges.rows[0].can_create_schema, false);
 
       const apiLog = memoryLog();
+      const startupPhases = [];
       app = await composeProduction({
         mode: "production",
         host: "127.0.0.1",
         databaseUrl,
         authSecret,
         authBaseURL,
+        onStartupPhase: (phase, durationMs) => startupPhases.push({ phase, durationMs }),
         // Leftover pilot settings must not change authentication when the feature is disabled.
         nativeAdmin: {
           enabled: false,
@@ -429,6 +434,12 @@ test(
         ],
         "production API composition must emit the Compute warning and continue startup",
       );
+      // The API's `listening` line reports these, so an operator can see which phase was slow.
+      assert.deepEqual(
+        startupPhases.map(({ phase }) => phase),
+        ["database", "authentication", "identity", "computePreflight", "controller", "routes"],
+      );
+      assert.ok(startupPhases.every(({ durationMs }) => Number.isSafeInteger(durationMs)));
       endpoint = await app.listen({ port: 0, host: "127.0.0.1" });
 
       await assert.rejects(
@@ -536,19 +547,45 @@ test(
         template: { agent: { name: "Kept across restart" } },
       });
       assert.equal(customized.status, 200);
-      await app.close();
-      app = await composeProduction({
-        mode: "production",
-        host: "127.0.0.1",
-        databaseUrl,
-        authSecret,
-        authBaseURL,
-        drivers: await productionDrivers({
-          includeDefaults: true,
-          configurationRoot: join(passwordDirectory, "configurations"),
-        }),
+      // Roll Standard OpenClaw back to an earlier shipped version, as a Namespace seeded
+      // by that release holds it. The restart below must refresh it in place.
+      const archivedPreset = async (path) =>
+        JSON.parse(
+          await readFile(new URL(`../../deploy/presets/archive/${path}`, import.meta.url), "utf8"),
+        );
+      const earlierOpenClaw = await archivedPreset("standard-openclaw/ed4bae5153f86b94.json");
+      const rolledBack = await request("PATCH", `${presetPath}/${copiedOpenClaw.id}`, {
+        template: earlierOpenClaw.template,
       });
-      endpoint = await app.listen({ port: 0, host: "127.0.0.1" });
+      assert.equal(rolledBack.status, 200);
+      assert.notDeepEqual(rolledBack.data.template, copiedOpenClaw.template);
+      const restart = async (drivers, logger) => {
+        await app.close();
+        app = await composeProduction({
+          mode: "production",
+          host: "127.0.0.1",
+          databaseUrl,
+          authSecret,
+          authBaseURL,
+          drivers: await productionDrivers({
+            ...drivers,
+            configurationRoot: join(passwordDirectory, "configurations"),
+          }),
+          ...(logger === undefined ? {} : { logger }),
+        });
+        endpoint = await app.listen({ port: 0, host: "127.0.0.1" });
+      };
+      const readOpenClaw = async () =>
+        (await request("GET", `${presetPath}/${copiedOpenClaw.id}`)).data;
+      // The same file seeded through presets.files, with includeDefaults off, is never refreshed.
+      await restart({
+        includeDefaults: false,
+        files: [
+          fileURLToPath(new URL("../../deploy/presets/standard-openclaw.json", import.meta.url)),
+        ],
+      });
+      assert.deepEqual(await readOpenClaw(), rolledBack.data);
+      await restart({ includeDefaults: true });
       const afterRestart = await request("GET", presetPath);
       assert.deepEqual(afterRestart.data.map((preset) => preset.name).sort(), [
         "Standard Codex",
@@ -559,10 +596,66 @@ test(
         afterRestart.data.find((preset) => preset.name === "Standard Codex"),
         customized.data,
       );
+      // Refreshed from the stored JSONB: same ID, current template. The edit above stays.
       assert.deepEqual(
         afterRestart.data.find((preset) => preset.name === "Standard OpenClaw"),
         copiedOpenClaw,
       );
+      // A Restriction freezing the Namespace's Presets keeps an earlier copy, and startup
+      // only warns. It stays for the rest of this test, which never updates these Presets.
+      const refrozen = await request("PATCH", `${presetPath}/${copiedOpenClaw.id}`, {
+        template: earlierOpenClaw.template,
+      });
+      assert.equal(refrozen.status, 200);
+      const freezeId = `freeze-presets-${randomUUID()}`;
+      await pool.query(
+        "INSERT INTO occ.iam_restrictions (id, namespace_id, action, resource_kind) VALUES ($1, $2, 'update', 'preset')",
+        [freezeId, defaultNamespace[0].id],
+      );
+      const skippedRefreshes = ({ lines }) =>
+        lines
+          .filter(({ event }) => event === "presets.default-refresh-skipped")
+          .map(({ severity, namespaceId, presetId, presetName, reason, restrictionIds }) => ({
+            severity,
+            namespaceId,
+            presetId,
+            presetName,
+            reason,
+            restrictionIds,
+          }));
+      const frozenWarning = [
+        {
+          severity: "WARN",
+          namespaceId: defaultNamespace[0].id,
+          presetId: copiedOpenClaw.id,
+          presetName: "Standard OpenClaw",
+          reason: "An applicable Restriction denies the exact action and resource.",
+          restrictionIds: [freezeId],
+        },
+      ];
+      const frozenLog = memoryLog();
+      await restart({ includeDefaults: true }, frozenLog.logger);
+      assert.deepEqual(await readOpenClaw(), refrozen.data);
+      assert.deepEqual(skippedRefreshes(frozenLog), frozenWarning);
+      // Development PostgreSQL startup passes the same warning to its logger.
+      const developmentLog = memoryLog();
+      const development = await composePostgresDevelopment(
+        {
+          mode: "development",
+          host: "127.0.0.1",
+          databaseUrl,
+          authSecret,
+          authBaseURL,
+          logger: developmentLog.logger,
+        },
+        await productionDrivers({
+          includeDefaults: true,
+          configurationRoot: join(passwordDirectory, "configurations"),
+        }),
+      );
+      await development.close();
+      assert.deepEqual(await readOpenClaw(), refrozen.data);
+      assert.deepEqual(skippedRefreshes(developmentLog), frozenWarning);
       const newNamespace = await request("POST", "/namespaces", {
         name: "Preset startup namespace",
       });
@@ -580,6 +673,18 @@ test(
       assert.notEqual(
         newPresets.data.find((preset) => preset.name === "Standard OpenClaw").id,
         copiedOpenClaw.id,
+      );
+      // An earlier release seeded this default under a name the bundle no longer ships.
+      // The Namespace is still provisioning, so write the row as that seeding did.
+      const earlierCodex = await archivedPreset("standard-codex/a07d1e2070d95c99.json");
+      await pool.query(
+        "INSERT INTO occ.presets (id, namespace_id, name, template, created_at) VALUES ($1, $2, $3, $4, now())",
+        [
+          `pre_${randomUUID()}`,
+          newNamespace.data.id,
+          earlierCodex.name,
+          JSON.stringify(normalizePresetTemplate(earlierCodex.template, newNamespace.data.id)),
+        ],
       );
       // Only unmodified seeded defaults remain, so deletion removes them with the Namespace.
       const deletedNamespace = await request("DELETE", `/namespaces/${newNamespace.data.id}`);

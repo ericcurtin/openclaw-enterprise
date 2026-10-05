@@ -47,6 +47,7 @@ import {
   agentPostRequests,
   optionValues,
   createRepositoryLaunchFixture,
+  waitForCreateFormReads,
 } from "./console-agents-test-support.mjs";
 
 const defaultCodexPreset = JSON.parse(
@@ -480,6 +481,7 @@ test("Agent creation keeps loading and empty repository discovery safe for an or
   assert.equal(await page.getByRole("button", { name: "Create Agent" }).isDisabled(), true);
   releaseOptions();
   await page.getByText(/No approved repositories are available/).waitFor();
+  await waitForCreateFormReads(page);
   assert.equal(await page.getByRole("button", { name: "Create Agent" }).isEnabled(), true);
 
   await enterManualModel(page, "repository-fixture-model-key", "gpt-5.1");
@@ -620,6 +622,7 @@ test("Agent creation distinguishes unavailable repository choices from denied Ag
     await setupGuide.getAttribute("href"),
     "https://github.com/openclaw/openclaw-enterprise/blob/main/docs/guides/repository-credentials/team-runbook.md",
   );
+  await waitForCreateFormReads(unavailablePage);
   assert.equal(
     await unavailablePage.getByRole("button", { name: "Create Agent" }).isEnabled(),
     true,
@@ -659,6 +662,8 @@ test("Agent creation distinguishes unavailable repository choices from denied Ag
   await login(deniedPage, deniedFixture, `/console/agents/new?namespace=${deniedNamespace.id}`);
   await deniedPage.getByRole("button", { name: "Start with default Preset" }).click();
   await deniedPage.getByText(/Repository choices are denied/).waitFor();
+  // The disabled state must reflect both reads' outcome, not a read still pending.
+  await waitForCreateFormReads(deniedPage);
   assert.equal(await deniedPage.getByRole("button", { name: "Create Agent" }).isDisabled(), true);
   await deniedPage.locator("#create-agent-form").evaluate((form) => form.requestSubmit());
   assert.equal(configurationPostRequests(deniedRequests, deniedNamespace.id).length, 0);

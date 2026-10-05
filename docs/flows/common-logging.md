@@ -169,10 +169,14 @@ the local diagnostic message is excluded from remote export.
 `authentication.sign-in-limit-warning` keeps `occ.code`, and
 `authentication.sign-in-limited` keeps only `occ.sign_in.lane`; its local key
 hash is not exported. `authentication.provider-unavailable-warning` keeps
-`occ.sign_in.provider`, `.step`, `.cause` and `.status`, plus a transport code as
-`occ.code`; the provider instance ID stays local.
+`occ.sign_in.provider`, `.step` (`authorization`, `token`, `jwks`, `profile` or
+`membership`), `.cause` and `.status`, plus a transport code as `occ.code`; the provider
+instance ID stays local.
 `worker.repository-cleanup-warning` keeps `occ.code` and its bounded cause as
-`occ.worker.cause`. It drops malformed,
+`occ.worker.cause`.
+`presets.default-refresh-skipped` (a default Preset copy kept because policy refused
+its refresh) is WARN and keeps `occ.namespace.id` and `occ.preset.id`; the Preset
+name, refusal text and Restriction IDs stay local. The Collector drops malformed,
 oversized, unclassified, unspecified-severity, and Codex protocol stdout records.
 OpenClaw's Gateway startup failure (an `error` record with no subsystem whose
 message starts `Gateway failed to start:`) is exported as
@@ -220,6 +224,8 @@ for panels, correlation, and authorization limits.
 [keep this for the user to add notes. do not change between edits]
 
 ## Changelog
+
+- 2026-10-04 23:10: Export `presets.default-refresh-skipped` as WARN with only the Namespace and Preset IDs. (bh13-fu2-collector - e54a08048)
 
 - 2026-10-01 14:45: Export sign-in provider outage warnings with bounded provider, step, cause and status attributes. (collector-auth-warning - 769c8cd88)
 

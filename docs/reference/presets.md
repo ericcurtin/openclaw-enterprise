@@ -32,16 +32,31 @@ including the bootstrap Namespace; new Namespaces receive them atomically. Start
 skips failed or deleting Namespaces.
 
 Each copy is an ordinary Namespace-owned Preset with its own ID and normal
-read/update/delete permissions. Matching names are preserved without comparing
-or overwriting their templates. Startup can restore a deleted or renamed
-default while enabled; bundle updates do not replace existing copies. Removing the files and disabling
+read/update/delete permissions. Startup can restore a deleted or renamed
+default while enabled. Removing the files and disabling
 `includeDefaults` stops seeding and leaves saved Presets and Agents unchanged.
-Namespace deletion removes copies that still match the current default by name
-and template; edited copies block it with `409 NAMESPACE_NOT_EMPTY`.
 Restart the API after changing the YAML, keeping the worker configuration in sync.
 
+### Bundled default upgrades
+
+Earlier shipped versions of the bundled defaults are archived in
+`deploy/presets/archive/`. While `includeDefaults` is enabled, startup replaces
+a same-name copy that still equals an earlier version (normalized JSON) with the
+current template, keeping its ID and AccessBindings, and audits
+`openclaw.presets.update` with `source: installation-defaults-refresh`. Copies
+matching no shipped version are operator edits and stay; so do `presets.files`
+copies and retired names such as `standard-codex`. To keep an earlier version,
+rename the copy or change any field. A refused refresh (say, a deny Restriction
+on `preset:update`) keeps the copy and logs a `presets.default-refresh-skipped`
+warning.
+
+Namespace deletion removes copies that equal, by name and template, a configured
+default or any shipped bundled version, even with `includeDefaults` disabled.
+Other Presets block it with `409 NAMESPACE_NOT_EMPTY`.
+
 Startup selects a persisted Principal authorized to administer the Installation
-and requires `preset:create` wherever defaults are missing. Namespace
+and requires `preset:create` wherever defaults are missing and `preset:update`
+on each copy it refreshes. Namespace
 creators likewise need `preset:create` when this option is enabled. Authorization
 or template validation failure rolls back initialization and prevents startup
 or Namespace creation. The selected Configuration Driver validates native
@@ -74,8 +89,7 @@ through `includeDefaults`, `presets.files`, or Preset POST to enable it.
 console's shared configuration base and ordinary creation permissions.
 
 The shipped default file also supplies the console's shared configuration base
-for empty templates, **Reset template**, and provider/Harness switches. It replaces
-the former inline starter. The installed copy supplies initial draft settings;
+for empty templates, **Reset template**, and provider/Harness switches. The installed copy supplies initial draft settings;
 normal field edits preserve unrelated settings, while **Reset template** explicitly
 returns to the shipped base with the selected model. No installed credential or
 private template is exposed by the public shared-default asset.
@@ -276,13 +290,13 @@ The collection path is `/namespaces/:namespaceId/presets`; an exact Preset adds
 `/:presetId`. Use the [generated API reference](api.md#presets) for full schemas
 and response envelopes.
 
-| Request                                            | Result                  | Required permission                          |
-| -------------------------------------------------- | ----------------------- | -------------------------------------------- |
-| `POST` collection with `{name, template}`          | `201`, created Preset   | `preset:create` on the Namespace collection. |
-| `GET` collection                                   | `200`, readable Presets | `preset:read` checked on each candidate.     |
-| `GET` exact Preset                                 | `200`, Preset           | `preset:read` on that Preset.                |
-| `PATCH` exact Preset with `name` and/or `template` | `200`, updated Preset   | `preset:update` on that Preset.              |
-| `DELETE` exact Preset                              | `204`                   | `preset:delete` on that Preset.              |
+| Request                                            | Result                  | Required permission                                             |
+| -------------------------------------------------- | ----------------------- | --------------------------------------------------------------- |
+| `POST` collection with `{name, template}`          | `201`, created Preset   | `preset:create` on the Namespace collection.                    |
+| `GET` collection                                   | `200`, readable Presets | Namespace `read`, then `preset:read` checked on each candidate. |
+| `GET` exact Preset                                 | `200`, Preset           | `preset:read` on that Preset.                                   |
+| `PATCH` exact Preset with `name` and/or `template` | `200`, updated Preset   | `preset:update` on that Preset.                                 |
+| `DELETE` exact Preset                              | `204`                   | `preset:delete` on that Preset.                                 |
 
 An included `template` replaces the whole template, including variable
 definitions; omitted fields stay unchanged. Writes check the template structure,
@@ -320,8 +334,9 @@ bindings, but keeps copied Agents, Configurations, and credential sources.
 
 ## Limits and recovery
 
-Presets are managed through the HTTP API; the console only selects and applies
-them. There are no Preset CLI commands, inheritance, version history, or Agent
+Create and update Presets through the HTTP API; `occ preset list`, `get`, and
+`delete` cover the rest ([CLI reference](cli.md#resource-commands)). The console
+only selects and applies them. There is no inheritance, version history, or Agent
 metadata recording which Preset was used. Creation still saves a Configuration
 and an Agent separately. Follow [partial-save recovery](console/create-and-deploy.md#create-an-agent)
 if the second save fails or a response is lost.

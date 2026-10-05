@@ -1,23 +1,13 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import { resolveApprovedHarness as resolveApprovedDevelopmentHarness } from "../../apps/controller/src/composition/production-harness.ts";
-import { createControllerApp } from "../../apps/controller/src/index.ts";
 import { InMemoryAuditSink } from "../../packages/audit/src/index.ts";
-import { NativeIAMDriver } from "../../packages/iam/src/index.ts";
 import {
   BOOTSTRAP_DEFAULT_NAMESPACE_NAME,
   createRuntimeLogCursorCodec,
-  InMemoryPlatformState,
-  OpenClawController,
   RuntimeLogsForbiddenByClusterError,
 } from "../../packages/occ/src/index.ts";
-import {
-  authenticatedHeaders,
-  createTestAuthPrincipal,
-  signInToControllerApp,
-} from "../helpers/auth-session.mjs";
-import { createTestConfigurationDriver } from "../helpers/configuration-driver.mjs";
+import { authenticatedHeaders } from "../helpers/auth-session.mjs";
 import { createTestKubernetesComputeDriver } from "../helpers/kubernetes-compute.mjs";
 import {
   administerGrants,
@@ -25,11 +15,11 @@ import {
   createRuntimeLogFixture,
   operateGrants,
 } from "../helpers/runtime-logs.mjs";
+import { createTenantReaderFixture, tenantANamespaceId } from "../helpers/tenant-reader-app.mjs";
 
 const installationId = "ins_3033697e-6397-4cc6-9b04-8ec17af78cf1";
 const missingRevisionId = "rev_3dd29693-ce8b-4b4c-97c4-14b4c68c6e9c";
 const bootstrapDefaultNamespaceId = "ns_00000000-0000-4000-8000-000000000001";
-const tenantANamespaceId = "ns_00000000-0000-4000-8000-000000000002";
 
 const permissions = [
   { action: "administer", resourceKind: "installation" },
@@ -49,164 +39,52 @@ const permissions = [
   { action: "administer", resourceKind: "agent" },
 ];
 
-async function createFixture(options = {}) {
-  const adminAuth = await createTestAuthPrincipal({
-    installationId,
-    name: "Security Administrator",
-  });
-  const administrator = adminAuth.seed.principal;
-  const readerEmail = `tenant-a-reader-${randomUUID()}@example.com`;
-  const readerPassword = `generated-password-${randomUUID()}`;
-  const readerAccount = await adminAuth.auth.createAccount({
-    email: readerEmail,
-    password: readerPassword,
-    name: "Tenant A Reader",
-  });
-  const readerSeed = adminAuth.auth.principalSeed(readerAccount, { grant: "none" });
-  const tenantAReader = readerSeed.principal;
-  const identities = options.identities ?? [administrator, tenantAReader];
-  const identityIds = new Set(identities.map(({ id }) => id));
-  const state = {
-    identities,
-    groups: [],
-    memberships: [],
-    roles: [
-      {
-        id: "role-administrator",
-        permissions: [...permissions],
-      },
-      {
-        id: "role-tenant-a-reader",
-        namespaceId: tenantANamespaceId,
-        permissions: [
-          { action: "read", resourceKind: "namespace" },
-          { action: "read", resourceKind: "agent" },
-          { action: "read", resourceKind: "agent_revision" },
-        ],
-      },
-    ],
-    bindings: [
-      {
-        id: "binding-administrator",
-        subjectKind: "identity",
-        subjectId: administrator.id,
-        roleId: "role-administrator",
-      },
-      {
-        id: "binding-tenant-a-reader",
-        namespaceId: tenantANamespaceId,
-        subjectKind: "identity",
-        subjectId: tenantAReader.id,
-        roleId: "role-tenant-a-reader",
-      },
-    ].filter(({ subjectId }) => identityIds.has(subjectId)),
-    restrictions: options.restrictions ?? [],
-  };
-  const iamDriver = new NativeIAMDriver(
-    { loadNativeIAMState: async () => state },
-    { id: "iam-security" },
-  );
-  const computeDriver = {
-    id: "compute-security",
-    capability: "compute",
-    implementation: "deterministic-test",
-    async ensureNamespace(namespace) {
-      return {
-        namespaceId: namespace.id,
-        namespaceReady: true,
-      };
-    },
-    async deleteNamespace(namespace) {
-      return {
-        namespaceId: namespace.id,
-        namespaceDeleted: true,
-      };
-    },
-    async prepareRevision(revision) {
-      return {
-        namespaceId: revision.namespaceId,
-        agentId: revision.agentId,
-        revisionId: revision.id,
-        ready: true,
-      };
-    },
-    async retireRevision() {},
-  };
-  const auditSink = new InMemoryAuditSink();
-  const configurationDriver = createTestConfigurationDriver({ id: "configuration-security" });
-  const sessions = new Map();
-  let controller;
-  let sequence = 0;
-  let configurationSequence = 0;
+// A Compute Driver whose Namespaces and Revisions are always ready.
+const createComputeDriver = () => ({
+  id: "compute-security",
+  capability: "compute",
+  implementation: "deterministic-test",
+  async ensureNamespace(namespace) {
+    return {
+      namespaceId: namespace.id,
+      namespaceReady: true,
+    };
+  },
+  async deleteNamespace(namespace) {
+    return {
+      namespaceId: namespace.id,
+      namespaceDeleted: true,
+    };
+  },
+  async prepareRevision(revision) {
+    return {
+      namespaceId: revision.namespaceId,
+      agentId: revision.agentId,
+      revisionId: revision.id,
+      ready: true,
+    };
+  },
+  async retireRevision() {},
+});
 
-  function createApp(principal = administrator, overrides = {}, factory = createControllerApp) {
-    const app = factory({
-      ...(controller
-        ? { controller }
-        : {
-            createController(installation) {
-              controller = new OpenClawController(installation, {
-                state: new InMemoryPlatformState({ auditSink }),
-                recordOperations: true,
-                createId(kind) {
-                  if (kind === "configuration") {
-                    configurationSequence += 1;
-                    return `cfg_10000000-0000-4000-8000-${String(configurationSequence).padStart(12, "0")}`;
-                  }
-                  sequence += 1;
-                  const prefix = {
-                    namespace: "ns",
-                    agent: "agt",
-                    agent_revision: "rev",
-                  }[kind];
-                  return `${prefix}_00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`;
-                },
-              });
-              return controller;
-            },
-          }),
-      iamDriver,
-      computeDriver,
-      configurationDriver,
-      resolveHarness: resolveApprovedDevelopmentHarness,
-      auditSink,
-      development: {
-        enabled: true,
-        installationId,
-        ...overrides.development,
-      },
-      auth: adminAuth.auth,
+function createFixture(options = {}) {
+  return createTenantReaderFixture({
+    installationId,
+    label: "security",
+    administratorName: "Security Administrator",
+    readerName: "Tenant A Reader",
+    administratorPermissions: permissions,
+    computeDriver: createComputeDriver(),
+    recordOperations: true,
+    appOptions: (overrides) => ({
       ...(overrides.maxBodyBytes === undefined ? {} : { maxBodyBytes: overrides.maxBodyBytes }),
       ...(overrides.gatewayRequestTimeoutMs === undefined
         ? {}
         : { gatewayRequestTimeoutMs: overrides.gatewayRequestTimeoutMs }),
       ...(overrides.publicOrigin === undefined ? {} : { publicOrigin: overrides.publicOrigin }),
-    });
-    app.defaultSession = sessions.get(principal.id);
-    return app;
-  }
-
-  const app = createApp(administrator, options);
-  sessions.set(administrator.id, await signInToControllerApp(app, adminAuth));
-  sessions.set(
-    tenantAReader.id,
-    await signInToControllerApp(app, { email: readerEmail, password: readerPassword }),
-  );
-  app.defaultSession = sessions.get(administrator.id);
-
-  return {
-    app,
-    administrator,
-    tenantAReader,
-    auditSink,
-    createApp,
-    auth: adminAuth.auth,
-    iamDriver,
-    state,
-    get controller() {
-      return controller;
-    },
-  };
+    }),
+    options,
+  });
 }
 
 async function request(app, pathname, options = {}) {
@@ -904,6 +782,97 @@ test("exact Namespace ownership prevents cross-tenant access and resource traver
     assert.equal(event.namespaceId, namespaceB.id);
     assert.equal(event.outcome, "denied");
   }
+});
+
+test("a caller without a grant gets the same audited denial whether or not the target exists", async () => {
+  const fixture = await createFixture();
+  await bootstrap(fixture);
+  await createNamespace(fixture, "Tenant A");
+  const namespace = await createNamespace(fixture, "Tenant B");
+  const agent = await createAgent(fixture, namespace, "Agent B");
+  const missingNamespaceId = "ns_9e5b1c7a-5d2f-4c1e-8a3b-0f6d2e7c9a41";
+  const missingAgentId = "agt_4b8e2d1f-7a3c-4e9b-9c5d-2a1f8e6b3d70";
+  const child = (prefix) => `${prefix}_6c2a9f1e-3b7d-4a8c-b5e1-9d4f2a7c8e03`;
+  const reader = fixture.tenantAReader;
+  const readerApp = fixture.createApp(reader);
+
+  // The reader holds no grant in Tenant B. Every target below must answer the same audited
+  // 403 whether the Namespace or Agent exists, so a refusal never reveals which ids are real.
+  const namespaceRoutes = [
+    ["GET", "agents/repository-options"],
+    ["GET", `agents/provision/${child("work")}`],
+    ["POST", `agents/provision/${child("work")}/retry`],
+    ["GET", "presets"],
+    ["POST", "agents", { name: "probe", configurationId: agent.configurationId }],
+    ["POST", "configurations", { kind: "agent", values: {} }],
+    ["PATCH", `configurations/${child("cfg")}`, { values: {} }],
+    ["DELETE", `configurations/${child("cfg")}`],
+    ["POST", "secrets", { name: "probe", value: "probe-value" }],
+    ["PATCH", `secrets/${child("sec")}`, { value: "probe-value" }],
+    ["DELETE", `secrets/${child("sec")}`],
+    ["POST", "credential-sources", { name: "probe", type: "openai" }],
+    ["PATCH", `credential-sources/${child("cs")}`, {}],
+    ["DELETE", `credential-sources/${child("cs")}`],
+    ["POST", "presets", { name: "probe", template: {} }],
+    ["PATCH", `presets/${child("pre")}`, { name: "probe" }],
+    ["DELETE", `presets/${child("pre")}`],
+    ["POST", "service-accounts", { name: "probe" }],
+    ["POST", `service-accounts/${child("sa")}/credentials`, {}],
+    [
+      "PATCH",
+      `service-accounts/${child("sa")}/credential`,
+      { kind: "api_key", secretRef: { name: "probe", key: "probe" } },
+    ],
+    ["DELETE", `service-accounts/${child("sa")}`],
+    ["DELETE", ""],
+  ];
+  const agentRoutes = [
+    ["GET", ""],
+    ["GET", `revisions/${missingRevisionId}`],
+    ["GET", `deployments/${missingRevisionId}`],
+    ["GET", "repository-options"],
+    ["PATCH", "", { configurationId: agent.configurationId }],
+    ["POST", "deploy"],
+    ["POST", "stop"],
+    ["POST", `credential-sources/${child("cs")}/withdraw`],
+    ["DELETE", ""],
+  ];
+  const probes = [
+    ...namespaceRoutes.flatMap(([method, suffix, body]) =>
+      [namespace.id, missingNamespaceId].map((namespaceId) => ({
+        method,
+        body,
+        pathname: `/namespaces/${namespaceId}${suffix ? `/${suffix}` : ""}`,
+      })),
+    ),
+    ...agentRoutes.flatMap(([method, suffix, body]) =>
+      [
+        [namespace.id, agent.id],
+        [namespace.id, missingAgentId],
+        [missingNamespaceId, missingAgentId],
+      ].map(([namespaceId, agentId]) => ({
+        method,
+        body,
+        pathname: `/namespaces/${namespaceId}/agents/${agentId}${suffix ? `/${suffix}` : ""}`,
+      })),
+    ),
+  ];
+
+  const leaks = [];
+  for (const { method, pathname, body } of probes) {
+    const auditCount = fixture.auditSink.events.length;
+    const result = await request(readerApp, pathname, {
+      method,
+      ...(body === undefined ? {} : { body }),
+    });
+    const denials = fixture.auditSink.events
+      .slice(auditCount)
+      .filter((event) => event.kind === "authorization_denial" && event.actorId === reader.id);
+    if (result.response.status !== 403 || denials.length !== 1) {
+      leaks.push(`${method} ${pathname}: ${result.response.status}, ${denials.length} denials`);
+    }
+  }
+  assert.deepEqual(leaks, []);
 });
 
 test("Namespace deletion authorizes the exact target and rejects nonempty resources", async () => {
@@ -1626,19 +1595,52 @@ test("runtime log reads are rate limited per principal and Agent with Retry-Afte
   assert.equal(limited.body.error.code, "RUNTIME_LOGS_RATE_LIMITED");
   assert.match(limited.headers.get("retry-after") ?? "", /^[1-9][0-9]*$/);
 
-  // The limiter runs before authorization (documented): an unauthorized principal can
-  // only spend its own bucket, never another principal's, and never reaches the Driver.
+  // Authorization runs before the limiter: an unauthorized principal past the burst is
+  // still refused with 403 and audited every time, takes no token and never reaches the
+  // Driver. (A limiter answering first would hide denials behind unaudited 429s.)
   const outsider = await fixture.createPrincipal("runtime-outsider", target, []);
   fixture.computeDriver.calls.length = 0;
+  const deniedBefore = fixture.auditSink.events.filter(
+    (event) => event.kind === "authorization_denial" && event.actorId === outsider.principal.id,
+  ).length;
   const statuses = [];
   for (let attempt = 0; attempt < 12; attempt += 1) {
-    statuses.push(
-      (await fixture.request("GET", target.runtimePath, { session: outsider.session })).status,
-    );
+    for (const path of [target.runtimePath, target.logsPath()]) {
+      statuses.push((await fixture.request("GET", path, { session: outsider.session })).status);
+    }
   }
-  assert.ok(statuses.includes(403));
-  assert.equal(statuses.at(-1), 429);
+  assert.deepEqual(new Set(statuses), new Set([403]));
+  assert.equal(
+    fixture.auditSink.events.filter(
+      (event) => event.kind === "authorization_denial" && event.actorId === outsider.principal.id,
+    ).length - deniedBefore,
+    statuses.length,
+  );
   assert.equal(fixture.computeDriver.calls.length, 0);
+  // The denials took no token: once granted, the same principal still has its full burst.
+  for (const grant of operateGrants) {
+    const id = `runtime-outsider-${grant.resourceKind}-${grant.action}`;
+    fixture.policy.roles.push({
+      id,
+      namespaceId: target.namespace.id,
+      permissions: [{ action: grant.action, resourceKind: grant.resourceKind }],
+    });
+    fixture.policy.bindings.push({
+      id,
+      namespaceId: target.namespace.id,
+      subjectKind: "identity",
+      subjectId: outsider.principal.id,
+      roleId: id,
+      resourceKind: grant.resourceKind,
+      resourceId: grant.resourceKind === "agent_revision" ? target.revisionId : target.agent.id,
+    });
+  }
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const granted = await fixture.request("GET", target.runtimePath, {
+      session: outsider.session,
+    });
+    assert.equal(granted.status, 200, granted.text);
+  }
   const operator = await fixture.createPrincipal("runtime-limit-operator", target, operateGrants);
   const unaffected = await fixture.request("GET", target.runtimePath, {
     session: operator.session,

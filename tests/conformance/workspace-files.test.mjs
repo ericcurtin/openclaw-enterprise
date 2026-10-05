@@ -1,24 +1,13 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import test from "node:test";
-import { resolveApprovedHarness as resolveApprovedDevelopmentHarness } from "../../apps/controller/src/composition/production-harness.ts";
 import { ControllerWorkspaceFileUnknownOutcomeError } from "../../apps/controller/src/gateway/contracts.ts";
-import { createControllerApp, createFastifyApp } from "../../apps/controller/src/index.ts";
-import { InMemoryAuditSink } from "../../packages/audit/src/index.ts";
-import { NativeIAMDriver } from "../../packages/iam/src/index.ts";
-import { InMemoryPlatformState, OpenClawController } from "../../packages/occ/src/index.ts";
-import {
-  authenticatedHeaders,
-  createTestAuthPrincipal,
-  signInToControllerApp,
-} from "../helpers/auth-session.mjs";
+import { createFastifyApp } from "../../apps/controller/src/index.ts";
+import { authenticatedHeaders } from "../helpers/auth-session.mjs";
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
-import { createTestConfigurationDriver } from "../helpers/configuration-driver.mjs";
 import { createDevelopmentComputeDriver } from "../helpers/development.mjs";
+import { createTenantReaderFixture } from "../helpers/tenant-reader-app.mjs";
 
 const installationId = "ins_4033697e-6397-4cc6-9b04-8ec17af78cf1";
-// Bootstrap allocates the first Namespace ID for the initial default Namespace.
-const tenantANamespaceId = "ns_00000000-0000-4000-8000-000000000002";
 const publicOrigin = "http://127.0.0.1";
 
 const administratorPermissions = [
@@ -38,149 +27,32 @@ const administratorPermissions = [
   { action: "read", resourceKind: "agent_revision" },
 ];
 
-async function createFixture(options = {}) {
-  const adminAuth = await createTestAuthPrincipal({
+function createFixture(options = {}) {
+  return createTenantReaderFixture({
     installationId,
-    name: "Workspace file administrator",
-  });
-  const administrator = adminAuth.seed.principal;
-  const readerEmail = `workspace-file-reader-${randomUUID()}@example.com`;
-  const readerPassword = `generated-password-${randomUUID()}`;
-  const readerAccount = await adminAuth.auth.createAccount({
-    email: readerEmail,
-    password: readerPassword,
-    name: "Workspace file reader",
-  });
-  const tenantAReader = adminAuth.auth.principalSeed(readerAccount, { grant: "none" }).principal;
-  const state = {
-    identities: [administrator, tenantAReader],
-    groups: [],
-    memberships: [],
-    roles: [
-      {
-        id: "role-administrator",
-        permissions: [...administratorPermissions],
-      },
-      {
-        id: "role-tenant-a-reader",
-        namespaceId: tenantANamespaceId,
-        permissions: [
-          { action: "read", resourceKind: "namespace" },
-          { action: "read", resourceKind: "agent" },
-          { action: "read", resourceKind: "agent_revision" },
-        ],
-      },
-    ],
-    bindings: [
-      {
-        id: "binding-administrator",
-        subjectKind: "identity",
-        subjectId: administrator.id,
-        roleId: "role-administrator",
-      },
-      {
-        id: "binding-tenant-a-reader",
-        namespaceId: tenantANamespaceId,
-        subjectKind: "identity",
-        subjectId: tenantAReader.id,
-        roleId: "role-tenant-a-reader",
-      },
-    ],
-    restrictions: options.restrictions ?? [],
-  };
-  const iamDriver = new NativeIAMDriver(
-    { loadNativeIAMState: async () => state },
-    { id: "iam-workspace-files" },
-  );
-  const auditSink = new InMemoryAuditSink();
-  const configurationDriver = createTestConfigurationDriver({
-    id: "configuration-workspace-files",
-  });
-  const secretDriver = createTestSecretDriver();
-  const sessions = new Map();
-  let controller;
-  let sequence = 0;
-  let configurationSequence = 0;
-
-  const computeDriver = {
-    ...createDevelopmentComputeDriver(),
-    id: "compute-workspace-files",
-    implementation: "deterministic-test",
-  };
-
-  function createApp(principal = administrator, overrides = {}, factory = createControllerApp) {
-    const app = factory({
-      ...(controller === undefined
-        ? {
-            createController(installation) {
-              controller = new OpenClawController(installation, {
-                state: new InMemoryPlatformState({ auditSink }),
-                recordOperations: false,
-                createId(kind) {
-                  if (kind === "configuration") {
-                    configurationSequence += 1;
-                    return `cfg_20000000-0000-4000-8000-${String(configurationSequence).padStart(12, "0")}`;
-                  }
-                  sequence += 1;
-                  const prefix = {
-                    namespace: "ns",
-                    agent: "agt",
-                    agent_revision: "rev",
-                    secret: "sec",
-                  }[kind];
-                  return `${prefix}_00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`;
-                },
-              });
-              return controller;
-            },
-          }
-        : { controller }),
-      iamDriver,
-      computeDriver,
-      configurationDriver,
-      secretDriver,
-      resolveHarness: resolveApprovedDevelopmentHarness,
-      auditSink,
-      development: {
-        enabled: true,
-        installationId,
-        ...overrides.development,
-      },
-      auth: adminAuth.auth,
-      ...(overrides.workspaceFilesAccess === undefined
-        ? { workspaceFilesAccess: options.workspaceFilesAccess }
-        : { workspaceFilesAccess: overrides.workspaceFilesAccess }),
+    label: "workspace-files",
+    administratorName: "Workspace file administrator",
+    readerName: "Workspace file reader",
+    administratorPermissions,
+    computeDriver: {
+      ...createDevelopmentComputeDriver(),
+      id: "compute-workspace-files",
+      implementation: "deterministic-test",
+    },
+    secretDriver: createTestSecretDriver(),
+    appOptions: (overrides) => ({
+      workspaceFilesAccess:
+        overrides.workspaceFilesAccess === undefined
+          ? options.workspaceFilesAccess
+          : overrides.workspaceFilesAccess,
       ...(overrides.workspaceFileRequestTimeoutMs === undefined
         ? {}
         : { workspaceFileRequestTimeoutMs: overrides.workspaceFileRequestTimeoutMs }),
       ...(overrides.maxBodyBytes === undefined ? {} : { maxBodyBytes: overrides.maxBodyBytes }),
-      ...(overrides.publicOrigin === undefined
-        ? { publicOrigin }
-        : { publicOrigin: overrides.publicOrigin }),
-    });
-    app.defaultSession = sessions.get(principal.id);
-    return app;
-  }
-
-  const app = createApp(administrator, options);
-  sessions.set(administrator.id, await signInToControllerApp(app, adminAuth));
-  sessions.set(
-    tenantAReader.id,
-    await signInToControllerApp(app, { email: readerEmail, password: readerPassword }),
-  );
-  app.defaultSession = sessions.get(administrator.id);
-
-  return {
-    app,
-    administrator,
-    tenantAReader,
-    auditSink,
-    createApp,
-    state,
-    get controller() {
-      return controller;
-    },
-  };
+      publicOrigin: overrides.publicOrigin === undefined ? publicOrigin : overrides.publicOrigin,
+    }),
+    options,
+  });
 }
 
 async function request(app, pathname, options = {}) {

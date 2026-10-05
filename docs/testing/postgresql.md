@@ -112,8 +112,9 @@ bootstrap needs its own URL:
 ```
 
 Omitting the general URL skips most persistence and
-queue cases. Use the prepared `postgres-application` lane above for its complete
-file selection. Broad `test:postgres`, `test:integration`, and `test` commands
+queue cases. For a lane's complete file selection, prepare and run it as above,
+substituting `postgres-platform` (platform state, wire-up), `postgres` (migration
+compatibility) or `postgres-auth` for `postgres-application`. Broad `test:postgres`, `test:integration`, and `test` commands
 include the revision-worker suite and its
 [prepared-ownership requirement](#revision-worker-tests).
 
@@ -207,7 +208,8 @@ The same composition covers the GitHub profile against the fixture provider:
   signs RS256 ID tokens with a local key. It covers attached-only admission, bad
   ID-token claims, state and binding-cookie replay, password fallback, detach,
   disablement, and GitHub plus Google together. No real Google client is used;
-  `google-id-token` and `google-login-transport` cover the verifier and transport.
+  `oidc-id-token` covers the shared ID-token verifier, `google-id-token` Google's
+  issuers, hosted domains and nonce, and `google-login-transport` the transport.
 - `postgres-break-glass-auth-maintain.test.mjs`: also needs
   `OCC_AUTH_MAINTAIN_MIGRATION_DATABASE_URL`. With the API stopped,
   `auth:maintain` resets the recovery password and deactivates GitHub sign-in.

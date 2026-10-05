@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { realpathSync } from "node:fs";
+import { createRequire } from "node:module";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AuthAccountRoleNotFoundError } from "../../apps/controller/src/auth/index.ts";
@@ -3858,6 +3860,7 @@ test("administrator-created auth accounts sign in and receive only provisioned I
       email: namespaceRoleEmail,
       password: namespaceRolePassword,
     }),
+    /sign-in failed with HTTP 401: .*"code":\s*"UNAUTHENTICATED"/s,
   );
 
   // An explicit but blank or null roleId is a malformed request, never the zero-grant path.
@@ -4663,6 +4666,50 @@ test("bodyless OCC routes reject request payloads before IAM or domain side effe
   }
 });
 
+test("API response serializers keep same-$id shared schemas of sibling plugins apart", async () => {
+  // The serializer cache keys shared schemas by identity: two plugins that each add a
+  // different schema under one $id, with identical route schemas, must not share a build.
+  const fixture = await createInjectedFixture();
+  const app = fixture.createApp(fixture.principal, createFastifyApp);
+  try {
+    for (const field of ["first", "second"]) {
+      app.register(async (scope) => {
+        scope.addSchema({
+          $id: "SerializerCacheSibling",
+          type: "object",
+          properties: { [field]: { type: "string" } },
+        });
+        scope.get(
+          `/serializer-cache/${field}`,
+          { schema: { response: { 200: { $ref: "SerializerCacheSibling#" } } } },
+          async () => ({ first: "one", second: "two" }),
+        );
+      });
+    }
+    for (const [field, value] of [
+      ["first", "one"],
+      ["second", "two"],
+    ]) {
+      const response = await app.inject({ method: "GET", url: `/serializer-cache/${field}` });
+      assert.equal(response.statusCode, 200, response.body);
+      assert.deepEqual(response.json(), { [field]: value });
+    }
+  } finally {
+    await app.close();
+  }
+});
+
+test("API serializer compiler is the copy Fastify itself loads", () => {
+  // apps/controller pins @fastify/fast-json-stringify-compiler for its serializer cache. When
+  // a Fastify upgrade moves its own compiler, move the pin with it so one copy serves both.
+  const controller = createRequire(new URL("../../apps/controller/package.json", import.meta.url));
+  const fastify = createRequire(controller.resolve("fastify"));
+  assert.equal(
+    realpathSync(controller.resolve("@fastify/fast-json-stringify-compiler")),
+    realpathSync(fastify.resolve("@fastify/fast-json-stringify-compiler")),
+  );
+});
+
 test("OCC isolates Namespace ownership and filters collections by exact IAM grants", async () => {
   const controller = await configuredController();
   await bootstrap(controller);
@@ -4792,12 +4839,14 @@ test("OCC isolates Namespace ownership and filters collections by exact IAM gran
   assert.equal(exactRevision.status, 404);
   assert.equal(exactRevision.body.error.code, "NOT_FOUND");
 
+  // The reader holds no grant in tenant A, so the misplaced parent is refused before any
+  // lookup, as getAgent does; a 404 here would confirm which Agents tenant A lacks.
   const wrongParent = await injectedRequest(
     revisionReaderApp,
     "GET",
     `/namespaces/${tenantA.data.id}/agents/${ownAgent.data.id}/revisions/${missingRevisionId}`,
   );
-  assert.equal(wrongParent.status, 404);
+  assert.equal(wrongParent.status, 403);
 
   fixture.state.roles.find((role) => role.id === "role-revision-only-reader").permissions.length =
     0;

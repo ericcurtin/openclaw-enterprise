@@ -9,6 +9,7 @@ import { prepareFile } from "../../scripts/ci/prepare.mjs";
 import { createOccMetrics } from "../../apps/controller/src/metrics/index.ts";
 import { OpenShellAdmissionLimitError } from "../../apps/controller/src/drivers/sandbox/openshell-gateway-client.ts";
 import {
+  ActivationFailedError,
   ActivationPendingError,
   PostgresMetricsSnapshot,
   SandboxRevisionUnsupportedError,
@@ -7592,6 +7593,80 @@ test(
     assert.equal(succeeded.attempt_count, 1);
   },
 );
+
+// D381 follow-up: a dedicated Gateway that refuses its own in-Pod CLI as unauthorized
+// can never apply its workspace node for this revision, so activation must fail the
+// deployment with a named code instead of staying pending until the convergence
+// deadline. Both activation paths are covered: the pass that publishes the active
+// pointer, and a later pass that finds the pointer already published.
+for (const pendingPasses of [0, 1]) {
+  test(
+    `an activation the Gateway refuses as unauthorized fails deployment at once (after ${pendingPasses} pending passes)`,
+    requiresPostgres,
+    async (context) => {
+      const fixture = await setup(context);
+      const owner = await fixture.agent(`gateway-unauthorized-${pendingPasses}`);
+      const candidate = await fixture.revision(owner, 1);
+      const events = [];
+      let activations = 0;
+
+      await fixture.start(
+        {
+          ...fixture.compute,
+          async activateRevision() {
+            activations += 1;
+            if (activations <= pendingPasses) {
+              throw new ActivationPendingError(
+                "WORKSPACE_NODE_BINDING_PENDING",
+                "The exact AgentRevision gateway has not applied its workspace node.",
+              );
+            }
+            throw new ActivationFailedError(
+              "AGENT_GATEWAY_UNAUTHORIZED",
+              "The exact AgentRevision gateway refused its own CLI as unauthorized.",
+            );
+          },
+        },
+        (event) => events.push(event),
+      );
+
+      const failed = await fixture.work(candidate, "failed_permanent", 30_000);
+      // No retry after the refusal: the first refused pass ends the deployment.
+      assert.equal(activations, pendingPasses + 1);
+      assert.equal(failed.attempt_count, 1);
+      const result = await fixture.observerPool.query(
+        "SELECT reason_code, result_data FROM occ.controller_work WHERE idempotency_key = $1",
+        [candidate.idempotencyKey],
+      );
+      assert.deepEqual(result.rows, [
+        { reason_code: "AGENT_GATEWAY_UNAUTHORIZED", result_data: null },
+      ]);
+      const status = await fixture.controller.getDeploymentStatus(
+        fixture.actor.id,
+        fixture.namespace.id,
+        owner.id,
+        candidate.id,
+      );
+      assert.equal(status.status, "failed");
+      assert.deepEqual(status.error, {
+        code: "AGENT_GATEWAY_UNAUTHORIZED",
+        message:
+          "The Agent Gateway refused its own CLI as unauthorized. Check that the Agent's Configuration sets gateway.auth.password to OPENCLAW_GATEWAY_PASSWORD (Enable gateway password access), then deploy again.",
+      });
+      const last = events
+        .filter((event) => event.event === "worker.completed" && event.revisionId === candidate.id)
+        .at(-1);
+      assert.deepEqual(
+        { outcome: last?.outcome, code: last?.code, cause: last?.cause },
+        {
+          outcome: "permanent",
+          code: "AGENT_GATEWAY_UNAUTHORIZED",
+          cause: "ActivationFailedError",
+        },
+      );
+    },
+  );
+}
 
 // The admission-limit case uses the real OpenShellAdmissionLimitError class, thrown from a
 // stubbed Compute prepareRevision; the gateway wire test proves the client raises it. The

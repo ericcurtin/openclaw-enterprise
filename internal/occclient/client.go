@@ -99,6 +99,14 @@ type errorEnvelope struct {
 	} `json:"error"`
 }
 
+// WithContext returns a client sharing transport and credentials whose requests
+// use ctx. The original client remains unchanged.
+func (client *Client) WithContext(ctx context.Context) *Client {
+	clone := *client
+	clone.ctx = ctx
+	return &clone
+}
+
 // New validates the client configuration and prepares authenticated transport.
 func New(config Config) (*Client, error) {
 	baseURL, err := parseOrigin(config.URL)
@@ -272,6 +280,21 @@ func (client *Client) UpdateSecret(namespaceID, secretID string, body jsontext.V
 // DeleteSecret deletes an unbound Secret.
 func (client *Client) DeleteSecret(namespaceID, secretID string) error {
 	return client.sendEmpty(http.MethodDelete, []string{"namespaces", namespaceID, "secrets", secretID})
+}
+
+// ListPresets lists the Presets in a Namespace that the caller can read.
+func (client *Client) ListPresets(namespaceID string) (any, error) {
+	return client.get("namespaces", namespaceID, "presets")
+}
+
+// GetPreset fetches a Preset with its template.
+func (client *Client) GetPreset(namespaceID, presetID string) (any, error) {
+	return client.get("namespaces", namespaceID, "presets", presetID)
+}
+
+// DeletePreset deletes a Preset and its exact-resource AccessBindings.
+func (client *Client) DeletePreset(namespaceID, presetID string) error {
+	return client.sendEmpty(http.MethodDelete, []string{"namespaces", namespaceID, "presets", presetID})
 }
 
 // CreateCredentialSource registers a Namespace Secret with the selected Credential Gateway.

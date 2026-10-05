@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { runInNewContext } from "node:vm";
 import { spawnSync } from "node:child_process";
@@ -24,7 +22,11 @@ import {
   kubernetesGatewayNamespaceName,
   resolveKubernetesNamespace,
 } from "../../apps/controller/src/drivers/compute/kubernetes/index.ts";
-import { ActivationPendingError, ConfigurationHarnessError } from "../../packages/occ/src/index.ts";
+import {
+  ActivationFailedError,
+  ActivationPendingError,
+  ConfigurationHarnessError,
+} from "../../packages/occ/src/index.ts";
 import {
   currentComputeAbortSignal,
   withComputeAbortSignal,
@@ -32,9 +34,13 @@ import {
 } from "../../apps/controller/src/drivers/compute/operation-context.ts";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
 import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
+import {
+  conformanceKubeconfig,
+  conformanceKubernetesOptions,
+} from "../helpers/kubernetes-compute.mjs";
+import { writeUnsafeKubeconfigs } from "../helpers/unsafe-kubeconfigs.mjs";
 
-const kubeconfigPath = "/tmp/openclaw-enterprise-conformance/kubeconfig";
-const contextName = "openclaw-enterprise-local";
+const { kubeconfigPath, context: contextName } = conformanceKubeconfig;
 const tenant = {
   id: "ns_00000000-0000-4000-8000-000000000001",
   name: "Conformance tenant",
@@ -84,35 +90,8 @@ function preparedAuth(driver, namespace, embedded = false, harnessAuth = apiKeyA
 }
 
 function options(overrides = {}) {
-  const resources = {
-    requests: { cpu: "100m", memory: "64Mi" },
-    limits: { cpu: "250m", memory: "128Mi" },
-  };
-
   return {
-    authentication: { mode: "kubeconfig", kubeconfigPath, context: contextName },
-    images: {
-      gateway: "openclaw-enterprise/gateway-fixture:local",
-      agent: "openclaw-enterprise/agent-fixture:local",
-      requireImmutableDigest: false,
-    },
-    resources: {
-      gateway: resources,
-      agent: resources,
-      namespace: {
-        quota: { pods: "10", "requests.cpu": "2", "requests.memory": "1Gi" },
-        containerDefaults: resources,
-      },
-    },
-    network: {
-      dns: { namespace: "kube-system", podLabels: { "k8s-app": "kube-dns" } },
-      gatewayPort: 8080,
-      gatewayTrustedProxyCidrs: ["10.42.0.0/16"],
-      gatewayClients: [
-        { namespace: "openclaw-controller", podLabels: { "app.kubernetes.io/name": "controller" } },
-      ],
-    },
-    servicePrincipalCredentials: { mode: "disabled" },
+    ...conformanceKubernetesOptions({ gatewayTrustedProxyCidrs: ["10.42.0.0/16"] }),
     ...overrides,
     ...(overrides.runtime === undefined
       ? {}
@@ -180,23 +159,35 @@ test("repository capability admits only configured Compute-owned native topologi
       () => driver.validateRepositoryCredentials(harness, "selected-sandbox"),
       /without a SandboxDriver/,
     );
-    assert.throws(() =>
-      new KubernetesComputeDriver({
-        ...configured,
-        runtime: undefined,
-      }).validateRepositoryCredentials(harness),
+    // Each Driver misses one prerequisite: a runtime, the credential endpoint, or the
+    // absence of a SandboxDriver.
+    const unsupported = {
+      message:
+        "Repository credentials require a configured Kubernetes runtime and credential endpoint without a SandboxDriver.",
+    };
+    assert.throws(
+      () =>
+        new KubernetesComputeDriver({
+          ...configured,
+          runtime: undefined,
+        }).validateRepositoryCredentials(harness),
+      unsupported,
     );
-    assert.throws(() =>
-      new KubernetesComputeDriver({
-        ...configured,
-        network: options().network,
-      }).validateRepositoryCredentials(harness),
+    assert.throws(
+      () =>
+        new KubernetesComputeDriver({
+          ...configured,
+          network: options().network,
+        }).validateRepositoryCredentials(harness),
+      unsupported,
     );
     const sandboxDriver = { id: "sandbox", implementation: "sandbox", capability: "sandbox" };
-    assert.throws(() =>
-      new KubernetesComputeDriver(configured, { sandboxDriver }).validateRepositoryCredentials(
-        harness,
-      ),
+    assert.throws(
+      () =>
+        new KubernetesComputeDriver(configured, { sandboxDriver }).validateRepositoryCredentials(
+          harness,
+        ),
+      unsupported,
     );
   }
   for (const [id, mode] of [
@@ -205,7 +196,10 @@ test("repository capability admits only configured Compute-owned native topologi
     ["unknown", "dedicated"],
     ["codex", "unknown"],
   ]) {
-    assert.throws(() => driver.validateRepositoryCredentials({ id, mode, version: "1.0.0" }));
+    assert.throws(() => driver.validateRepositoryCredentials({ id, mode, version: "1.0.0" }), {
+      message:
+        "Repository credentials require an embedded OpenClaw or dedicated Codex Kubernetes runtime.",
+    });
   }
 });
 
@@ -1970,6 +1964,17 @@ test("activation fails with OpenClaw's reason when the Gateway cannot apply its 
     driver.activateRevision(revision, authContext(revision)),
     /gateway could not apply its workspace node \(RELOAD_NOT_CONFIRMED\)/,
   );
+  // A Gateway that refuses its own CLI as unauthorized never applies the node
+  // for this revision (D381): activation fails with a named code, not a retry.
+  state.gatewayWorkspaceNodeFailure = {
+    code: "GATEWAY_UNAUTHORIZED",
+    checkedAt: "2026-09-29T12:00:00.000Z",
+  };
+  await assert.rejects(driver.activateRevision(revision, authContext(revision)), (error) => {
+    assert.ok(error instanceof ActivationFailedError, String(error));
+    assert.equal(error.code, "AGENT_GATEWAY_UNAUTHORIZED");
+    return true;
+  });
   // A malformed cause is refused, not trusted.
   state.gatewayWorkspaceNodeFailure = { code: "not a code" };
   await assert.rejects(
@@ -7139,64 +7144,20 @@ test("containment-only Sandbox cleanup retries after its Compute-owned workload 
 });
 
 test("the official Kubernetes client rejects ambiguous identity and insecure API servers", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "openclaw-kubernetes-auth-conformance-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-
-  for (const scenario of [
-    { name: "unselected-context", context: "missing-context" },
-    { name: "missing-credential-identity", users: [] },
-    { name: "plaintext-api-endpoint", server: "http://127.0.0.1:1" },
-    { name: "unverified-tls", skipTLSVerify: true },
-    {
-      name: "embedded-api-credentials",
-      server: syntheticCredentialUrl({
-        username: "user",
-        password: "password",
-        host: "127.0.0.1",
-        port: 1,
-      }),
-    },
-    { name: "unexpected-api-path", server: "https://127.0.0.1:1/untrusted" },
-  ]) {
-    const path = join(directory, `${scenario.name}.json`);
-    await writeFile(
-      path,
-      JSON.stringify({
-        apiVersion: "v1",
-        kind: "Config",
-        clusters: [
-          {
-            name: "conformance-cluster",
-            cluster: {
-              server: scenario.server ?? "https://127.0.0.1:1",
-              ...(scenario.skipTLSVerify ? { "insecure-skip-tls-verify": true } : {}),
-            },
-          },
-        ],
-        users: scenario.users ?? [
-          { name: "conformance-user", user: { token: "test-only-fixture-token" } },
-        ],
-        contexts: [
-          {
-            name: contextName,
-            context: { cluster: "conformance-cluster", user: "conformance-user" },
-          },
-        ],
-        "current-context": contextName,
-      }),
-    );
-
+  for (const scenario of await writeUnsafeKubeconfigs(t)) {
     const driver = createKubernetesComputeDriver(
       options({
         authentication: {
           mode: "kubeconfig",
-          kubeconfigPath: path,
-          context: scenario.context ?? contextName,
+          kubeconfigPath: scenario.kubeconfigPath,
+          context: scenario.context,
         },
       }),
     );
 
     // Unsafe cluster configuration is permanently rejected before contacting its API server.
+    // An unrefused fixture fails later at the unreachable port, which is retryable, so
+    // `permanent` is what proves the validator refused it.
     assert.deepEqual(
       await driver.ensureNamespace(tenant),
       {
@@ -11160,6 +11121,42 @@ for (const embedded of [true, false]) {
     assert.equal(objects.has(`Secret:${secret.metadata.namespace}:${secret.metadata.name}`), false);
   });
 }
+
+test("the production example sizes dedicated Gateway and Harness containers from measured use", async () => {
+  // The example carries the profile renderer's values (profile-renderer.test.mjs keeps them equal).
+  const { loadYaml } = createRequire(
+    new URL("../../apps/controller/package.json", import.meta.url),
+  )("@kubernetes/client-node");
+  const example = loadYaml(
+    await readFile(
+      new URL("../../deploy/examples/production/installation.yaml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const { resources } = example.drivers.compute.configuration;
+  const { driver, revision, objects, context } = workspaceSetupFixture(false, true, undefined, {
+    resources,
+  });
+  await driver.prepareRevision(revision, context);
+  const container = (prefix) => {
+    const deployment = [...objects.values()].find(
+      ({ kind, metadata }) => kind === "Deployment" && metadata.name.startsWith(prefix),
+    );
+    assert.ok(deployment, `${prefix} Deployment rendered`);
+    return deployment.spec.template.spec.containers[0];
+  };
+  // A dedicated Codex Gateway held 1.2-1.6 GiB between turns and peaked at 2.2 GiB.
+  assert.deepEqual(container("gateway-").resources, {
+    requests: { cpu: "100m", memory: "1792Mi" },
+    limits: { cpu: "4", memory: "3Gi" },
+  });
+  // The Codex Harness held 0.45-0.57 GiB idle; lint, tsc and tests together were
+  // OOM-killed at 2Gi and reached a 4Gi limit.
+  assert.deepEqual(container("agent-").resources, {
+    requests: { cpu: "100m", memory: "768Mi" },
+    limits: { cpu: "4", memory: "6Gi" },
+  });
+});
 
 test("rendered exec arguments and environment values stay within the per-string budget", async () => {
   for (const embedded of [true, false]) {

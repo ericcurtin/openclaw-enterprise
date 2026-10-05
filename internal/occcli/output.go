@@ -45,6 +45,15 @@ func (app *application) printSecret(value any, collection bool) error {
 	})
 }
 
+// printPreset shows Preset identity in tables; structured output includes the template.
+func (app *application) printPreset(value any, collection bool) error {
+	return app.printItems(value, collection, []column{
+		{title: "ID", key: "id"},
+		{title: "NAME", key: "name"},
+		{title: "CREATED", key: "createdAt"},
+	})
+}
+
 func (app *application) printCredentialSource(value any, collection bool) error {
 	columns := []column{
 		{title: "ID", key: "id"},

@@ -44,6 +44,17 @@ function isAllowedSlackConnectTarget(target) {
   );
 }
 
+function closeOnSocketError(socket) {
+  let closing = false;
+  socket.on("error", () => {
+    if (closing) {
+      return;
+    }
+    closing = true;
+    socket.destroy();
+  });
+}
+
 function reject(socket, statusCode, message) {
   socket.end(`HTTP/1.1 ${statusCode} ${message}\r\nConnection: close\r\n\r\n`);
 }
@@ -55,6 +66,10 @@ function createSlackProxyServer() {
   });
 
   server.on("connect", (request, clientSocket, head) => {
+    // Attach this before reject(). A refused CONNECT that resets emits
+    // EPIPE or ECONNRESET while the 403 is written; without a listener
+    // that error exits the process.
+    closeOnSocketError(clientSocket);
     if (!isAllowedSlackConnectTarget(request.url)) {
       reject(clientSocket, 403, "Forbidden");
       return;

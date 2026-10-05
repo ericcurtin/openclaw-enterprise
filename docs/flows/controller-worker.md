@@ -1,6 +1,6 @@
 ---
 created: 2026-08-28
-updated: 2026-10-01
+updated: 2026-10-04
 last_updated_session: authoring-run/d0545dc8-f524-4ce5-a3ce-918838dddd92
 ---
 
@@ -219,7 +219,11 @@ the worker invokes neither independently.
 `withClaimHeartbeat()` renews before each effect and every third of the lease
 duration, so sequences of short effects cannot starve renewal. Lease loss,
 heartbeat failure, or shutdown aborts Compute and raises `WorkClaimLostError`;
-expired or replaced claim tokens cannot publish results. Successful renewals
+expired or replaced claim tokens cannot publish results. A renewal that gets no
+answer, such as on a database connection that went silent, cannot extend the
+claim: Compute is aborted when the last confirmed lease runs out, measured from
+when that renewal was sent. That is no later than the moment another worker
+could recover the claim; a request already in flight can still complete. Successful renewals
 request throttled health updates without delaying effects or renewal; health
 failure does not imply lease loss.
 
@@ -381,6 +385,8 @@ failed retry keeps the active runtime.
 [keep this for the user to add notes. do not change between edits]
 
 ## Changelog
+
+- 2026-10-04 04:20: Abort Compute when the last confirmed claim lease runs out, even if a renewal never answers. (bughunt-10-claimloss)
 
 - 2026-10-03 17:00: Finish published deployments after a last-attempt crash. (fix-recover-active-revision)
 

@@ -57,14 +57,19 @@ const ALLOWED_FIELDS = new Set([
   "pending",
   "port",
   "prepareMs",
+  "presetId",
+  "presetName",
   "provider",
   "providerId",
   "readinessWaitMs",
+  "reason",
   "requestId",
+  "restrictionIds",
   "result",
   "revisionId",
   "route",
   "sandboxDriverId",
+  "signal",
   "skippedUserCount",
   "skippedUserIds",
   "skippedUserIdsTruncated",
@@ -232,7 +237,7 @@ function sanitizedEvent(
     const safe =
       key === "attempt"
         ? safeAttempt(value)
-        : key === "skippedUserIds"
+        : key === "skippedUserIds" || key === "restrictionIds"
           ? safeIdentifiers(value)
           : safeScalar(key, value);
     if (safe !== undefined) {
@@ -243,7 +248,10 @@ function sanitizedEvent(
 }
 
 // Events that warn although their names carry no warning suffix.
-const WARNING_EVENTS = new Set(["authentication.sign-in-limited"]);
+const WARNING_EVENTS = new Set([
+  "authentication.sign-in-limited",
+  "presets.default-refresh-skipped",
+]);
 
 export function emitOccLogEvent(logger: OccLogger, event: Readonly<Record<string, unknown>>): void {
   const record = sanitizedEvent(event);

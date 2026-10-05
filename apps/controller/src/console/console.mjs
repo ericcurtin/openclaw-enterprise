@@ -148,6 +148,17 @@ function providerFailure(label) {
       : `Could not sign in with ${label}. Try again, or ask an administrator to attach your ${label} identity to your account.`;
 }
 
+// GitHub sign-in refused by the organization and team allowlist (RFC-0061). The controller
+// sends only these reasons; anything else keeps the generic provider message.
+const githubMembershipFailures = {
+  membership: (password) =>
+    `Your GitHub account is not a member of an organization or team allowed to sign in here. If you were invited, accept the invitation on GitHub and try again; otherwise ask an administrator for access${password ? " or use your password" : ""}.`,
+  "membership-unavailable": (password) =>
+    password
+      ? "Could not check your GitHub organization membership. Try again later or use your password."
+      : "Could not check your GitHub organization membership. Try again later; if this keeps happening, ask an administrator.",
+};
+
 function pinSessionKey(value) {
   pinnedSessionKey = typeof value === "string" && value.length > 0 ? value : null;
 }
@@ -758,6 +769,11 @@ async function loadPage({ fromNavigation = false, reuseView = fromNavigation } =
   const providerError = Object.hasOwn(externalProviders, authError ?? "")
     ? externalProviders[authError]
     : null;
+  const authReason = current.url.searchParams.get("authReason");
+  const membershipFailure =
+    authError === "github" && Object.hasOwn(githubMembershipFailures, authReason ?? "")
+      ? githubMembershipFailures[authReason]
+      : null;
   const externalAttempt = takeExternalAttempt();
   if (externalAttempt !== null && providerError === null) {
     // Adopt only the session this tab's own provider attempt created.
@@ -803,7 +819,7 @@ async function loadPage({ fromNavigation = false, reuseView = fromNavigation } =
             : pageUrl(current.target, current.namespace);
       showLogin(
         providerError !== null
-          ? providerFailure(providerError.label)
+          ? (membershipFailure ?? providerFailure(providerError.label))
           : current.feature !== "login" &&
               current.url.pathname !== "/console/" &&
               current.url.pathname !== "/console"
@@ -1120,7 +1136,10 @@ async function loadPage({ fromNavigation = false, reuseView = fromNavigation } =
         mountedAgent = agent;
         viewState.agent = agent;
         viewState.reusable &&= agent?.status !== "deleting";
-        markMountedRoute(current);
+        // A tab switch while the detail was loading already moved the URL (and the mounted
+        // route) in place; keying the view by the URL it was opened with would retain it
+        // under the wrong tab.
+        markMountedRoute(route());
       }
       return;
     }

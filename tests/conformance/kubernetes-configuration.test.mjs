@@ -1,15 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 import {
   ConfigurationConflictError,
+  ConfigurationValidationError,
   KubernetesConfigurationDriver,
   kubernetesConfigurationName,
 } from "../../apps/controller/src/drivers/configuration/kubernetes/index.ts";
-import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
+import { writeUnsafeKubeconfigs } from "../helpers/unsafe-kubeconfigs.mjs";
 
 const namespaceId = "ns_00000000-0000-4000-8000-000000000001";
 const configuration = {
@@ -110,18 +108,43 @@ test("Kubernetes configuration implementations expose a closed preconstruction s
     KubernetesConfigurationDriver.validateConfiguration({ authentication: { mode: "inCluster" } }),
   );
 
-  for (const invalid of [
-    undefined,
-    {},
-    { authentication: { mode: "ambient" } },
-    { authentication: { mode: "inCluster", context: "unexpected" } },
-    { authentication: { mode: "kubeconfig", kubeconfigPath: "relative", context: "tenant" } },
-    { authentication: { mode: "kubeconfig", kubeconfigPath: "/tmp/config", context: "" } },
-    { authentication: { mode: "inCluster" }, token: "not-allowed" },
-    { authentication: { mode: "inCluster" }, clients: {} },
+  const injected = /Injected clients and unknown Kubernetes configuration options/;
+  for (const [invalid, refusal] of [
+    [undefined, /Kubernetes configuration options are required/],
+    [{}, /Explicit Kubernetes authentication is required/],
+    [{ authentication: { mode: "ambient" } }, /explicit Kubernetes authentication mode/],
+    [
+      { authentication: { mode: "inCluster", context: "unexpected" } },
+      /In-cluster authentication does not accept additional options/,
+    ],
+    [
+      {
+        authentication: {
+          mode: "kubeconfig",
+          kubeconfigPath: "/tmp/config",
+          context: "tenant",
+          token: "x",
+        },
+      },
+      /Unknown kubeconfig authentication options are forbidden/,
+    ],
+    [
+      { authentication: { mode: "kubeconfig", kubeconfigPath: "", context: "tenant" } },
+      /Dedicated kubeconfig path must be a nonempty string/,
+    ],
+    [
+      { authentication: { mode: "kubeconfig", kubeconfigPath: "relative", context: "tenant" } },
+      /Dedicated kubeconfig path must be absolute/,
+    ],
+    [
+      { authentication: { mode: "kubeconfig", kubeconfigPath: "/tmp/config", context: "" } },
+      /Explicit Kubernetes context must be a nonempty string/,
+    ],
+    [{ authentication: { mode: "inCluster" }, token: "not-allowed" }, injected],
+    [{ authentication: { mode: "inCluster" }, clients: {} }, injected],
   ]) {
-    assert.throws(() => KubernetesConfigurationDriver.validateConfiguration(invalid));
-    assert.throws(() => new KubernetesConfigurationDriver(invalid));
+    assert.throws(() => KubernetesConfigurationDriver.validateConfiguration(invalid), refusal);
+    assert.throws(() => new KubernetesConfigurationDriver(invalid), refusal);
   }
 
   // Inherited client injection must not evade the closed own-property schema.
@@ -332,63 +355,20 @@ test("configuration CRUD fails closed when its explicitly selected kubeconfig is
 });
 
 test("the official Kubernetes client rejects ambiguous identities and insecure API servers", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "openclaw-configuration-auth-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-
-  for (const scenario of [
-    { name: "missing-context", requestedContext: "unselected" },
-    { name: "missing-user", users: [] },
-    { name: "plaintext-api", server: "http://127.0.0.1:1" },
-    { name: "unverified-tls", skipTLSVerify: true },
-    {
-      name: "embedded-credentials",
-      server: syntheticCredentialUrl({
-        username: "user",
-        password: "password",
-        host: "127.0.0.1",
-        port: 1,
-      }),
-    },
-    { name: "unexpected-api-path", server: "https://127.0.0.1:1/untrusted" },
-  ]) {
-    const path = join(directory, `${scenario.name}.json`);
-    await writeFile(
-      path,
-      JSON.stringify({
-        apiVersion: "v1",
-        kind: "Config",
-        clusters: [
-          {
-            name: "configuration-cluster",
-            cluster: {
-              server: scenario.server ?? "https://127.0.0.1:1",
-              ...(scenario.skipTLSVerify ? { "insecure-skip-tls-verify": true } : {}),
-            },
-          },
-        ],
-        users: scenario.users ?? [
-          { name: "configuration-user", user: { token: "test-only-fixture-token" } },
-        ],
-        contexts: [
-          {
-            name: "configuration-context",
-            context: { cluster: "configuration-cluster", user: "configuration-user" },
-          },
-        ],
-        "current-context": "configuration-context",
-      }),
-    );
-
+  for (const scenario of await writeUnsafeKubeconfigs(t)) {
     const driver = createDriver({
       mode: "kubeconfig",
-      kubeconfigPath: path,
-      context: scenario.requestedContext ?? "configuration-context",
+      kubeconfigPath: scenario.kubeconfigPath,
+      context: scenario.context,
     });
 
-    // The real Kubernetes SDK parses each fixture; unsafe identity or transport must fail before I/O.
+    // The real Kubernetes SDK parses each fixture; unsafe identity or transport must fail
+    // validation before I/O (fetch's own refusal of a credentialed URL does not count).
     await assert.rejects(
       driver.read(configuration),
-      /context|credential|identity|verified HTTPS/i,
+      (error) =>
+        error instanceof ConfigurationValidationError &&
+        /context|credential|identity|verified HTTPS/i.test(error.message),
       scenario.name,
     );
   }

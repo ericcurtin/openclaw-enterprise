@@ -238,6 +238,31 @@ test(
   },
 );
 
+test("the API accepts exactly the GitHub allowlist the chart renders", tooling, async () => {
+  const objects = await renderChart({
+    ...githubUpgradeValues(recoveryUserId),
+    "auth.github.allowedOrgs[0]": "Acme",
+    "auth.github.allowedOrgs[1]": "acme-labs",
+    "auth.github.allowedTeams[0]": "other/platform_team",
+  });
+  const rendered = signInSettings(deploymentEnv(objects, "api"));
+  assert.deepEqual(rendered, {
+    ...githubUpgradeSettings(recoveryUserId),
+    OCC_AUTH_GITHUB_ALLOWED_ORGS: "Acme,acme-labs",
+    OCC_AUTH_GITHUB_ALLOWED_TEAMS: "other/platform_team",
+  });
+  assert.deepEqual(githubLoginConfiguration(resolveSecrets(rendered)), {
+    clientId: secrets["occ-github-login/client-id"],
+    clientSecret: secrets["occ-github-login/client-secret"],
+    recoveryUserId,
+    allowedOrgs: ["acme", "acme-labs"],
+    allowedTeams: ["other/platform_team"],
+  });
+  assert.ok(
+    !deploymentEnv(objects, "worker").some(({ name }) => name.startsWith("OCC_AUTH_GITHUB_")),
+  );
+});
+
 test(
   "the API accepts exactly the Google sign-in settings the chart renders, alone and with GitHub",
   tooling,
@@ -591,6 +616,54 @@ const invalid = [
     github: true,
     env: { OCC_AUTH_PASSWORD_SIGN_IN: "none" },
     parser: /OCC_AUTH_PASSWORD_SIGN_IN must be all or recovery-only/,
+  },
+  {
+    name: "GitHub with an allowed organization that is not a login",
+    values: {
+      ...githubOn,
+      "agentNativeAdmin.enabled": "false",
+      "auth.github.allowedOrgs[0]": "acme/platform",
+    },
+    chart: /auth\.github\.allowedOrgs requires GitHub organization logins/,
+    github: true,
+    env: { OCC_AUTH_GITHUB_ALLOWED_ORGS: "acme/platform" },
+    parser:
+      /OCC_AUTH_GITHUB_ALLOWED_ORGS must be a comma-separated list of GitHub organization logins/,
+  },
+  {
+    name: "GitHub with an allowed team without its organization",
+    values: {
+      ...githubOn,
+      "agentNativeAdmin.enabled": "false",
+      "auth.github.allowedTeams[0]": "platform",
+    },
+    chart: /auth\.github\.allowedTeams requires org\/team-slug entries/,
+    github: true,
+    env: { OCC_AUTH_GITHUB_ALLOWED_TEAMS: "platform" },
+    parser:
+      /OCC_AUTH_GITHUB_ALLOWED_TEAMS must be a comma-separated list of org\/team-slug entries/,
+  },
+  {
+    name: "GitHub with more than ten allowlist entries",
+    values: {
+      ...githubOn,
+      "agentNativeAdmin.enabled": "false",
+      ...Object.fromEntries(
+        Array.from({ length: 11 }, (_, index) => [
+          `auth.github.allowedOrgs[${index}]`,
+          `org${index}`,
+        ]),
+      ),
+    },
+    chart:
+      /auth\.github\.allowedOrgs and auth\.github\.allowedTeams list at most 10 entries together/,
+    github: true,
+    env: {
+      OCC_AUTH_GITHUB_ALLOWED_ORGS: Array.from({ length: 11 }, (_, index) => `org${index}`).join(
+        ",",
+      ),
+    },
+    parser: /list at most 10 entries together/,
   },
   {
     name: "Google without a recovery user",

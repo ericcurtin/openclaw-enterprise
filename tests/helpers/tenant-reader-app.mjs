@@ -1,10 +1,15 @@
+import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { resolveApprovedHarness as resolveApprovedDevelopmentHarness } from "../../apps/controller/src/composition/production-harness.ts";
 import { createControllerApp } from "../../apps/controller/src/index.ts";
 import { InMemoryAuditSink } from "../../packages/audit/src/index.ts";
 import { NativeIAMDriver } from "../../packages/iam/src/index.ts";
 import { InMemoryPlatformState, OpenClawController } from "../../packages/occ/src/index.ts";
-import { createTestAuthPrincipal, signInToControllerApp } from "./auth-session.mjs";
+import {
+  authenticatedHeaders,
+  createTestAuthPrincipal,
+  signInToControllerApp,
+} from "./auth-session.mjs";
 import { createTestConfigurationDriver } from "./configuration-driver.mjs";
 
 // Bootstrap allocates the first Namespace ID for the initial default Namespace, so the
@@ -158,4 +163,59 @@ export async function createTenantReaderFixture({
       return controller;
     },
   };
+}
+
+/**
+ * Sends one request to a fixture app (`app.fetch`) as `options.session`, default the app's
+ * own session; `identity: false` sends none. The URL is `pathname` on `options.origin`,
+ * default `http://127.0.0.1`. A `body` (JSON-encoded unless a string) makes the default
+ * method POST; a `headers` entry set to null removes that header. Every answer must be the
+ * documented JSON envelope: a request ID (also sent as `x-request-id`), then `data` or a
+ * string error code and message. Returns `{ response, payload }`.
+ */
+export async function tenantRequest(app, pathname, options = {}) {
+  const headers = new Headers(
+    options.identity === false ? {} : authenticatedHeaders(options.session ?? app.defaultSession),
+  );
+  for (const [name, value] of Object.entries(options.headers ?? {})) {
+    if (value === null) {
+      headers.delete(name);
+    } else {
+      headers.set(name, value);
+    }
+  }
+
+  const hasBody = Object.hasOwn(options, "body");
+  if (hasBody && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  const body = hasBody
+    ? typeof options.body === "string"
+      ? options.body
+      : JSON.stringify(options.body)
+    : undefined;
+  const response = await app.fetch(
+    new Request(new URL(pathname, options.origin ?? "http://127.0.0.1"), {
+      method: options.method ?? (hasBody ? "POST" : "GET"),
+      headers,
+      ...(body === undefined ? {} : { body }),
+    }),
+  );
+  const contentType = response.headers.get("content-type");
+  assert.match(contentType ?? "", /^application\/json\b/i);
+  const payload = await response.json();
+  assert.match(
+    payload.meta?.requestId ?? "",
+    /^req_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  assert.equal(response.headers.get("x-request-id"), payload.meta.requestId);
+
+  if (response.ok) {
+    assert.ok(Object.hasOwn(payload, "data"));
+  } else {
+    assert.equal(typeof payload.error?.code, "string");
+    assert.equal(typeof payload.error?.message, "string");
+  }
+
+  return { response, payload };
 }

@@ -258,7 +258,7 @@ the same file and verify its contents are retained.
 
 ## Tests
 
-Open the console, choose a running Agent with an active revision, open **Workspace files**, and verify **Native admin UI** reports available for an administrator. Open the tab and confirm the Agent host loads without native-admin exchange, bootstrap, callback, or Agent-specific session-cookie requests.
+Open the console, choose a running Agent with an active revision, and verify the **Native admin UI** section on its detail page reports available for an administrator. Select **Open native admin UI** and confirm the Agent host loads in a new tab without native-admin exchange, bootstrap, callback, or Agent-specific session-cookie requests.
 
 Full runtime proof still requires a real browser test that loads native assets through OCC, reconnects native WebSocket traffic, verifies the OCE session cookie never reaches the native gateway, and performs a reversible native admin edit against a disposable Agent.
 
@@ -267,6 +267,9 @@ Full runtime proof still requires a real browser test that loads native assets t
 | Symptom                                             | Check                                                                                                                                                                                 |
 | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Helm render fails                                   | `agentNativeAdmin.enabled` requires `gatewayRouting.enabled`, a DNS-only `agentNativeAdmin.domain`, and a valid `agentNativeAdmin.sharedCookieDomain` parent.                         |
+| Helm render fails on `auth.baseUrl`                 | With native admin, `auth.baseUrl` must be HTTPS and its host inside `agentNativeAdmin.sharedCookieDomain`.                                                                            |
+| API startup fails with `AUTH_BASE_URL_INVALID`      | `auth.baseUrl` is an HTTPS origin whose host is inside `agentNativeAdmin.sharedCookieDomain`, which must not be a public suffix. Better Auth checks these first.                      |
+| API startup fails with `AUTH_SECRET_INVALID`        | The `auth.secretKey` value in the `auth.secretName` Secret has at least 32 characters.                                                                                                |
 | API startup fails with `AGENT_NATIVE_ADMIN_INVALID` | `agentNativeAdmin.domain`, `agentNativeAdmin.sharedCookieDomain`, `OCC_AUTH_BASE_URL`, cookie-scope compatibility, auth secret length, and gateway routing.                           |
 | Console panel is hidden                             | Feature enablement and exact Agent `administer` permission.                                                                                                                           |
 | Panel or status API reports `stopped`               | A stopped Agent with no active revision returns only `data.status: "stopped"`, without an origin. Deploy the Agent if native admin access is intended.                                |

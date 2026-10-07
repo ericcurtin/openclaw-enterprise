@@ -19,7 +19,8 @@ import { authenticatedHeaders, signInWithEmailPassword } from "../helpers/auth-s
 import { createTestConfigurationDriver } from "../helpers/configuration-driver.mjs";
 import { createTestKubernetesComputeDriver } from "../helpers/kubernetes-compute.mjs";
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
-import { availablePort } from "../helpers/available-port.mjs";
+import { reservePort } from "../helpers/available-port.mjs";
+import { grantRole } from "../helpers/iam-grants.mjs";
 
 const uuidV4 = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 const identifier = (prefix) => new RegExp(`^${prefix}_${uuidV4}$`);
@@ -114,7 +115,11 @@ function createRuntimeCredentialComputeDriver(options = {}) {
 
 async function createFixture(t, options = {}) {
   const installationId = `ins_${randomUUID()}`;
-  const port = await availablePort();
+  // The port is part of the auth base URL and origin, so hold it until the app binds it; a
+  // released probe port can be taken by another socket while the account and app are built.
+  const reservation = await reservePort();
+  t.after(reservation.release);
+  const { port } = reservation;
   const origin = `http://127.0.0.1:${port}`;
   const auth = createControllerAuth({
     installationId,
@@ -168,8 +173,9 @@ async function createFixture(t, options = {}) {
       return controller;
     },
   });
-  await app.listen({ host: "127.0.0.1", port });
+  await app.listen({ host: "127.0.0.1", port, reusePort: reservation.reusePort });
   t.after(() => app.close());
+  await reservation.release();
   const adminSession = await signInWithEmailPassword({ origin, ...credentials });
   let bootstrapped = false;
 
@@ -253,19 +259,11 @@ async function createFixture(t, options = {}) {
       namespaceId: namespace.data.id,
       agentId: agent.data.id,
     });
-    policy.roles.push({
+    grantRole(policy, servicePrincipalId, {
       id: roleId,
       namespaceId: namespace.data.id,
-      permissions: [{ action: "operate", resourceKind: "secret" }],
-    });
-    policy.bindings.push({
-      id: roleId,
-      namespaceId: namespace.data.id,
-      subjectKind: "identity",
-      subjectId: servicePrincipalId,
-      roleId,
-      resourceKind: "secret",
-      resourceId: secret.data.id,
+      permissions: { secret: ["operate"] },
+      resource: { kind: "secret", id: secret.data.id },
     });
     return {
       namespace: namespace.data,
@@ -407,22 +405,15 @@ test("first deployment requires Agent read and operate only when generating cred
   ]) {
     const { principal, session } = await fixture.createPrincipal(label, (identity) => {
       const roleId = `deploy-${randomUUID()}`;
-      fixture.policy.roles.push({
+      grantRole(fixture.policy, identity.id, {
         id: roleId,
+        bindingId: `${roleId}-binding`,
         namespaceId: namespace.id,
-        permissions: [
-          { action: "deploy", resourceKind: "agent" },
-          ...agentActions.map((action) => ({ action, resourceKind: "agent" })),
-          { action: "read", resourceKind: "configuration" },
-          { action: "operate", resourceKind: "secret" },
-        ],
-      });
-      fixture.policy.bindings.push({
-        id: `${roleId}-binding`,
-        namespaceId: namespace.id,
-        subjectKind: "identity",
-        subjectId: identity.id,
-        roleId,
+        permissions: {
+          agent: ["deploy", ...agentActions],
+          configuration: ["read"],
+          secret: ["operate"],
+        },
       });
     });
     const denied = await fixture.request("POST", `${agentPath}/deploy`, { session });
@@ -518,37 +509,35 @@ test("runtime credential POST keeps session CSRF and exact Agent read plus opera
   assert.equal(csrfRejected.body.error.code, "FORBIDDEN");
   assert.equal(fixture.computeDriver.calls.length, 0);
 
-  const { principal, session } = await fixture.createPrincipal(
-    "runtime-operator-without-read",
-    (limited) => {
-      fixture.policy.roles.push({
-        id: "runtime-operate-without-read",
+  // Each grant is required on its own: operate without read, then read without operate.
+  for (const [held, missing] of [
+    ["operate", "read"],
+    ["read", "operate"],
+  ]) {
+    const roleId = `runtime-${held}-without-${missing}`;
+    const { principal, session } = await fixture.createPrincipal(roleId, (limited) => {
+      grantRole(fixture.policy, limited.id, {
+        id: roleId,
+        bindingId: `${roleId}-binding`,
         namespaceId: namespace.id,
-        permissions: [{ action: "operate", resourceKind: "agent" }],
+        permissions: { agent: [held] },
       });
-      fixture.policy.bindings.push({
-        id: "runtime-operate-without-read-binding",
-        namespaceId: namespace.id,
-        subjectKind: "identity",
-        subjectId: limited.id,
-        roleId: "runtime-operate-without-read",
-      });
-    },
-  );
-  const denied = await fixture.request("POST", path, {
-    session,
-    body: {},
-  });
-  assert.equal(denied.status, 403);
-  assert.equal(denied.body.error.code, "FORBIDDEN");
-  assert.equal(fixture.computeDriver.calls.length, 0);
-  const denial = fixture.auditSink.events.at(-1);
-  assert.equal(denial.kind, "authorization_denial");
-  assert.deepEqual(denial.authorization, {
-    principalId: principal.id,
-    action: "read",
-    resource: { kind: "agent", id: agent.id, namespaceId: namespace.id },
-  });
+    });
+    const denied = await fixture.request("POST", path, {
+      session,
+      body: {},
+    });
+    assert.equal(denied.status, 403);
+    assert.equal(denied.body.error.code, "FORBIDDEN");
+    assert.equal(fixture.computeDriver.calls.length, 0);
+    const denial = fixture.auditSink.events.at(-1);
+    assert.equal(denial.kind, "authorization_denial");
+    assert.deepEqual(denial.authorization, {
+      principalId: principal.id,
+      action: missing,
+      resource: { kind: "agent", id: agent.id, namespaceId: namespace.id },
+    });
+  }
 });
 
 test("runtime credential API rejects unsupported initial provisioning states and request shapes", async (t) => {
@@ -599,19 +588,12 @@ test("deployment diagnostics require exact revision read and Agent operate autho
   const { principal, session } = await fixture.createPrincipal(
     "deployment-diagnostics-reader",
     (limited) => {
-      fixture.policy.roles.push({
+      grantRole(fixture.policy, limited.id, {
         id: "diagnostics-revision-reader",
+        bindingId: "diagnostics-revision-reader-binding",
         namespaceId: namespace.id,
-        permissions: [{ action: "read", resourceKind: "agent_revision" }],
-      });
-      fixture.policy.bindings.push({
-        id: "diagnostics-revision-reader-binding",
-        namespaceId: namespace.id,
-        subjectKind: "identity",
-        subjectId: limited.id,
-        roleId: "diagnostics-revision-reader",
-        resourceKind: "agent_revision",
-        resourceId: revision.data.id,
+        permissions: { agent_revision: ["read"] },
+        resource: { kind: "agent_revision", id: revision.data.id },
       });
     },
   );
@@ -627,19 +609,12 @@ test("deployment diagnostics require exact revision read and Agent operate autho
     resource: { kind: "agent", id: agent.id, namespaceId: namespace.id },
   });
 
-  fixture.policy.roles.push({
+  grantRole(fixture.policy, principal.id, {
     id: "diagnostics-agent-operator",
+    bindingId: "diagnostics-agent-operator-binding",
     namespaceId: namespace.id,
-    permissions: [{ action: "operate", resourceKind: "agent" }],
-  });
-  fixture.policy.bindings.push({
-    id: "diagnostics-agent-operator-binding",
-    namespaceId: namespace.id,
-    subjectKind: "identity",
-    subjectId: principal.id,
-    roleId: "diagnostics-agent-operator",
-    resourceKind: "agent",
-    resourceId: agent.id,
+    permissions: { agent: ["operate"] },
+    resource: { kind: "agent", id: agent.id },
   });
   const missingAgentRead = await fixture.request("POST", path, { session });
   assert.equal(missingAgentRead.status, 403);
@@ -653,19 +628,12 @@ test("deployment diagnostics require exact revision read and Agent operate autho
     resource: { kind: "agent", id: agent.id, namespaceId: namespace.id },
   });
 
-  fixture.policy.roles.push({
+  grantRole(fixture.policy, principal.id, {
     id: "diagnostics-agent-reader",
+    bindingId: "diagnostics-agent-reader-binding",
     namespaceId: namespace.id,
-    permissions: [{ action: "read", resourceKind: "agent" }],
-  });
-  fixture.policy.bindings.push({
-    id: "diagnostics-agent-reader-binding",
-    namespaceId: namespace.id,
-    subjectKind: "identity",
-    subjectId: principal.id,
-    roleId: "diagnostics-agent-reader",
-    resourceKind: "agent",
-    resourceId: agent.id,
+    permissions: { agent: ["read"] },
+    resource: { kind: "agent", id: agent.id },
   });
   const scopedDiagnostics = await fixture.request("POST", path, { session });
   assert.equal(scopedDiagnostics.status, 200);

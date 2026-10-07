@@ -14,10 +14,13 @@ upstream credentials managed by [Service accounts](../service-accounts.md).
 - A human administrator session, or an Installation-scoped service principal
   with current `administer` on the singleton Installation.
 - An existing non-Agent service principal and its exact Namespace, if it has
-  one. Fresh bootstrap creates an Installation service administrator. OCC has no
-  public API to create other service principals; the selected IAM authority
-  must provision them. Administrators manage Namespace Roles and AccessBindings
-  through the [Namespace IAM API](../authorization.md#manage-namespace-policy).
+  one. Fresh bootstrap creates an Installation service administrator. For
+  Namespace automation or a member's CLI, create a Namespace service principal
+  with `occ iam service-principal create` (`POST
+/namespaces/:namespaceId/iam/service-principals`) and grant it a Role with an
+  AccessBinding; both use the [Namespace IAM API](../authorization.md#manage-namespace-policy).
+  A new service principal holds no grant. You must already hold every grant of
+  the principal whose key you issue or revoke.
 - A private directory for credentials. Keep shell tracing disabled, do not print
   keys, and run the examples from the repository root. CLI examples assume the
   [`occ` executable](../../guides/cli.md) is installed and on `PATH`.
@@ -34,16 +37,22 @@ umask 077
 export OCC_SERVICE_KEY_DIRECTORY='/secure/occ/service-keys'
 install -d -m 700 "$OCC_SERVICE_KEY_DIRECTORY"
 export OCC_SERVICE_KEY_FILE="$(mktemp "$OCC_SERVICE_KEY_DIRECTORY/key.XXXXXX")"
-curl --fail --silent --show-error --cookie "$OCC_SESSION_COOKIE_JAR" \
+curl --fail-with-body --silent --show-error --cookie "$OCC_SESSION_COOKIE_JAR" \
   "$OCC_URL/api/auth/service-keys" -H "Origin: $OCC_ORIGIN" -H 'Content-Type: application/json' \
   --data '{"servicePrincipalId":"<service-principal-id>","namespaceId":"<namespace-id>","name":"nightly-reader","expiresIn":2592000}' \
   --output "$OCC_SERVICE_KEY_FILE"
 ```
 
+`occ service-key create --service-principal ID --name NAME --out FILE`, with
+`--namespace` for a Namespace principal, makes the same request and writes the
+response to a new `0600` file without printing the key. For an Installation
+principal, unset `OCC_NAMESPACE`, which the CLI also sends as `namespaceId`.
+
 Success returns HTTP `201`. The response contains the credential exactly once in
 `data.key` and a non-secret `data.id` needed to revoke it. Record the key and
 principal IDs separately for recovery; there is no plaintext retrieval endpoint.
-If the request fails, do not give its output file to an automation client.
+If the request fails, read and then delete the file (it holds the error
+response, or nothing); never give it to an automation client.
 
 ## Use a service key
 
@@ -66,11 +75,12 @@ To revoke the key in `OCC_SERVICE_KEY_FILE` with the administrator session:
 
 ```bash
 OCC_SERVICE_KEY_ID="$(python3 -c 'import json, os, pathlib; print(json.loads(pathlib.Path(os.environ["OCC_SERVICE_KEY_FILE"]).read_text())["data"]["id"])')"
-curl --fail --silent --show-error --cookie "$OCC_SESSION_COOKIE_JAR" \
+curl --fail-with-body --silent --show-error --cookie "$OCC_SESSION_COOKIE_JAR" \
   -H "Origin: $OCC_ORIGIN" \
   --request DELETE "$OCC_URL/api/auth/service-keys/$OCC_SERVICE_KEY_ID"
 ```
 
+`occ service-key revoke ID` makes the same request with a service-key file.
 Success returns HTTP `200` and `data.revoked: true`; subsequent use of the key
 returns `401`. To rotate without interrupting clients, issue a replacement to a
 new private file, switch the clients, verify access, then revoke the old key by
@@ -82,7 +92,8 @@ Use a human session for recovery, human-issued keys, and account-only APIs. For
 production, obtain the first administrator’s password through the protected
 bootstrap storage procedure. The following sends it from a file and keeps the
 session cookie in a private directory. Set `OCC_URL` to the approved HTTPS
-endpoint.
+endpoint and `OCC_ORIGIN` as in [Requirements](#requirements); without it,
+sign-out returns `403` and the session stays live.
 
 When local startup printed an HTTPS browser console URL, set `OCC_URL` to its
 origin (`https://console.<cluster>.oce.localhost:<port>`, without `/console/`)
@@ -95,6 +106,7 @@ sends it to `http://127.0.0.1` and the next request returns `401`.
 set -o pipefail
 umask 077
 : "${OCC_URL:?Set OCC_URL to the approved HTTPS endpoint or local console origin}"
+: "${OCC_ORIGIN:?Set OCC_ORIGIN to the console origin; see Requirements}"
 export OCC_ADMIN_EMAIL='<first-admin@example.com>'
 export OCC_ADMIN_PASSWORD_FILE='/secure/occ/initial-admin-password'
 OCC_SESSION_DIRECTORY="$(mktemp -d)"
@@ -128,7 +140,7 @@ it does not appear in process arguments:
 ```bash
 set -o pipefail
 python3 -c 'import json, os, pathlib, sys; key=json.loads(pathlib.Path(os.environ["OCC_ADMIN_SERVICE_KEY_FILE"]).read_text())["data"]["key"]; sys.stdout.write("x-api-key: " + key + "\n")' |
-  curl --fail --silent --show-error --header @- "$OCC_URL/api/auth/service-keys" \
+  curl --fail-with-body --silent --show-error --header @- "$OCC_URL/api/auth/service-keys" \
   -H 'Content-Type: application/json' \
   --data '{"servicePrincipalId":"<service-principal-id>","namespaceId":"<namespace-id>","name":"nightly-reader","expiresIn":2592000}' \
   --output "$OCC_SERVICE_KEY_FILE"
@@ -147,8 +159,8 @@ bootstrap PVC through approved storage access. Save it to a private path and
 set `OCC_SERVICE_KEY_FILE`. See the [bootstrap storage settings](../settings/production.md#production-installation-bootstrap-environment)
 if the file was given a different name.
 
-For a Compose development environment started with `dev-up`, use the private
-key path it prints. If you need to copy it manually, create a fresh directory:
+For a local stack started with `dev-up`, use the `Service key file` path it
+prints. To copy the key from a Compose stack by hand, create a fresh directory:
 
 ```bash
 umask 077

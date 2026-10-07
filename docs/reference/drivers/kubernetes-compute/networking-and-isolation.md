@@ -19,6 +19,14 @@ Cross-tenant traffic, traffic between different Agents, Kubernetes API access,
 and cloud metadata access remain denied where those addresses fall inside the
 model egress exclusions below.
 
+A provisioning Sandbox Driver may own the dedicated Harness endpoint. Configure
+`network.providerHarness` with its namespace, Pod labels, Service ClusterIP in
+`address`, and `port`. Compute maps the advertised hostname to that address,
+limits Gateway egress to the peer, and leaves its direct Harness route inactive.
+This ClusterIP bridge is only for owned k3d profiles advertising
+`*.openshell.localhost`; it is not production configuration. Drivers without
+the endpoint capability retain ordinary Service or private routing.
+
 For Compute-owned startup failure evidence, plugin reporting, and on-demand
 deployment diagnostics, set `network.pluginStatusProxySourceCidrs` to the
 Kubernetes API server's source addresses for Pod proxy requests, preferably
@@ -50,7 +58,13 @@ identity `occ-workspace-files` with `operator.admin`, and
 `gateway.allowRealIpFallback: true`. Agent Configuration and Console starters
 can omit those fields. Unsupported gateway authentication fields or conflicting
 tenant trust fields fail deployment; matching explicit CIDR lists are accepted
-regardless of order. `trustedProxy.allowLoopback` must be omitted or false:
+regardless of order. Deployment and Agent provisioning check the same fields
+when they admit a request and answer `409 RESOURCE_CONFLICT` naming the refused
+setting and what is accepted, for example `Configuration setting gateway.auth.mode must be
+trusted-proxy: …`, never its value. `trustedProxy.allowUsers` is checked later:
+provisioning answers the fixed `409` text, with the reason in the API log, and a
+deployment is admitted and then fails with `DEPENDENCY_UNAVAILABLE`, with the
+reason in the worker's `worker.compute-prepare-failed` line. `trustedProxy.allowLoopback` must be omitted or false:
 loopback access uses the separate password, not proxy identity headers. Native
 required-header and device auto-approval settings retain their separate purposes.
 
@@ -65,6 +79,7 @@ Operators must verify that the configured CIDRs contain the proxy's actual
 source addresses and exclude untrusted sources. CIDRs do not authenticate a
 proxy: retain the exact Envoy NetworkPolicy peer, TLS verification, service-key
 authentication, and identity/header sanitization.
+Direct access still requires a trusted proxy or the operator loopback password.
 
 For repository-bearing revisions, Compute grants credential-service egress to
 the embedded gateway/Harness or dedicated Codex Pod. The separate dedicated
@@ -131,7 +146,7 @@ plugin-status, sandbox-preview ingress and gateway/Harness allow policies requir
 `openclaw.dev/network-profile=broad-egress-v1` plus their existing
 role, Agent, namespace and revision selectors. Gateway/Harness peer selectors require the
 same profile. Missing, empty or unknown profiles receive no ordinary grant;
-the tenant and separate Gateway namespace default-deny policies still select every Pod.
+default-deny policies still select every Pod in each runtime target.
 
 Compute assigns this profile to ordinary embedded and dedicated workload
 templates without changing their routes or ports. Deployment readiness requires
@@ -249,17 +264,23 @@ port-forward alone is not a working native attribution path.
 
 ## Namespaces and isolation
 
-Each OpenClaw Namespace has a data-plane Kubernetes namespace and a managed
-Gateway runtime namespace, `oce-gateways-<hash>`, where `hash` is the first 24
-hexadecimal characters of `sha256(namespaceId)`. The latter is discovered by
-`openclaw.dev/gateway-namespace=<namespaceId>`; it deliberately omits the
-data-plane discovery label `openclaw.dev/namespace`. Adopting an existing
-data-plane namespace never adopts or reuses OCC's own namespace for Gateways.
+Single-cluster Compute shares one created or adopted tenant namespace, labeled
+`openclaw.dev/namespace=<namespaceId>` and
+`openclaw.dev/gateway-namespace=<namespaceId>`. Secret and Configuration Drivers
+require one owned storage target; adopted targets require restricted Pod Security.
+Discovery excludes OCC's namespace.
+
+Only the experimental two-cluster profile creates `oce-gateways-<hash>` in the
+control cluster, with the first 24 hexadecimal characters of `sha256(namespaceId)`.
+That target has the storage-role label and omits the tenant discovery label.
 
 Compute prepares restricted Pod security, quotas, defaults, default-deny and DNS
-policies in both targets. Dedicated Gateway resources, private PVCs, configuration,
-Services and HTTPRoutes live only in the Gateway target; Harness resources and
-model credentials remain in the data target. Explicit namespace **and** Pod
+policies in each target. Dedicated Gateway and Harness Pods, ServiceAccounts,
+private PVCs and credential mounts remain separate. Gateway password and channel
+credentials never enter the Harness projection; model credentials never enter a
+dedicated Gateway. Namespace workload managers are trusted for both roles:
+namespace-wide Pod/Secret privileges, quotas and deletion affect both.
+Explicit namespace **and** Pod
 selectors allow only the same Agent's selected Harness revision on app-server
 and private plugin-status ports. DNS uses `agent-<hash>.<harness-namespace>.svc`.
 The stable dedicated Harness Service keeps the same network-profile, Namespace,
@@ -273,20 +294,15 @@ revision. These Service selectors support the
 App-server transport is capability-token `ws://`, not mTLS; cross-cluster
 transport and runtime attestation are not implemented.
 
-Stop and revision retirement inspect both targets and retain durable claims.
-Agent deletion removes its owned claims. Namespace deletion deletes the exact
-managed Gateway namespace and any data namespace the driver created. From an
-adopted data namespace it removes only its exact-owned quota, limit, and
-tenant NetworkPolicies; the namespace, ownership markers, RoleBindings, and
-unrelated resources remain. Neither operation may remove shared OCC
-infrastructure. A missing or foreign
-Gateway target fails preparation rather than falling back to data-plane placement.
+Stop and retirement retain durable
+claims. Agent deletion removes its owned claims and credentials by UID, independent
+of the draft execution mode. Namespace deletion removes the managed tenant
+namespace, or only owned resources in an adopted namespace, preserving its ownership metadata. The
+two-cluster profile also deletes its exact-owned Gateway namespace. Both preserve
+OCC infrastructure. Missing or foreign targets fail preparation.
 
-Identity labels under `openclaw.dev/` contain the full platform Namespace,
-Agent, revision, ServiceAccount, ServicePrincipal, or Configuration ID, not a
-hash. Ownership checks, discovery, Service selectors, and NetworkPolicies use
-those same raw IDs. Generated Kubernetes resource names still use bounded
-hashes to satisfy their naming constraints.
+Identity labels under `openclaw.dev/` contain full platform IDs for ownership,
+discovery and network selectors; generated resource names use bounded hashes.
 
 An Installation administrator can select an existing, exclusively dedicated
 Kubernetes namespace when creating the OpenClaw Namespace:

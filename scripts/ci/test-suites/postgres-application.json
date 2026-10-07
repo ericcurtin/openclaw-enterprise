@@ -3,6 +3,15 @@
     "postgres": true,
     "requiresPreparedStateForFile": true
   },
+  "fileConcurrency": 2,
+  "parallelFiles": [
+    "tests/integration/postgres-native-iam-policy-barrier.test.mjs",
+    "tests/integration/auth-maintain.test.mjs",
+    "tests/integration/occ-metrics.test.mjs"
+  ],
+  "serialFiles": {
+    "tests/integration/postgres-worker-agent-revision.test.mjs": "prepares a database per test with prepareFile from the test process, which rewrites the lane state file outside the runner's setup queue"
+  },
   "files": [
     {
       "path": "tests/integration/occ-metrics.test.mjs",
@@ -52,6 +61,14 @@
         "codex_pat revision dispatch rechecks Configuration and exact harness Secret grants without backend Secret reads",
         "revision dispatch refuses a different selected Secret Driver before binding or activating the Agent",
         "revision dispatch never substitutes a later ChatGPT credential or reconfigured Backend for its admitted snapshot"
+      ]
+    },
+    {
+      "path": "tests/integration/auth-maintain.test.mjs",
+      "expectedTests": [
+        "auth:maintain requires an explicit writers-stopped claim for every change",
+        "auth:maintain rejects undeclared commands before configuration",
+        "stopped maintenance activates, repairs, resets, purges and returns to the legacy profile"
       ]
     }
   ]

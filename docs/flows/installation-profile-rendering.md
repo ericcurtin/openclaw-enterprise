@@ -88,9 +88,9 @@ provisioning is optional and renders only when `codex.managedServiceAccounts` is
 supplied.
 
 Preflight applies the downstream contracts for IPv4 CIDRs, native-admin DNS
-hostnames and their shared cookie parent domain, and paired metrics scraper
-selectors. Invalid values therefore fail before `values.yaml` or
-`installation.yaml` is written.
+hostnames and their shared cookie parent domain (not a public suffix, checked
+with the API's `tldts` list), and paired metrics scraper selectors. Invalid
+values therefore fail before `values.yaml` or `installation.yaml` is written.
 
 ### 4. Build Helm values
 
@@ -194,6 +194,7 @@ activation, and repository registry creation need separate evidence.
 
 ## Changelog
 
+- 2026-10-07: Refuse a public-suffix shared cookie domain in preflight.
 - 2026-09-29 20:30: Stop defaulting the repository broker Service name so the chart upgrade guard applies.
 
 - 2026-09-29 18:00: Carry external sign-in, the recovery user ID, and trusted proxies through profile rerenders.

@@ -23,6 +23,7 @@ import {
 import { createTestConfigurationDriver } from "../helpers/configuration-driver.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
+import { grantRole } from "../helpers/iam-grants.mjs";
 
 const driverId = "repository-credentials";
 const backendId = "repository-provider";
@@ -254,19 +255,11 @@ async function fixture(
       id: internal.servicePrincipalId,
       namespaceId: namespace.id,
     });
-    iamState.roles.push({
+    grantRole(iamState, internal.servicePrincipalId, {
       id: roleId,
       namespaceId: namespace.id,
-      permissions: [{ action: "operate", resourceKind: "secret" }],
-    });
-    iamState.bindings.push({
-      id: roleId,
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: internal.servicePrincipalId,
-      roleId,
-      resourceKind: "secret",
-      resourceId: secret.data.id,
+      permissions: { secret: ["operate"] },
+      resource: { kind: "secret", id: secret.data.id },
     });
     const updated = await composed.request("PATCH", `${collection}/${agent.id}`, {
       configurationId: configuration.id,
@@ -446,6 +439,38 @@ test("Repository options preserve an empty successful discovery", async (t) => {
   const options = await reconfigured.request("GET", `${f.collection}/repository-options`);
   assert.equal(options.status, 200, JSON.stringify(options));
   assert.deepEqual(options.data, []);
+});
+
+test("Repository options refuse Driver display text with C0 controls or DEL", async (t) => {
+  // The utils conformance suite pins every code unit of the shared helper; this pins its use here.
+  let override = {};
+  class CraftedRepositoryDriver extends GitHubRepoDriver {
+    async listOptions(input) {
+      const result = await super.listOptions(input);
+      return { ...result, options: result.options.map((option) => ({ ...option, ...override })) };
+    }
+  }
+  const f = await fixture(t);
+  const { controller } = await f.compose(f.registry, CraftedRepositoryDriver);
+  for (const [code, refused] of [
+    [0x1f, true],
+    [0x20, false],
+    [0x7e, false],
+    [0x7f, true],
+    [0x80, false],
+  ]) {
+    const text = `example${String.fromCharCode(code)}project`;
+    for (const field of ["displayName", "description"]) {
+      const label = `${field} U+${code.toString(16).toUpperCase().padStart(4, "0")}`;
+      override = { [field]: text };
+      const listing = controller.listRepositoryOptions(f.actorId, f.namespace.id);
+      if (refused) {
+        await assert.rejects(listing, /returned invalid repository options/, label);
+      } else {
+        assert.equal((await listing).options[0][field], text, label);
+      }
+    }
+  }
 });
 
 test("Repository discovery supports a dedicated-only Compute Driver without admitting unsupported Harnesses", async (t) => {
@@ -862,12 +887,19 @@ test("Unsupported Compute refuses repository deployment while ordinary deploymen
 });
 
 test("Repository admission retains unknown Harness and execution-mode rejection", async (t) => {
-  for (const { harness, executionMode, status, code } of [
+  for (const { harness, executionMode, status, code, message } of [
     // An unsupported runtime identity is Configuration content, not a missing resource.
     { harness: "unknown", executionMode: "embedded", status: 400, code: "INVALID_REQUEST" },
     // The pinned runtime lacks native worker support, so admission refuses first.
     { harness: "openclaw", executionMode: "dedicated", status: 400, code: "INVALID_REQUEST" },
-    { harness: "codex", executionMode: "embedded", status: 503, code: "DEPENDENCY_UNAVAILABLE" },
+    // A Harness/mode mismatch names the execution mode the Configuration needs.
+    {
+      harness: "codex",
+      executionMode: "embedded",
+      status: 400,
+      code: "INVALID_REQUEST",
+      message: /selects the Codex Harness, which needs dedicated execution/,
+    },
   ]) {
     await t.test(`${harness}/${executionMode}`, async (t) => {
       const f = await fixture(t, { harness });
@@ -877,6 +909,9 @@ test("Repository admission retains unknown Harness and execution-mode rejection"
       const denied = await f.request("POST", `${path}/deploy`);
       assert.equal(denied.status, status, JSON.stringify(denied));
       assert.equal(denied.error.code, code);
+      if (message) {
+        assert.match(denied.error.message, message);
+      }
       assert.deepEqual((await f.request("GET", `${path}/revisions`)).data, []);
     });
   }

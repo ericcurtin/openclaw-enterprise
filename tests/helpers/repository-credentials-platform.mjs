@@ -476,7 +476,7 @@ async function setupRepositoryPlatformFixture(context, diagnostic) {
     { default: pg },
     { loadInstallationConfiguration },
     { composeProduction },
-    { kubernetesNamespaceName, kubernetesGatewayNamespaceName },
+    { kubernetesNamespaceName },
   ] = await Promise.all([
     import("pg"),
     import("../../apps/controller/src/composition/installation-config.ts"),
@@ -498,8 +498,8 @@ async function setupRepositoryPlatformFixture(context, diagnostic) {
     installationName: "Repository platform integration",
     environment: { PATH: process.env.PATH },
   });
-  const bootstrapNamespaces = (await pool.query("SELECT id FROM occ.namespaces")).rows.flatMap(
-    ({ id }) => [kubernetesNamespaceName(id), kubernetesGatewayNamespaceName(id)],
+  const bootstrapNamespaces = (await pool.query("SELECT id FROM occ.namespaces")).rows.map(
+    ({ id }) => kubernetesNamespaceName(id),
   );
   ownedNamespaces.push(...bootstrapNamespaces);
   let app;
@@ -571,10 +571,9 @@ async function setupRepositoryPlatformFixture(context, diagnostic) {
     201,
   );
   const placement = kubernetesNamespaceName(namespace.id);
-  const controlPlacement = kubernetesGatewayNamespaceName(namespace.id);
-  ownedNamespaces.push(placement, controlPlacement);
+  ownedNamespaces.push(placement);
   diagnostic.stage = "namespace-provisioning";
-  for (const tenant of [...bootstrapNamespaces, placement, controlPlacement]) {
+  for (const tenant of [...bootstrapNamespaces, placement]) {
     await kube.waitFor("worker-created tenant Namespace", async () => {
       const namespaces = JSON.parse(await kubectl("get", "namespaces", "-o", "json")).items;
       return namespaces.find(({ metadata }) => metadata.name === tenant);
@@ -778,7 +777,26 @@ async function setupRepositoryPlatformFixture(context, diagnostic) {
     await request("POST", `/namespaces/${namespace.id}/agents/${agent.id}/runtime-credentials`, {});
     return agent;
   }
-  async function readyPod(agent, revision, previousUid) {
+  // Periodic maintenance and repository cleanup retries run every 30 s (the
+  // repository Driver's fixed interval). A test waiting on such a pass pulls the
+  // revision's queued maintenance or cleanup Work forward instead of waiting the
+  // interval out. Only Work scheduled more than 5 s ahead moves, so readiness
+  // rechecks keep their cadence. Each early maintenance pass queues its successor
+  // one bucket later, so nudge only until the awaited change appears.
+  async function expediteWork(revision) {
+    await pool.query(
+      `UPDATE occ.controller_work SET available_at = clock_timestamp()
+       WHERE revision_id = $1 AND state = 'queued'
+         AND available_at > clock_timestamp() + interval '5 seconds'
+         AND (idempotency_key LIKE $2 OR idempotency_key LIKE $3)`,
+      [
+        revision.id,
+        `agent_revision:${revision.id}:maintenance:%`,
+        `agent_revision:${revision.id}:repository_cleanup:%`,
+      ],
+    );
+  }
+  async function readyPod(agent, revision, previousUid, { expedite = false } = {}) {
     await kube.waitFor(
       "exact active AgentRevision",
       async () =>
@@ -806,6 +824,10 @@ async function setupRepositoryPlatformFixture(context, diagnostic) {
           ),
       );
       assert.ok(matches.length <= 1, "exact revision has multiple Ready gateway Pods");
+      // Nudge only until a replacement Pod exists; its rollout needs no more passes.
+      if (expedite && pods.every((pod) => pod.metadata.uid === previousUid)) {
+        await expediteWork(revision);
+      }
       return matches[0];
     });
   }
@@ -980,6 +1002,7 @@ async function setupRepositoryPlatformFixture(context, diagnostic) {
     request,
     createAgent,
     readyPod,
+    expediteWork,
     tool,
     podNode,
     material,

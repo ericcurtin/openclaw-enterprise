@@ -1,21 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import pg from "pg";
-import { PostgresPlatformState } from "../../packages/occ/src/index.ts";
 import {
-  bootstrapProductionInstallation,
+  assertProviderAttached,
+  assertSessionUser,
+  authRowCounts,
   composeProductionSignIn,
   consoleOrigin as origin,
-  currentSession,
-  defaultInstallSettings,
   githubSignIn,
   githubUpgradeSettings,
-  installationRoles,
+  onboardPasswordAccounts,
   passwordSignIn,
+  postgresSignInState,
   signedInHeaders,
   startFakeGitHub,
 } from "../helpers/production-sign-in.mjs";
-import { cookieHeaderFromSetCookie } from "../helpers/auth-session.mjs";
 import { databaseUrl, requiresPostgres } from "../helpers/postgres-database.mjs";
 
 const adminEmail = "allowlist-recovery@example.test";
@@ -38,66 +36,38 @@ test(
   "a GitHub org and team allowlist refuses non-members before the account lookup and fails closed when GitHub cannot answer",
   requiresPostgres,
   async (t) => {
-    const pool = new pg.Pool({ connectionString: databaseUrl });
-    const state = new PostgresPlatformState(pool);
     let app;
-    t.after(async () => {
-      await app?.close();
-      await pool.end();
-    });
+    const { pool, state } = postgresSignInState(t, () => [app]);
     const github = await startFakeGitHub(t);
     let memberships = {};
     // Compare with the fixed paths; never select a handler by the request's own key.
     github.membership = (path, subject) =>
       Object.entries(memberships).find(([listed]) => listed === path)?.[1](subject) ?? 404;
 
-    const adminPassword = await bootstrapProductionInstallation(t, {
+    const { admin, accounts } = await onboardPasswordAccounts(t, {
       databaseUrl,
+      state,
+      pool,
       email: adminEmail,
       authSecret,
-    });
-    const admin = { email: adminEmail, password: adminPassword };
-    const { reader } = await installationRoles(state, pool);
-    app = await composeProductionSignIn(t, {
-      databaseUrl,
-      settings: defaultInstallSettings,
       secrets,
+      password,
+      accounts: { member: { email: "allowlist-member@example.test" } },
     });
-    let adminHeaders = await signedInHeaders(app, origin, admin);
-    const adminId = (await currentSession(app, adminHeaders.cookie)).user.id;
-    const created = await app.inject({
-      method: "POST",
-      url: "/api/auth/accounts",
-      headers: adminHeaders,
-      payload: { email: "allowlist-member@example.test", password, roleId: reader.id },
-    });
-    assert.equal(created.statusCode, 201, created.body);
-    const member = { id: created.json().data.id, email: "allowlist-member@example.test", password };
-    await app.close();
+    const { member } = accounts;
     app = await composeProductionSignIn(t, {
       databaseUrl,
       settings: {
-        ...githubUpgradeSettings(adminId),
+        ...githubUpgradeSettings(admin.id),
         OCC_AUTH_GITHUB_ALLOWED_ORGS: "Acme",
         OCC_AUTH_GITHUB_ALLOWED_TEAMS: "other/platform",
       },
       secrets,
     });
-    adminHeaders = await signedInHeaders(app, origin, admin);
-    const account = await app.inject({
-      url: `/api/auth/accounts/${member.id}`,
-      headers: adminHeaders,
-    });
-    const attached = await app.inject({
-      method: "POST",
-      url: `/api/auth/accounts/${member.id}/providers/github`,
-      headers: adminHeaders,
-      payload: { subject: String(memberSubject), expectedVersion: account.json().data.version },
-    });
-    assert.equal(attached.statusCode, 200, attached.body);
+    const adminHeaders = await signedInHeaders(app, origin, admin);
+    await assertProviderAttached(app, adminHeaders, member.id, "github", String(memberSubject));
 
-    const sessionCount = async () =>
-      (await pool.query("SELECT count(*)::int AS count FROM occ.session")).rows[0].count;
+    const sessionCount = async () => (await authRowCounts(pool)).sessions;
     const loginDenials = async () =>
       (await state.transact((unit) => unit.audit.list()))
         .filter(
@@ -132,8 +102,7 @@ test(
       const { callback, paths } = await signIn(memberSubject);
       assert.equal(callback.headers.location, "/console/", callback.body);
       assert.deepEqual(paths, ["/login/oauth/access_token", "/user", acme]);
-      const cookie = cookieHeaderFromSetCookie(callback.headers["set-cookie"]);
-      assert.equal((await currentSession(app, cookie)).user.id, member.id);
+      await assertSessionUser(app, callback, member.id);
     });
 
     await t.test("an active member of the listed team signs in", async () => {

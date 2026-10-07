@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { RequestFailure, requestFailure } from "../../apps/controller/src/http/errors.ts";
+import {
+  canonicalFailure,
+  RequestFailure,
+  requestFailure,
+} from "../../apps/controller/src/http/errors.ts";
 import {
   ConfigurationOwnershipError,
   ConfigurationValidationError,
 } from "../../apps/controller/src/drivers/configuration/kubernetes/index.ts";
 import { PresetValidationError } from "../../packages/contracts/src/index.ts";
+import { normalizeRequestSecretBindings } from "../../packages/occ/src/agent-provisioning.ts";
 import {
   AgentDeletingError,
   AgentPrincipalAuthorizationError,
@@ -100,7 +105,7 @@ const cases = [
     {
       status: 409,
       code: "NAMESPACE_NOT_READY",
-      message: "The requested Namespace is not ready for deployment.",
+      message: "The requested Namespace is not ready.",
     },
   ],
   [
@@ -187,6 +192,19 @@ const cases = [
     },
   ],
   [
+    "an IAM policy path over the 512-character cap keeps whole leading segments",
+    new IAMPolicyValidationError(
+      `/bindings/${"b".repeat(600)}`,
+      "The subject is not usable in this Namespace.",
+    ),
+    {
+      status: 400,
+      code: "INVALID_REQUEST",
+      message: "The subject is not usable in this Namespace.",
+      details: [{ path: "/bindings", code: "INVALID_VALUE" }],
+    },
+  ],
+  [
     "a Secret value over the byte limit",
     new SecretValueError("TOO_LONG", "Secret values must be at most 65536 UTF-8 bytes."),
     {
@@ -218,6 +236,34 @@ const cases = [
     "a runtime image without native worker support",
     new NativeWorkerSupportError(),
     { status: 400, code: "INVALID_REQUEST", message: new NativeWorkerSupportError().message },
+  ],
+  [
+    "a plugin selection the selected Plugin Driver does not offer",
+    new PluginPolicyValidationError("unknownPlugin", "occ-plugin", "codex-plugin:a~b/c"),
+    {
+      status: 400,
+      code: "INVALID_REQUEST",
+      message: new PluginPolicyValidationError("unknownPlugin", "occ-plugin", "codex-plugin:a~b/c")
+        .message,
+      details: [{ path: "/plugins/codex-plugin:a~0b~1c", code: "INVALID_VALUE" }],
+    },
+  ],
+  [
+    "a reserved Secret binding destination",
+    new SecretBindingValidationError(
+      "A secret binding destination uses the reserved prefix OPENCLAW_*: OPENCLAW_TOKEN.",
+      {
+        bindingsPath: "/configuration/secretBindings",
+        key: "OPENCLAW_TOKEN",
+        code: "INVALID_VALUE",
+      },
+    ),
+    {
+      status: 400,
+      code: "INVALID_REQUEST",
+      message: "A secret binding destination uses the reserved prefix OPENCLAW_*: OPENCLAW_TOKEN.",
+      details: [{ path: "/configuration/secretBindings/OPENCLAW_TOKEN", code: "INVALID_VALUE" }],
+    },
   ],
   [
     "plugin selections that alias the same plugin",
@@ -275,6 +321,19 @@ const cases = [
       code: "CHANNEL_CREDENTIAL_BINDING_REQUIRED",
       message: "Select an environment-backed Secret for this channel credential.",
       details: [{ path: "/channels/slack/appToken", code: "INVALID_VALUE" }],
+    },
+  ],
+  [
+    "a channel credential path under a long account key is capped",
+    new ChannelCredentialError(
+      "binding_required",
+      `/channels/slack/accounts/${"a".repeat(600)}/appToken`,
+    ),
+    {
+      status: 400,
+      code: "CHANNEL_CREDENTIAL_BINDING_REQUIRED",
+      message: "Select an environment-backed Secret for this channel credential.",
+      details: [{ path: "/channels/slack/accounts", code: "INVALID_VALUE" }],
     },
   ],
   [
@@ -569,12 +628,13 @@ const cases = [
     },
   ],
   [
-    "missing admission evidence",
+    "a 401 admission failure",
     admissionFailure({ statusCode: 401 }),
     {
       status: 401,
       code: "UNAUTHENTICATED",
-      message: "The caller did not provide valid admission evidence.",
+      message:
+        "A valid session cookie or service API key is required: the credential sent is missing, invalid, expired, or revoked. Send service API keys in the x-api-key header; Authorization bearer tokens are not accepted.",
     },
   ],
   [
@@ -724,5 +784,55 @@ for (const [name, error, expected] of cases) {
       expected,
     );
     assert.doesNotMatch(failure.message, /internal detail/);
+    // The wire cap (256 characters) must not cut a mapped message, such as a trailing doc link.
+    let sent;
+    const reply = {
+      request: { id: "req_1" },
+      header: () => reply,
+      status: () => reply,
+      send: (body) => {
+        sent = body;
+        return reply;
+      },
+    };
+    canonicalFailure(reply, failure);
+    assert.equal(sent.error.message, failure.message);
   });
 }
+
+test("a submitted Secret binding destination names its rule and key, never the Secret", () => {
+  const source = { kind: "secret", namespaceId: "ns_1", id: "sec_private_id" };
+  for (const [destination, bindingsPath, message, details] of [
+    [
+      "OPENCLAW_TOKEN",
+      undefined,
+      "A secret binding destination uses the reserved prefix OPENCLAW_*: OPENCLAW_TOKEN.",
+      [{ path: "/secretBindings/OPENCLAW_TOKEN", code: "INVALID_VALUE" }],
+    ],
+    [
+      "path",
+      "/configuration/secretBindings",
+      "A secret binding destination is a reserved process or platform variable name: path.",
+      [{ path: "/configuration/secretBindings/path", code: "INVALID_VALUE" }],
+    ],
+    [
+      "bad/name\n",
+      undefined,
+      "A secret binding destination is not a valid environment variable name: it must match ^[A-Za-z_][A-Za-z0-9_]*$ and have at most 253 characters.",
+      // A malformed key is not echoed; the detail points at the binding map.
+      [{ path: "/secretBindings", code: "INVALID_FORMAT" }],
+    ],
+  ]) {
+    let failure;
+    try {
+      normalizeRequestSecretBindings({ [destination]: { source } }, bindingsPath);
+    } catch (error) {
+      failure = requestFailure(error);
+    }
+    assert.ok(failure, destination);
+    assert.equal(failure.status, 400, destination);
+    assert.equal(failure.message, message, destination);
+    assert.deepEqual(failure.details, details, destination);
+    assert.doesNotMatch(JSON.stringify({ ...failure, message: failure.message }), /sec_private_id/);
+  }
+});

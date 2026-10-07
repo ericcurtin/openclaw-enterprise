@@ -12,6 +12,7 @@ import {
   loginOrigin as origin,
   redirectProviderFetch,
   startProviderServer,
+  testOversizedProviderBodies,
   until,
 } from "../helpers/human-login-transport.mjs";
 
@@ -102,35 +103,19 @@ test(
           assert.deepEqual(login.denials, [["PROVIDER_UNAVAILABLE", "github"]]);
         },
       );
-
-      for (const declared of [false, true]) {
-        await t.test(
-          `${endpoint} cancels oversized ${declared ? "declared" : "chunked"} bodies`,
-          async () => {
-            const login = loginFixture();
-            let closed = false;
-            serve = (request, response) => {
-              if (request.url !== endpoint) {
-                return token(response);
-              }
-              response.on("close", () => {
-                closed = true;
-              });
-              if (declared) {
-                response.setHeader("content-length", String(128 * 1024));
-              }
-              response.write("x".repeat(64 * 1024 + 1));
-              // Leave the stream open: rejection must cancel it without waiting for EOF.
-            };
-            const started = performance.now();
-            await expectDenied(await login.callback());
-            assert.ok(performance.now() - started < 2_000);
-            await until(() => closed);
-            assert.deepEqual(login.subjects, []);
-          },
-        );
-      }
     }
+
+    await testOversizedProviderBodies(t, {
+      endpoints: [
+        ["/login/oauth/access_token", "token"],
+        ["/user", "profile"],
+      ],
+      serve: (handler) => {
+        serve = handler;
+      },
+      provider: () => (_request, response) => token(response),
+      login: loginFixture,
+    });
 
     await t.test("shared deadline aborts a stalled token response before headers", async () => {
       const login = loginFixture({}, { providerDeadlineMs });

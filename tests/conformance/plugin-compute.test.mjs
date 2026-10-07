@@ -10,7 +10,6 @@ import {
   createKubernetesComputeDriver,
   KubernetesComputeDriver,
   kubernetesNamespaceName,
-  kubernetesGatewayNamespaceName,
 } from "../../apps/controller/src/drivers/compute/kubernetes/index.ts";
 import {
   AGENT_RUNTIME_ENTRYPOINT,
@@ -171,7 +170,7 @@ function harnessAuthContext(candidate) {
     harnessAuth: {
       ...candidate.harnessAuth,
       backendRef: {
-        namespaceName: kubernetesGatewayNamespaceName(tenant.id),
+        namespaceName: kubernetesNamespaceName(tenant.id),
         name: "plugin-model-key",
         key: "value",
         uid: "plugin-model-key-uid",
@@ -2198,7 +2197,7 @@ test("embedded plugin preparation applies runtime egress before gateway readines
 
   // This fresh Agent has no prior authentication-probe workloads to retire.
   const credentialObjects = new Map();
-  const cp = kubernetesGatewayNamespaceName(tenant.id);
+  const cp = kubernetesNamespaceName(tenant.id);
   credentialObjects.set(`${cp}:plugin-model-key`, {
     apiVersion: "v1",
     kind: "Secret",
@@ -2496,7 +2495,7 @@ test("Kubernetes plugin runtime status requires the exact ready Pod report", asy
     kind: "Pod",
     metadata: {
       name: "gateway-plugin-status",
-      namespace: kubernetesGatewayNamespaceName(tenant.id),
+      namespace: kubernetesNamespaceName(tenant.id),
       uid: "pod-plugin-status-1",
       labels: {
         "openclaw.dev/agent": candidate.agentId,
@@ -2741,6 +2740,16 @@ test("gateway runtime status maps native Slack channel status without provider d
       if (specifier === "openclaw/plugin-sdk/gateway-runtime") {
         return {
           isGatewayTransportError: (error) => error === transportError,
+          // OpenClaw's predicate for a request refusal the Gateway answered (call.ts).
+          isGatewayClientRequestError: (error) =>
+            error instanceof Error &&
+            error.name === "GatewayClientRequestError" &&
+            typeof error.gatewayCode === "string" &&
+            error.gatewayCode.length > 0 &&
+            error.message.length > 0 &&
+            typeof error.retryable === "boolean" &&
+            (error.retryAfterMs === undefined ||
+              (Number.isInteger(error.retryAfterMs) && error.retryAfterMs >= 0)),
           async callGatewayFromCli(method, options, params, { signal }) {
             assert.equal(method, "channels.status");
             assert.deepEqual(plain(params), { channel: "slack", probe: true, timeoutMs: 5000 });
@@ -2886,9 +2895,20 @@ test("gateway runtime status maps native Slack channel status without provider d
     "malformed live response",
   );
 
+  // The shape of a refusal the Gateway answers (OpenClaw's GatewayClientRequestError).
+  const gatewayRefusal = (gatewayCode, message) =>
+    Object.assign(new Error(message), {
+      name: "GatewayClientRequestError",
+      gatewayCode,
+      retryable: false,
+    });
   for (const [error, code] of [
     [transportError, "UNAVAILABLE"],
     [new Error("RPC failed"), "PROBE_FAILED"],
+    // Only the unknown-channel refusal for Slack itself means "no Slack channel".
+    [gatewayRefusal("INVALID_REQUEST", "unknown channel: teams"), "PROBE_FAILED"],
+    [gatewayRefusal("UNAVAILABLE", "unknown channel: slack"), "PROBE_FAILED"],
+    [new Error("unknown channel: slack"), "PROBE_FAILED"],
   ]) {
     channelError = error;
     const diagnostics = await readRuntimeChannelChecksFromHandler(statusHandler);
@@ -2897,6 +2917,24 @@ test("gateway runtime status maps native Slack channel status without provider d
       Array.from({ length: 3 }, () => ({ state: "unknown", code })),
     );
   }
+  // The Gateway loads the Slack plugin only when the Configuration sets up a Slack channel,
+  // so for an Agent without one it refuses channels.status as an unknown channel. That is
+  // the documented NOT_CONFIGURED answer, not a failed probe.
+  channelError = gatewayRefusal("INVALID_REQUEST", "unknown channel: slack");
+  const withoutSlack = await readRuntimeChannelChecksFromHandler(statusHandler);
+  assert.deepEqual(
+    withoutSlack.checks.map(({ component, check, state, code }) => ({
+      component,
+      check,
+      state,
+      code,
+    })),
+    [
+      { component: "gateway", check: "configuration", state: "failed", code: "NOT_CONFIGURED" },
+      { component: "gateway", check: "authentication", state: "unknown", code: undefined },
+      { component: "gateway", check: "connectivity", state: "unknown", code: undefined },
+    ],
+  );
   channelError = undefined;
 
   holdChannelStatusResponse = true;
@@ -2941,7 +2979,7 @@ test("gateway runtime status maps native Slack channel status without provider d
   assert.equal(pendingChannelSignal.aborted, true);
   await abortedRequest;
   responseListeners.close?.();
-  assert.equal(channelStatusCalls, 11);
+  assert.equal(channelStatusCalls, 15);
 });
 
 test("Codex runtime gates startup and readiness on a successful native authentication turn", async (t) => {
@@ -2961,6 +2999,12 @@ test("Codex runtime gates startup and readiness on a successful native authentic
     message: "Reconnecting... 2/3 stream disconnected - retrying sampling request",
   };
   const scenarios = [
+    {
+      name: "verifier-only app server starts without exposing either token input",
+      tokenVerifier: true,
+      events: [started, assistant, completed],
+      ready: true,
+    },
     {
       name: "delayed retry uses only the remaining budget",
       probeTimeouts: 2,
@@ -3267,7 +3311,9 @@ test("Codex runtime gates startup and readiness on a successful native authentic
               OPENCLAW_RUNTIME_STATUS_PORT: "18791",
               OPENCLAW_POD_UID: "pod-runtime-auth-gate",
               OPENCLAW_PLUGIN_READY_MARKER: marker,
-              APP_SERVER_TOKEN: "fixture-transport-token",
+              ...(scenario.tokenVerifier
+                ? { APP_TOKEN_SHA: sha256("fixture-transport-token") }
+                : { APP_SERVER_TOKEN: "fixture-transport-token" }),
               APP_SERVER_PORT: "4500",
             },
             on() {},
@@ -3307,11 +3353,19 @@ test("Codex runtime gates startup and readiness on a successful native authentic
                     loginCalls++;
                     const loginEnvironment = options.env ?? sandbox.process.env;
                     assert.equal(Object.hasOwn(loginEnvironment, "APP_SERVER_TOKEN"), false);
+                    assert.equal(Object.hasOwn(loginEnvironment, "APP_TOKEN_SHA"), false);
                     assert.equal(
                       loginEnvironment.CODEX_LOGIN_MODE,
                       sandbox.process.env.CODEX_LOGIN_MODE,
                     );
-                    assert.equal(sandbox.process.env.APP_SERVER_TOKEN, "fixture-transport-token");
+                    if (scenario.tokenVerifier) {
+                      assert.equal(
+                        sandbox.process.env.APP_TOKEN_SHA,
+                        sha256("fixture-transport-token"),
+                      );
+                    } else {
+                      assert.equal(sandbox.process.env.APP_SERVER_TOKEN, "fixture-transport-token");
+                    }
                   }
                   if (isLogin && scenario.pat) {
                     assert.equal(command, "codex");
@@ -3362,8 +3416,12 @@ test("Codex runtime gates startup and readiness on a successful native authentic
                       scenario.events.map((event) => JSON.stringify(event)).join("\n"),
                   };
                 },
-                spawn(_command, args) {
+                spawn(_command, args, options) {
                   assert.ok(args.includes("app-server"));
+                  const tokenDigest = args[args.indexOf("--ws-token-sha256") + 1];
+                  assert.equal(tokenDigest, sha256("fixture-transport-token"));
+                  assert.equal(Object.hasOwn(options.env, "APP_SERVER_TOKEN"), false);
+                  assert.equal(Object.hasOwn(options.env, "APP_TOKEN_SHA"), false);
                   appServerStarts++;
                   return { on() {}, kill() {} };
                 },
@@ -4462,7 +4520,7 @@ test("Kubernetes dedicated Codex agent mounts plugin-free runtime without plugin
     false,
     undefined,
     driver.harnessAuthForRevision(candidate, harnessAuthContext(candidate), {
-      name: kubernetesGatewayNamespaceName(tenant.id),
+      name: kubernetesNamespaceName(tenant.id),
       plane: "control",
     }),
     [],
@@ -4679,7 +4737,7 @@ test("Kubernetes dedicated successor readiness preserves the stable Agent Servic
   let candidateRevisionName;
 
   const credentialObjects = new Map();
-  const cp = kubernetesGatewayNamespaceName(tenant.id);
+  const cp = kubernetesNamespaceName(tenant.id);
   credentialObjects.set(`${cp}:plugin-model-key`, {
     apiVersion: "v1",
     kind: "Secret",

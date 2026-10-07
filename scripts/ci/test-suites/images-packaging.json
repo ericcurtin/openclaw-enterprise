@@ -16,6 +16,21 @@
     "requireEnv": ["NODE_BASE_IMAGE"],
     "nodeBaseImage": true
   },
+  "fileConcurrency": 2,
+  "parallelFiles": [
+    "tests/integration/codex-model-probe.test.mjs",
+    "tests/integration/production-image-upgrade-recovery.test.mjs",
+    "tests/integration/docker-compute-token-retry.test.mjs",
+    "tests/integration/workspace-setup-runtime.test.mjs",
+    "tests/integration/production-kubernetes-packaging.test.mjs",
+    "tests/integration/production-image-startup.test.mjs",
+    "tests/integration/container-registry-real.test.mjs",
+    "tests/integration/logging-packaging.test.mjs",
+    "tests/integration/repository-runtime-volume.test.mjs",
+    "tests/integration/production-image-qualification.test.mjs",
+    "tests/integration/development-packaging.test.mjs",
+    "tests/integration/container-publication-workflow.test.mjs"
+  ],
   "files": [
     {
       "path": "tests/integration/container-publication-workflow.test.mjs",
@@ -63,20 +78,6 @@
         "the real Helm renderer rejects mutable images, broad dependencies, and shared credentials",
         "private Envoy Gateway routing renders automatic CA and deterministic default hostnames",
         "private Envoy Gateway routing preserves explicit hostnames and external CA trust"
-      ]
-    },
-    {
-      "path": "tests/integration/sign-in-chart-parity.test.mjs",
-      "expectedTests": [
-        "the API accepts exactly the sign-in settings the chart renders for every proxy preset, with and without GitHub",
-        "the API accepts exactly the GitHub allowlist the chart renders",
-        "the API accepts exactly the Google sign-in settings the chart renders, alone and with GitHub",
-        "the API accepts exactly the OIDC sign-in settings the chart renders, alone and with GitHub and Google",
-        "values the chart refuses are settings the API also refuses",
-        "proxy CIDRs without a preset are refused by the chart and default to ingress-nginx in the API",
-        "the chart refuses Google Secret and egress settings the API cannot observe",
-        "the chart refuses OIDC Secret and egress settings the API cannot observe",
-        "install notes warn when sign-in is exposed without a trusted proxy, and never fail"
       ]
     },
     {

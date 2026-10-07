@@ -1,23 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import pg from "pg";
-import { PostgresPlatformState } from "../../packages/occ/src/index.ts";
 import {
-  bootstrapProductionInstallation,
+  assertConsoleSignIn,
   clientAddresses,
   composeProductionSignIn,
   consoleOrigin as origin,
   currentSession,
-  defaultInstallSettings,
   githubSignIn,
   githubUpgradeSettings,
-  installationRoles,
+  onboardPasswordAccounts,
   passwordSignIn,
+  postgresSignInState,
   readAccount,
   signedInHeaders,
   startFakeGitHub,
 } from "../helpers/production-sign-in.mjs";
-import { cookieHeaderFromSetCookie } from "../helpers/auth-session.mjs";
 import { databaseUrl, requiresPostgres } from "../helpers/postgres-database.mjs";
 
 const adminEmail = "attach-recovery@example.test";
@@ -37,48 +34,30 @@ test(
   "Installation administrators attach, detach and re-attach GitHub identities and disable accounts",
   requiresPostgres,
   async (t) => {
-    const pool = new pg.Pool({ connectionString: databaseUrl });
-    const state = new PostgresPlatformState(pool);
     let app;
-    t.after(async () => {
-      await app?.close();
-      await pool.end();
-    });
+    const { pool, state } = postgresSignInState(t, () => [app]);
     const github = await startFakeGitHub(t);
     const address = clientAddresses();
-    const adminPassword = await bootstrapProductionInstallation(t, {
+    // Password onboarding on the default install: a second administrator and a reader.
+    const {
+      admin,
+      roles,
+      accounts: { second, member },
+    } = await onboardPasswordAccounts(t, {
       databaseUrl,
+      state,
+      pool,
       email: adminEmail,
       authSecret,
-    });
-    const admin = { email: adminEmail, password: adminPassword };
-    const roles = await installationRoles(state, pool);
-
-    // Password onboarding on the default install: a second administrator and a reader.
-    app = await composeProductionSignIn(t, {
-      databaseUrl,
-      settings: defaultInstallSettings,
       secrets,
+      password,
+      remoteAddress: address(),
+      accounts: {
+        second: { email: "attach-second@example.test", role: "admin" },
+        member: { email: "attach-member@example.test" },
+      },
     });
-    let adminHeaders = await signedInHeaders(app, origin, admin, address());
-    admin.id = (await currentSession(app, adminHeaders.cookie)).user.id;
-    const accounts = {};
-    for (const [name, role] of [
-      ["second", roles.admin],
-      ["member", roles.reader],
-    ]) {
-      const email = `attach-${name}@example.test`;
-      const created = await app.inject({
-        method: "POST",
-        url: "/api/auth/accounts",
-        headers: adminHeaders,
-        payload: { email, password, roleId: role.id },
-      });
-      assert.equal(created.statusCode, 201, created.body);
-      accounts[name] = { id: created.json().data.id, email, password };
-    }
-    const { second, member } = accounts;
-    await app.close();
+    let adminHeaders;
     app = await composeProductionSignIn(t, {
       databaseUrl,
       settings: githubUpgradeSettings(admin.id),
@@ -95,14 +74,16 @@ test(
       app.inject({ method: "POST", url: path, headers, payload: { expectedVersion } });
     async function assertGitHubSignIn(subject, userId) {
       const { callback } = await githubSignIn(app, origin, subject, address());
-      assert.equal(callback.headers.location, "/console/", callback.body);
-      const cookie = cookieHeaderFromSetCookie(callback.headers["set-cookie"]);
-      assert.equal((await currentSession(app, cookie)).user.id, userId);
-      return cookie;
+      return assertConsoleSignIn(app, callback, userId);
     }
-    async function assertGitHubRefused(subject) {
+    async function assertGitHubRefused(subject, consoleReason) {
       const { callback } = await githubSignIn(app, origin, subject, address());
-      assert.equal(callback.headers.location, "/console/?authError=github");
+      assert.equal(
+        callback.headers.location,
+        consoleReason === undefined
+          ? "/console/?authError=github"
+          : `/console/?authError=github&authReason=${consoleReason}`,
+      );
       assert.equal(callback.headers["set-cookie"], undefined);
     }
 
@@ -249,7 +230,8 @@ test(
       assert.equal(disabled.statusCode, 200, disabled.body);
       assert.equal(await currentSession(app, secondGitHubCookie), null);
       assert.equal((await passwordSignIn(app, origin, second, address())).statusCode, 401);
-      await assertGitHubRefused(secondSubject);
+      // The attached GitHub identity is told its account is disabled; the password is not.
+      await assertGitHubRefused(secondSubject, "account-disabled");
 
       const disabledAccount = await readAccount(app, adminHeaders, second.id);
       assert.equal(disabledAccount.disabled, true);

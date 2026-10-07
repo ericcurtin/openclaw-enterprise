@@ -13,6 +13,13 @@ inputs:
   artifact-prefix:
     description: Prefix for the uploaded result artifact.
     required: true
+  static-checks:
+    description: >-
+      Whether checks-baseline-1 runs the workspace boundary, lint, format, OpenAPI
+      and docs checks before its tests ("false" when the workflow runs them in a
+      separate job).
+    required: false
+    default: "true"
 runs:
   using: composite
   steps:
@@ -20,7 +27,7 @@ runs:
       with:
         node-version: ${{ inputs.node-version }}
     - id: pnpm-store
-      uses: openclaw/openclaw/.github/actions/setup-pnpm-store-cache@ee0cf16623068ff535cc20f4a1ce175c8c5b8d25
+      uses: ./.github/actions/setup-pnpm-store-cache
       with:
         node-version: ${{ inputs.node-version }}
         cache-mode: read-write
@@ -31,6 +38,10 @@ runs:
         (inputs.profile == 'full' || inputs.profile == 'images' || inputs.profile == 'k3d') &&
         inputs.lane != 'docker-model' && inputs.lane != 'logging-collector' &&
         !startsWith(inputs.lane, 'k3d-fixture-') && !startsWith(inputs.lane, 'k3d-observability')
+      with:
+        # GitHub-hosted and Blacksmith runners are per-job VMs, so skip the builder
+        # removal; a persistent runner would accumulate buildx_buildkit_* containers.
+        cleanup: false
     - name: Set up CI tools
       shell: bash
       run: bash scripts/ci/setup-tools.sh "${{ inputs.profile }}"
@@ -69,28 +80,29 @@ runs:
         go-version-file: go.mod
         cache: true
     - name: Run workspace boundary check
-      if: inputs.lane == 'checks-baseline-1'
+      if: inputs.lane == 'checks-baseline-1' && inputs.static-checks != 'false'
       shell: bash
       run: pnpm check:workspace
     - name: Run lint check
-      if: inputs.lane == 'checks-baseline-1'
+      if: inputs.lane == 'checks-baseline-1' && inputs.static-checks != 'false'
       shell: bash
       run: pnpm lint
     - name: Run format check
-      if: inputs.lane == 'checks-baseline-1'
+      if: inputs.lane == 'checks-baseline-1' && inputs.static-checks != 'false'
       shell: bash
       run: pnpm format:check
     - name: Run OpenAPI check
-      if: inputs.lane == 'checks-baseline-1'
+      if: inputs.lane == 'checks-baseline-1' && inputs.static-checks != 'false'
       shell: bash
       run: pnpm openapi:check
     - name: Run docs check
-      if: inputs.lane == 'checks-baseline-1'
+      if: inputs.lane == 'checks-baseline-1' && inputs.static-checks != 'false'
       shell: bash
       run: pnpm docs:install && pnpm docs:check && pnpm docs:build
     - name: Install documentation browser dependencies
-      # Only part 1 runs docs-compute-matrix.
-      if: inputs.lane == 'checks-browser'
+      # Only browser part 1 runs docs-compute-matrix. Baseline part 1's docs-site
+      # test needs Pagefind; the docs check above installs it otherwise.
+      if: inputs.lane == 'checks-browser' || (inputs.lane == 'checks-baseline-1' && inputs.static-checks == 'false')
       shell: bash
       run: pnpm docs:install
     - name: Run typecheck
@@ -140,7 +152,7 @@ runs:
     - name: Run lane
       shell: bash
       env:
-        CI_RUNNER_TEST_TIMEOUT_MS: ${{ (startsWith(inputs.lane, 'checks-baseline-') || startsWith(inputs.lane, 'checks-browser')) && '300000' || inputs.lane == 'k3d-model' && '5400000' || '' }}
+        CI_RUNNER_TEST_TIMEOUT_MS: ${{ (startsWith(inputs.lane, 'checks-baseline-') || startsWith(inputs.lane, 'checks-browser')) && '300000' || (inputs.lane == 'k3d-model' || inputs.lane == 'openshell') && '5400000' || '' }}
         # Browser tests write screenshots and failure.json (console, network
         # and navigation log) here only when a test fails. Limited to the
         # fixture-only browser lanes.

@@ -113,6 +113,47 @@ export async function waitFor(description, operation, timeoutMs = 120_000) {
   assert.fail(`Timed out waiting for ${description}.`);
 }
 
+// Test cleanup deletes its randomly named namespaces without waiting: no later step reads
+// them, and each deletion waits out namespace-controller passes (5 s each, longer while Pods
+// terminate). local-path removes a deleted claim's host directory with a helper Pod, which
+// lane cleanup cannot do itself, so a file registers `after(waitForDeletedVolumes)` to wait
+// once, at its end, for those volumes to be deleted. It reads only volumes claimed from the
+// file's own namespaces, so a file sharing the cluster does not delay it.
+export function createNamespaceReaper() {
+  const deletedNamespaces = new Set();
+  return {
+    deleteNamespaces(...names) {
+      for (const name of names) {
+        deletedNamespaces.add(name);
+      }
+      return kubectl("delete", "namespace", ...names, "--ignore-not-found=true", "--wait=false");
+    },
+    async waitForDeletedVolumes() {
+      if (deletedNamespaces.size === 0) {
+        return;
+      }
+      let remaining = [];
+      try {
+        await waitFor(
+          "local-path volumes of deleted namespaces to be removed",
+          async () => {
+            const volumes = JSON.parse(await kubectlRead("get", "persistentvolumes", "-o", "json"));
+            remaining = volumes.items
+              .filter(({ spec }) => deletedNamespaces.has(spec.claimRef?.namespace))
+              .map(({ metadata, status }) => `${metadata.name} (${status?.phase ?? "unknown"})`);
+            return remaining.length === 0;
+          },
+          180_000,
+        );
+      } catch (error) {
+        // Bound means a namespace is stuck; Released or Failed means local-path's helper failed.
+        error.message = `${error.message} Remaining: ${remaining.join(", ")}`;
+        throw error;
+      }
+    },
+  };
+}
+
 export function provisioningRequestBody({
   modelSecretRef,
   slackBotSecretRef,
@@ -405,12 +446,6 @@ export function revisionName(candidate) {
 }
 
 export async function assertReadyGateway(namespaceName, agentId, namespaceId, snapshot) {
-  if (snapshot?.harness?.mode !== "embedded") {
-    const target = kubernetesGatewayNamespaceName(namespaceId);
-    assert.notEqual(target, namespaceName, "dedicated Gateway must leave the Harness namespace");
-    assert.equal(await missing("deployment", gatewayName(agentId), namespaceName), true);
-    namespaceName = target;
-  }
   const name = gatewayName(agentId);
   const deployment = await resource("deployment", name, namespaceName);
   assert.equal(deployment.spec.replicas, 1, "each Agent gateway must have exactly one replica");
@@ -770,6 +805,9 @@ export async function createDnsTrafficFixture(context, peer) {
       },
       spec: {
         automountServiceAccountToken: false,
+        // The control container runs `node` as PID 1, which ignores SIGTERM, so cleanup
+        // would otherwise wait out the default 30 s grace period.
+        terminationGracePeriodSeconds: 1,
         securityContext: {
           runAsNonRoot: true,
           runAsUser: 1000,

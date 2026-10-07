@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -128,6 +128,7 @@ async function productionDrivers({ includeDefaults = false, files, configuration
   return {
     installation,
     defaultPresets: runtime.defaultPresets,
+    shadowedDefaultPresets: runtime.shadowedDefaultPresets,
     bundledPresetVersions: runtime.bundledPresetVersions,
     computeDriver: createPassiveComputeDriver(),
     configurationDriver: configurationRoot
@@ -656,6 +657,29 @@ test(
       await development.close();
       assert.deepEqual(await readOpenClaw(), refrozen.data);
       assert.deepEqual(skippedRefreshes(developmentLog), frozenWarning);
+      // An operator file named like a bundled default (default-codex was bundled after
+      // operators could already use the name) replaces it: startup warns instead of stopping.
+      const operatorCodexPath = join(passwordDirectory, "operator-default-codex.json");
+      const operatorCodexTemplate = {
+        agent: { name: "Operator Codex", executionMode: "dedicated" },
+      };
+      await writeFile(
+        operatorCodexPath,
+        JSON.stringify({ name: "default-codex", template: operatorCodexTemplate }),
+      );
+      const bundledCodexCopy = async () =>
+        (await request("GET", presetPath)).data.find((preset) => preset.name === "default-codex");
+      const seededCodex = await bundledCodexCopy();
+      const shadowLog = memoryLog();
+      await restart({ includeDefaults: true, files: [operatorCodexPath] }, shadowLog.logger);
+      // The copy seeded earlier from the bundled template stays as it was.
+      assert.deepEqual(await bundledCodexCopy(), seededCodex);
+      assert.deepEqual(
+        shadowLog.lines
+          .filter(({ event }) => event === "presets.bundled-default-shadowed")
+          .map(({ severity, presetName, presetFile }) => ({ severity, presetName, presetFile })),
+        [{ severity: "WARN", presetName: "default-codex", presetFile: operatorCodexPath }],
+      );
       const newNamespace = await request("POST", "/namespaces", {
         name: "Preset startup namespace",
       });
@@ -666,6 +690,11 @@ test(
         "Standard OpenClaw",
         "default-codex",
       ]);
+      // A new Namespace receives the operator's template, not the bundled one.
+      assert.equal(
+        newPresets.data.find((preset) => preset.name === "default-codex").template.agent.name,
+        operatorCodexTemplate.agent.name,
+      );
       assert.notEqual(
         newPresets.data.find((preset) => preset.name === "Standard Codex").id,
         copied.id,

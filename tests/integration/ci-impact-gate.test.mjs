@@ -33,7 +33,7 @@ function needsFor(mode) {
   return {
     impact: { result: "success", outputs: { mode } },
     audit: { result: "success", outputs: {} },
-    "docs-checks": { result: mode === "docs" ? "success" : "skipped", outputs: {} },
+    "static-checks": { result: "success", outputs: {} },
     "pr-safe": { result: mode === "docs" ? "skipped" : "success", outputs: {} },
     "runtime-image-fixture": { result: mode === "docs" ? "skipped" : "success", outputs: {} },
   };
@@ -96,6 +96,16 @@ test("gate rejects failed, cancelled, missing, and unexpectedly run or skipped j
         const result = runGate(t, mode, needs);
         assert.notEqual(result.status, 0, `${mode}: ${job} ${bad}`);
         assert.match(result.stderr, new RegExp(job));
+        if (mode === "full") {
+          for (const lane of allLanes) {
+            const source = lane === "runtime-image-fixture" ? lane : "pr-safe";
+            assert.equal(
+              result.expanded?.[lane]?.result,
+              job === source ? bad : "success",
+              `${mode}: ${job} ${bad} -> ${lane}`,
+            );
+          }
+        }
       }
     }
   }
@@ -122,7 +132,7 @@ function testNeeds(lanes) {
   return {
     impact: { result: "success", outputs: { mode: "tests", lanes: json } },
     audit: { result: "success", outputs: {} },
-    "docs-checks": { result: "skipped", outputs: {} },
+    "static-checks": { result: "success", outputs: {} },
     "pr-safe": { result: "success", outputs: {} },
     "runtime-image-fixture": {
       result: lanes.includes("runtime-image-fixture") ? "success" : "skipped",
@@ -184,6 +194,14 @@ test("tests mode rejects wrong job states and unverifiable lane sets", (t) => {
         const result = runTestsGate(t, lanes, needs);
         assert.notEqual(result.status, 0, `${job} ${bad}`);
         assert.match(result.stderr, new RegExp(job));
+        for (const lane of lanes) {
+          const source = lane === "runtime-image-fixture" ? lane : "pr-safe";
+          assert.equal(
+            result.expanded?.[lane]?.result,
+            job === source ? bad : "success",
+            `${job} ${bad} -> ${lane}`,
+          );
+        }
       }
     }
   }

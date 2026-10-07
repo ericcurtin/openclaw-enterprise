@@ -2040,7 +2040,7 @@ test("Dedicated Agent creation offers Retry only for a transient provisioning fa
         body: JSON.stringify({
           error: {
             code: "INVALID_REQUEST",
-            message: "The request does not match the operation contract: /name is too long.",
+            message: "The request does not match the operation contract.",
           },
           meta: { requestId: "req_00000000-0000-4000-8000-000000000400" },
         }),
@@ -2173,8 +2173,7 @@ test("Dedicated Agent creation offers Retry only for a transient provisioning fa
   await createModelCredentialSecret(page, "model-secret-value");
   await page.getByLabel("Model", { exact: true }).selectOption("gpt-6-sol");
   const retry = page.getByRole("button", { name: "Retry provisioning request" });
-  // Longer than the API's 200-character limit, so a resend that reaches validation fails.
-  await page.getByLabel("Agent name").fill("n".repeat(201));
+  // The stub refuses the resend at admission.
   await page.getByRole("button", { name: "Create Agent" }).click();
   await page
     .getByText(/^Outcome unknown\. Retry resubmits the same request ID and saved references\./)
@@ -2182,9 +2181,7 @@ test("Dedicated Agent creation offers Retry only for a transient provisioning fa
   assert.equal(await page.getByLabel("Agent name").isDisabled(), true);
   // A 400 to the resend shows the request was never admitted, so the form unlocks.
   await retry.click();
-  await page
-    .getByText(/^The request does not match the operation contract: \/name is too long\./)
-    .waitFor();
+  await page.getByText(/^The request does not match the operation contract\./).waitFor();
   assert.equal(await retry.isVisible(), false);
   assert.equal(await page.getByLabel("Agent name").isDisabled(), false);
   await page.getByLabel("Agent name").fill("Taken name");
@@ -2625,6 +2622,112 @@ test("Static model selection survives credential edits and resets for provider o
   );
 });
 
+test("Agent creation can return from manual model entry to the list and save the selected model", async (t) => {
+  const fixture = await createConsoleAppFixture(t);
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Model selection round trip", { ready: true });
+  const { page } = await newPage(t, fixture);
+  // Save through the regular draft workflow; this case does not exercise provisioning.
+  await routeInstallationWithoutProvisioning(page, fixture);
+  await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
+  await page.getByRole("button", { name: "Start with default Preset" }).click();
+  await page.getByLabel("Agent name").fill("Model selection round trip");
+  const credential = page.getByLabel("API key Secret", { exact: true });
+  const choice = page.getByLabel("Model", { exact: true });
+  const model = page.getByLabel("Model ID", { exact: true });
+  const configuration = page.getByLabel("Configuration JSON");
+
+  // JSON edits can change the provider; returning to the list must show its models.
+  await choice.selectOption("gpt-6-astra");
+  const values = JSON.parse(await configuration.inputValue());
+  values.agents.defaults.model = "anthropic/custom-model-id";
+  await openAdvancedSettings(page);
+  await configuration.fill(JSON.stringify(values));
+  await configuration.press("Tab");
+  await page.getByRole("button", { name: "Choose a model from the list", exact: true }).click();
+  assert.equal(
+    (await optionValues(choice)).some(({ value }) => value === "claude-opus-5-5"),
+    true,
+  );
+  assert.equal(
+    (await optionValues(choice)).some(({ value }) => value === "gpt-6-astra"),
+    false,
+  );
+  await choice.selectOption("claude-opus-5-5");
+  assert.equal(
+    JSON.parse(await configuration.inputValue()).agents.defaults.model,
+    "anthropic/claude-opus-5-5",
+  );
+  await page.getByLabel("Provider", { exact: true }).selectOption("openai");
+  assert.equal(await choice.inputValue(), "");
+  assert.equal(JSON.parse(await configuration.inputValue()).agents?.defaults?.model, undefined);
+  const secret = await createModelCredentialSecret(page, "round-trip-model-key");
+  await choice.selectOption("gpt-6-astra");
+  await page.getByRole("button", { name: "Enter model ID manually", exact: true }).click();
+  assert.equal(await choice.isVisible(), false);
+  assert.equal(await model.evaluate((input) => input.ownerDocument.activeElement === input), true);
+  assert.equal(await model.inputValue(), "gpt-6-astra");
+  assert.equal(await model.evaluate((input) => input.required), true);
+  assert.equal(await choice.evaluate((input) => input.required), false);
+  // A manual edit replaces the previous list selection in the same Configuration.
+  await model.fill("gpt-6-sol");
+  await model.press("Tab");
+  assert.equal(
+    JSON.parse(await configuration.inputValue()).agents.defaults.model,
+    "codex/gpt-6-sol",
+  );
+  await page.getByRole("button", { name: "Choose a model from the list", exact: true }).click();
+  assert.equal(await choice.inputValue(), "gpt-6-sol");
+  assert.equal(await model.isVisible(), false);
+  assert.equal(await choice.isVisible(), true);
+  assert.equal(await model.evaluate((input) => input.required), false);
+  assert.equal(await choice.evaluate((input) => input.required), true);
+  assert.equal(
+    JSON.parse(await configuration.inputValue()).agents.defaults.model,
+    "codex/gpt-6-sol",
+  );
+  await page.getByRole("button", { name: "Enter model ID manually", exact: true }).click();
+  await model.fill("custom-model-id");
+  await model.press("Tab");
+
+  // Changing entry mode clears the custom model, but keeps the credential and other settings.
+  await page.getByRole("button", { name: "Choose a model from the list", exact: true }).click();
+  assert.equal(await model.isVisible(), false);
+  assert.equal(await choice.isVisible(), true);
+  assert.equal(await choice.evaluate((input) => input.ownerDocument.activeElement === input), true);
+  assert.equal(await choice.inputValue(), "");
+  assert.equal(await choice.evaluate((input) => input.validity.valueMissing), true);
+  assert.equal(JSON.parse(await configuration.inputValue()).agents?.defaults?.model, undefined);
+  assert.equal(await credential.inputValue(), secretOptionLabel(secret));
+  assert.equal(await page.getByLabel("Agent name").inputValue(), "Model selection round trip");
+  await choice.selectOption("gpt-6-sol");
+  assert.equal(
+    JSON.parse(await configuration.inputValue()).agents.defaults.model,
+    "codex/gpt-6-sol",
+  );
+
+  // Repeated switches must still offer both modes without leaving a hidden required input.
+  await page.getByRole("button", { name: "Enter model ID manually", exact: true }).click();
+  assert.equal(await model.inputValue(), "gpt-6-sol");
+  await page.getByRole("button", { name: "Choose a model from the list", exact: true }).click();
+  assert.equal(await choice.inputValue(), "gpt-6-sol");
+  const saved = page.waitForResponse(
+    (response) =>
+      response.url() === `${fixture.origin}/namespaces/${namespace.id}/agents` &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Create Agent", exact: true }).click();
+  const response = await saved;
+  assert.equal(response.status(), 201);
+  const agent = (await response.json()).data;
+  assert.deepEqual(agent.harnessAuth, { method: "api_key", source: secret.ref });
+  const savedConfiguration = await fixture.request(
+    "GET",
+    `/namespaces/${namespace.id}/configurations/${agent.configurationId}`,
+  );
+  assert.equal(savedConfiguration.data.values.agents.defaults.model, "codex/gpt-6-sol");
+});
+
 test("Agent creation accepts a manual model outside the static list and saves through the real Agent API", async (t) => {
   const fixture = await createConsoleAppFixture(t);
   await fixture.bootstrap();
@@ -2662,6 +2765,8 @@ test("Agent creation accepts a manual model outside the static list and saves th
     ).status,
     200,
   );
+  // Submit manual entry after a different list choice; only the manual model may be saved.
+  await page.getByLabel("Model", { exact: true }).selectOption("gpt-6-astra");
   const selectedSecret = await enterManualModel(
     page,
     "manual-model-key",
@@ -2775,7 +2880,7 @@ test("Agent creation reports unavailable Secret storage before creating Configur
   assert.equal(agentPostRequests(requests, namespace.id).length, 0);
 });
 
-test("Agent creation shows the API's duplicate-name conflict, generic text for other conflicts, and keeps the form usable", async (t) => {
+test("Agent creation shows the API's duplicate-name conflict, a not-ready Namespace, generic text for other conflicts, and keeps the form usable", async (t) => {
   const fixture = await createConsoleAppFixture(t);
   await fixture.bootstrap();
   const namespace = await fixture.createNamespace("Duplicate Agent name", { ready: true });
@@ -2824,6 +2929,36 @@ test("Agent creation shows the API's duplicate-name conflict, generic text for o
     .waitFor();
   assert.equal(await page.getByText("The requested platform resource already exists.").count(), 0);
   await page.unroute(agentsUrl, otherConflict);
+  await page.getByRole("button", { name: "Create Agent", disabled: false }).waitFor();
+
+  // A Namespace that is still provisioning is named as the cause, not a saved-state conflict.
+  const notReady = async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: { code: "NAMESPACE_NOT_READY", message: "The requested Namespace is not ready." },
+        meta: { requestId: "req_00000000-0000-4000-8000-000000000410" },
+      }),
+    });
+  };
+  await page.route(agentsUrl, notReady);
+  const refused = page.waitForResponse(agentPost);
+  await page.getByRole("button", { name: "Create Agent" }).click();
+  assert.equal((await refused).status(), 409);
+  await page
+    .getByRole("alert")
+    .filter({
+      hasText:
+        "This Namespace is not ready yet. Check its status on the Namespaces page: a provisioning Namespace becomes ready when its Kubernetes setup completes (on Kubernetes installs, after an operator grants the tenant RoleBindings). Request ID: req_00000000-0000-4000-8000-000000000410",
+    })
+    .waitFor();
+  assert.equal(await page.getByText(/conflicts with the saved state/).count(), 0);
+  await page.unroute(agentsUrl, notReady);
   await page.getByRole("button", { name: "Create Agent", disabled: false }).waitFor();
 
   const rejected = page.waitForResponse(agentPost);
@@ -2902,7 +3037,13 @@ test("Agent creation reuses its saved Secret and Configuration after an Agent cr
       .isDisabled(),
     true,
   );
-  assert.deepEqual(nonAuthWriteRequests(requests), []);
+  // Plugin catalog discovery is a read sent as POST. The codex_pat Secret above arms its
+  // prefetch with a 300 ms debounce, so it may or may not have been sent before the switch.
+  const pluginCatalogPath = `/namespaces/${namespace.id}/agents/plugins`;
+  assert.deepEqual(
+    nonAuthWriteRequests(requests).filter((request) => request.path !== pluginCatalogPath),
+    [],
+  );
   assert.deepEqual(pathRequests(requests, "POST", `/namespaces/${namespace.id}/agents/models`), []);
   await page.getByLabel("Harness", { exact: true }).selectOption("codex");
   await page.getByLabel("Authentication method", { exact: true }).selectOption("codex_pat");

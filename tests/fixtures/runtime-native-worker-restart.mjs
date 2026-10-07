@@ -150,6 +150,26 @@ async function waitForNode(expectedId) {
   }
   throw new Error(`Native worker did not connect: ${childLog}`);
 }
+// The Gateway lists the node before it finishes the setup handoff: it registers the
+// node, records the completion as delivery-uncertain, sends hello-ok, then marks it
+// confirmed. Wait for that confirmation instead of reading the status the moment the
+// node appears; until then the status is empty or delivery-uncertain.
+async function waitForConfirmedSetup(setupId, nodeId) {
+  const deadline = Date.now() + 20_000;
+  let status;
+  while (Date.now() < deadline) {
+    status = await call("device.pair.setupStatus", { setupId });
+    if (status.completion) {
+      assert.equal(status.completion.deviceId, nodeId);
+      return status.completion;
+    }
+    if (status.deliveryUncertain) {
+      assert.equal(status.deliveryUncertain.deviceId, nodeId);
+    }
+    await setTimeout(250);
+  }
+  throw new Error(`Setup completion was never confirmed: ${JSON.stringify(status)}`);
+}
 async function waitForDisconnect(nodeId) {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
@@ -189,8 +209,7 @@ try {
   const targetFile = await start(state, setup.setupCode);
   const nodeId = await waitForNode();
   await assert.rejects(access(targetFile), { code: "ENOENT" });
-  const completed = await call("device.pair.setupStatus", { setupId: setup.setupId });
-  assert.equal(completed.completion?.deviceId, nodeId);
+  const completion = await waitForConfirmedSetup(setup.setupId, nodeId);
   await stop();
   await waitForDisconnect(nodeId);
 
@@ -199,7 +218,7 @@ try {
   await start(state, expiredSetupCode);
   await waitForNode(nodeId);
   const reconnected = await call("device.pair.setupStatus", { setupId: setup.setupId });
-  assert.deepEqual(reconnected.completion, completed.completion);
+  assert.deepEqual(reconnected.completion, completion);
   assert.equal(childLog.includes("Pairing setup code has expired."), false);
   await stop();
   await waitForDisconnect(nodeId);

@@ -176,7 +176,7 @@ function selectTestLanes(mergeBase, tested, tests, manifests) {
         ":/",
         ":(top,exclude)scripts/ci/test-suites",
         ":(top,exclude)*.md",
-        // Lint suppressions name test files; checks-baseline-1 always lints.
+        // Lint suppressions name test files; Static Checks lints in every mode.
         ":(top,exclude)eslint-suppressions.json",
       ],
       { encoding: null, maxBuffer: 64 * 1024 * 1024 },

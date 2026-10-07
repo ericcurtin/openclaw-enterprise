@@ -318,6 +318,13 @@ class BundledPluginDriverBase {
     } catch (error) {
       const field =
         error instanceof Error && "policyField" in error ? error.policyField : undefined;
+      if (field === "pluginId") {
+        const pluginId =
+          error instanceof Error && "pluginId" in error && typeof error.pluginId === "string"
+            ? error.pluginId
+            : undefined;
+        throw new PluginPolicyValidationError("unknownPlugin", this.id, pluginId);
+      }
       throw new PluginPolicyValidationError(
         field === "toolDefaults.reviewer" || field === "tools[id].reviewer" ? field : undefined,
       );

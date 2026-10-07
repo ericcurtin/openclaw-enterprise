@@ -99,7 +99,8 @@ jobs:
       # One row per pr-safe lane (runtime-image-fixture is its own job). Full
       # mode runs every row; tests mode runs the rows the policy selected.
       # The baseline tests are split in two, balanced by measured file
-      # durations; only part 1 runs the lint, format, docs and type checks.
+      # durations; only part 1 runs the type and Go CLI checks (Static Checks
+      # runs lint, format, OpenAPI and docs beside the lanes).
       # Image Runtime Startup is split from Images and Packaging, which it
       # would otherwise lengthen by about five minutes. The runtime image
       # startup tests are split in two, balanced by measured case durations;
@@ -234,12 +235,15 @@ jobs:
       - name: Audit suite manifest and workflows
         run: node scripts/ci/run-tests.mjs audit
 
-  docs-checks:
-    name: Documentation Checks
+  static-checks:
+    name: Static Checks
     needs: impact
-    if: ${{ needs.impact.outputs.mode == 'docs' }}
+    # Workspace boundary, lint, format, OpenAPI and documentation checks need no
+    # test fixture, so they run beside the test lanes in every mode instead of
+    # before Checks and Conformance 1's tests (about 40 s of its critical path).
+    if: ${{ needs.impact.outputs.mode == 'docs' || needs.impact.outputs.mode == 'full' || needs.impact.outputs.mode == 'tests' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 25
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -249,14 +253,21 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - uses: openclaw/openclaw/.github/actions/setup-pnpm-store-cache@ee0cf16623068ff535cc20f4a1ce175c8c5b8d25
+      - uses: ./.github/actions/setup-pnpm-store-cache
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache-mode: read-write
+          # This job only restores the store; it has no save step.
+          cache-mode: restore
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Run workspace boundary check
+        run: pnpm check:workspace
+      - name: Run lint check
+        run: pnpm lint
       - name: Check formatting
         run: pnpm format:check
+      - name: Run OpenAPI check
+        run: pnpm openapi:check
       - name: Check and build documentation
         run: pnpm docs:install && pnpm docs:check && pnpm docs:build
 
@@ -275,7 +286,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - uses: openclaw/openclaw/.github/actions/setup-pnpm-store-cache@ee0cf16623068ff535cc20f4a1ce175c8c5b8d25
+      - uses: ./.github/actions/setup-pnpm-store-cache
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache-mode: "off"
@@ -311,6 +322,8 @@ jobs:
           profile: ${{ matrix.profile }}
           node-version: ${{ env.NODE_VERSION }}
           artifact-prefix: ci-results
+          # Static Checks runs them in this workflow.
+          static-checks: "false"
       - name: Upload repository credential image identities
         if: always() && matrix.lane == 'repository-credentials-container'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -365,6 +378,10 @@ jobs:
       - name: Set up CI tools
         run: bash scripts/ci/setup-tools.sh k3d
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # GitHub-hosted runners are per-job VMs; removing the builder took 8-33 s,
+          # which a superseding run also waits for on cancellation.
+          cleanup: false
       - name: Enable Kubernetes bridge packet filtering
         run: |
           if [[ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ]]; then
@@ -400,11 +417,24 @@ jobs:
     needs:
       - impact
       - audit
-      - docs-checks
+      - static-checks
       - pr-safe
       - runtime-image-fixture
+    # always(): a failed or skipped dependency must still produce a failed
+    # CI Required, never a skipped (passing) one.
     if: always()
     steps:
+      # A push that supersedes this run waits until this run has finished
+      # cancelling. cancelled() is false in a job that starts after the
+      # cancellation, so test the dependencies: fail at once instead of checking
+      # out and verifying jobs that never finished. Later steps then skip.
+      - name: Fail when a required job was cancelled
+        if: contains(needs.*.result, 'cancelled')
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          jq -r 'to_entries[] | select(.value.result == "cancelled") | "::error::\(.key) was cancelled (superseded run, manual cancel, or timeout-minutes exceeded; see that job)."' <<<"$NEEDS_JSON"
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 2
@@ -474,7 +504,7 @@ jobs:
             printf 'CI impact: full (trusted base policy unavailable)\n'
           fi
       - name: Validate selected job state
-        if: always()
+        if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
           EXPECTED_MODE: ${{ needs.impact.outputs.mode }}
@@ -487,13 +517,13 @@ jobs:
             node scripts/ci/impact-gate.mjs --needs "$RUNNER_TEMP/raw-needs.json" --mode "$EXPECTED_MODE" --output "$RUNNER_TEMP/needs.json"
           fi
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        if: ${{ always() && (needs.impact.outputs.mode == 'full' || needs.impact.outputs.mode == 'tests') }}
+        if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') && (needs.impact.outputs.mode == 'full' || needs.impact.outputs.mode == 'tests') }}
         with:
           pattern: ci-results-*
           path: ${{ runner.temp }}/results
           merge-multiple: true
       - name: Aggregate CI results
-        if: ${{ always() && (needs.impact.outputs.mode == 'full' || needs.impact.outputs.mode == 'tests') }}
+        if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') && (needs.impact.outputs.mode == 'full' || needs.impact.outputs.mode == 'tests') }}
         env:
           EXPECTED_MODE: ${{ needs.impact.outputs.mode }}
           EXPECTED_LANES: ${{ needs.impact.outputs.lanes }}

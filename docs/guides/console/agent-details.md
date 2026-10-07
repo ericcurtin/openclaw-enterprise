@@ -11,9 +11,10 @@ do not confirm that an Agent or its Slack connection is currently healthy.
 
 | Component                     | What it does                                                                                                                                                                                                                                                       |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Control Plane**             | Identifies the OpenClaw Control Plane (OCC) console.                                                                                                                                                                                                               |
+| **OCE**                       | Product mark at the top of the console navigation.                                                                                                                                                                                                                 |
 | **Agents** / **← Agents**     | Opens the Agents list in the selected Namespace.                                                                                                                                                                                                                   |
 | **Namespaces**                | Lists the Namespaces you can read.                                                                                                                                                                                                                                 |
+| **Observability**             | Opens the Installation's configured observability dashboard in a new tab. Shown only to Installation administrators, and only when one is configured.                                                                                                              |
 | Agent name                    | Human-readable name of this Agent.                                                                                                                                                                                                                                 |
 | **Namespace · name**          | Namespace containing the Agent.                                                                                                                                                                                                                                    |
 | **Refresh**                   | Reloads the Agent page. It does not retry or restart deployment.                                                                                                                                                                                                   |
@@ -23,10 +24,10 @@ do not confirm that an Agent or its Slack connection is currently healthy.
 | **Deployment activity**       | Most recent visible version and its persisted deployment status.                                                                                                                                                                                                   |
 | `agt_…`                       | Stable Agent identifier for API calls and support.                                                                                                                                                                                                                 |
 
-The bottom **OpenClaw Enterprise** menu contains **Namespace**, **Settings**,
-and **Logout**. Namespace selection changes your scope; from Agent detail it
-returns to the new Namespace's Agents list. Settings displays your account;
-it does not offer configurable settings. Logout ends your console session.
+The **Namespace** selector at the top of the page changes your scope; from Agent
+detail it returns to the new Namespace's Agents list. The bottom **OpenClaw
+Enterprise** menu contains **Settings** and **Logout**. Settings displays your
+account; it does not offer configurable settings. Logout ends your console session.
 
 ## Follow deployment activity
 
@@ -86,9 +87,10 @@ the viewed version. Checks include a time and `succeeded`, `failed`, or
 `unknown` state; unavailable requests show retryable errors. On Kubernetes
 Compute the gateway checks cover only the Slack channel. A version without
 Slack reports configuration `failed` with `NOT_CONFIGURED` and leaves
-authentication and connectivity `unknown`; the page says this is expected. If
-every check is `unknown` with `UNAVAILABLE`, the runtime did not answer. Either
-way, a recorded deployment failure such as `RUNTIME_AUTHENTICATION_FAILED`
+authentication and connectivity `unknown`; the page says this is expected. A
+version deployed by an earlier controller release still shows three `unknown`
+checks with `PROBE_FAILED` until you deploy a new version. If every check is
+`unknown` with `UNAVAILABLE`, the runtime did not answer. Either way, a recorded deployment failure such as `RUNTIME_AUTHENTICATION_FAILED`
 stays in view: diagnostics do not test model credentials, so they cannot
 confirm or clear it. Diagnostics do not change deployment history, activate a
 version, repeat the startup model probe, or prove message delivery. You need Agent `read` and `operate` plus
@@ -97,7 +99,7 @@ read access to that version.
 **Logs** on a deployed version shows its Pods, restarts, recent warning Events
 and redacted container output. It can follow new lines, filter the loaded
 lines by level or text, and download the last 1000 lines. Status needs the same
-grants as diagnostics; log text needs Agent `administer` instead of `operate`.
+grants as diagnostics; log text needs Agent `read_logs` or `administer` instead of `operate`.
 When a Pod is Ready and its containers have not restarted, its warning Events
 appear in muted text as earlier warnings, such as readiness probes that failed
 while it started. See [Agent logs](../topics/agent-logs.md).
@@ -119,8 +121,11 @@ OCC cannot regenerate them through initial provisioning. A successful request
 opens the new revision's Workspace files view. Bound channel Secrets do not
 prove successful authentication or a working channel.
 
-The **Configuration**, **Plugins**, **Channels**, **Credentials**, and **Workspace files** tabs
-change the panel below. Credentials is available only on the new version draft.
+The **Configuration**, **Plugins**, **Channels**, **Repositories**, **Credentials**, and
+**Workspace files** tabs change the panel below. Repositories and Credentials are available
+only on the new version draft; Logs only on a version.
+**Repositories** edits the draft's repository selections and access levels; see
+[repository access](../../reference/console/create-and-deploy.md#create-an-agent).
 Browser Back and Forward restore the selected tab. Leaving a tab clears entered
 token values. The workspace remains live regardless of the viewed version.
 

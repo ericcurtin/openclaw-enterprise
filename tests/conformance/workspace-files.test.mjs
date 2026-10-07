@@ -5,7 +5,11 @@ import { createFastifyApp } from "../../apps/controller/src/index.ts";
 import { authenticatedHeaders } from "../helpers/auth-session.mjs";
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
 import { createDevelopmentComputeDriver } from "../helpers/development.mjs";
-import { createTenantReaderFixture } from "../helpers/tenant-reader-app.mjs";
+import {
+  createTenantReaderFixture,
+  tenantRequest as request,
+} from "../helpers/tenant-reader-app.mjs";
+import { bindRole } from "../helpers/iam-grants.mjs";
 
 const installationId = "ins_4033697e-6397-4cc6-9b04-8ec17af78cf1";
 const publicOrigin = "http://127.0.0.1";
@@ -53,38 +57,6 @@ function createFixture(options = {}) {
     }),
     options,
   });
-}
-
-async function request(app, pathname, options = {}) {
-  const headers = new Headers(
-    options.identity === false ? {} : authenticatedHeaders(options.session ?? app.defaultSession),
-  );
-  for (const [name, value] of Object.entries(options.headers ?? {})) {
-    if (value === null) {
-      headers.delete(name);
-    } else {
-      headers.set(name, value);
-    }
-  }
-
-  const hasBody = Object.hasOwn(options, "body");
-  if (hasBody && !headers.has("content-type")) {
-    headers.set("content-type", "application/json");
-  }
-  const body = hasBody
-    ? typeof options.body === "string"
-      ? options.body
-      : JSON.stringify(options.body)
-    : undefined;
-  const response = await app.fetch(
-    new Request(new URL(pathname, options.origin ?? publicOrigin), {
-      method: options.method ?? (hasBody ? "POST" : "GET"),
-      headers,
-      ...(body === undefined ? {} : { body }),
-    }),
-  );
-  const payload = await response.json();
-  return { response, payload };
 }
 
 async function bootstrap(fixture) {
@@ -137,14 +109,11 @@ async function createAgent(fixture, namespace, name) {
     id: `model-${agent.id}`,
     permissions: [{ action: "operate", resourceKind: "secret" }],
   });
-  fixture.state.bindings.push({
+  bindRole(fixture.state, agent.servicePrincipalId, {
     id: `model-${agent.id}`,
-    subjectKind: "identity",
-    subjectId: agent.servicePrincipalId,
     roleId: `model-${agent.id}`,
     namespaceId: namespace.id,
-    resourceKind: "secret",
-    resourceId: secret.id,
+    resource: { kind: "secret", id: secret.id },
   });
   const deployed = await request(
     fixture.app,
@@ -325,6 +294,15 @@ test("Agent workspace file routes reject invalid names, bodies, and cross-site w
   });
   assert.equal(crossSite.response.status, 403);
   assert.equal(crossSite.payload.error.code, "FORBIDDEN");
+  // Session admission refuses cross-site writes too; for reads the route's own check is the
+  // only one, so a cross-site page cannot read Agent files with the browser's credentials.
+  for (const site of ["cross-site", "Cross-Site"]) {
+    const crossSiteRead = await request(fixture.app, `${path}/USER.md`, {
+      headers: { "sec-fetch-site": site },
+    });
+    assert.equal(crossSiteRead.response.status, 403, site);
+    assert.equal(crossSiteRead.payload.error.code, "FORBIDDEN", site);
+  }
 
   const missingContent = await request(fixture.app, `${path}/USER.md`, {
     method: "PUT",

@@ -67,7 +67,8 @@ function main(args) {
   const expected = {
     impact: "success",
     audit: "success",
-    "docs-checks": mode === "docs" ? "success" : "skipped",
+    // Lint, format, OpenAPI and docs checks run in every mode.
+    "static-checks": "success",
     "pr-safe": mode === "docs" ? "skipped" : "success",
     "runtime-image-fixture":
       mode === "full" || (mode === "tests" && lanes.includes(fixtureLane)) ? "success" : "skipped",

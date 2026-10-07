@@ -9,13 +9,12 @@ import {
   validateGitHubRepositoryRegistry,
 } from "../../apps/controller/src/drivers/repo/github/credentials/registry.ts";
 import { loadGitHubRepositoryRegistry } from "../../apps/controller/src/composition/repository-credentials/registry.ts";
-import { hasControlCharacter } from "../../apps/controller/src/drivers/repo/credentials/client-contracts.ts";
 import {
   githubConfigurationData,
   serviceConfigurationData,
 } from "../fixtures/repository-credentials/builders.mjs";
 import { createControlledClock } from "../fixtures/repository-credentials/clock.mjs";
-import { createResourceScope } from "../fixtures/repository-credentials/resources.mjs";
+import { createTestResourceScope } from "../fixtures/repository-credentials/resources.mjs";
 
 function registryInput() {
   return {
@@ -138,8 +137,7 @@ test("GitHub factory snapshots a registry-selected write grant through session a
     import("../../apps/controller/src/drivers/repo/credentials/configuration.ts"),
     import("../../apps/controller/src/drivers/repo/credentials/service.ts"),
   ]);
-  const resources = createResourceScope();
-  t.after(() => resources.close());
+  const resources = createTestResourceScope(t);
   const registry = validateGitHubRepositoryRegistry(registryInput());
   const binding = resolveGitHubRepositoryBinding(registry, {
     namespaceId: "namespace-a",
@@ -198,15 +196,6 @@ test("GitHub factory snapshots a registry-selected write grant through session a
     /unsupported-profile/,
   );
   service.close(opened.session.sessionId);
-});
-
-test("hasControlCharacter flags C0 controls and DEL but no other characters", () => {
-  for (const code of [0x00, 0x09, 0x0a, 0x1f, 0x7f]) {
-    assert.equal(hasControlCharacter(`a${String.fromCharCode(code)}b`), true, code.toString(16));
-  }
-  // Space, tilde, C1 controls, a line separator, an astral character and a lone surrogate pass.
-  assert.equal(hasControlCharacter(" ~\u0080\u009f\u2028\u{1f600}\ud800"), false);
-  assert.equal(hasControlCharacter(""), false);
 });
 
 test("push-ref policy normalizes branch refs and changes grant identity", () => {

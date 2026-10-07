@@ -1,7 +1,6 @@
 import { startReceiptState } from "../fixtures/repository-credentials/receipt-state.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { request } from "node:http";
 import { createServer as createNetServer, connect } from "node:net";
 import { randomUUID } from "node:crypto";
 import { channel } from "node:diagnostics_channel";
@@ -10,7 +9,7 @@ import {
   startRegistryCredentialServiceFixture,
 } from "../fixtures/repository-credentials/registry.mjs";
 import { createControlledClock } from "../fixtures/repository-credentials/clock.mjs";
-import { createResourceScope } from "../fixtures/repository-credentials/resources.mjs";
+import { createTestResourceScope } from "../fixtures/repository-credentials/resources.mjs";
 import { createServer as createTlsServer, request as tlsRequest } from "node:https";
 import { chmod, lstat, symlink, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -34,47 +33,22 @@ import {
   appModule,
   appRoot,
   appExtension,
+  controlRequest,
   createServiceConfiguration,
   eventually,
+  createLoopbackServiceConfiguration,
 } from "../fixtures/repository-credentials/service.mjs";
 import {
   createGitHubServiceFactory,
   startServiceListeners,
 } from "../fixtures/repository-credentials/service-resources.mjs";
 
-function control(socketPath, method, path, value, extra = {}) {
-  const body = value === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(value));
-  return new Promise((resolve, reject) => {
-    const outgoing = request(
-      {
-        socketPath,
-        method,
-        path,
-        headers: {
-          host: "localhost",
-          ...(path === "/v1/sessions" ? { "x-admission-id": `${Date.now()}-${randomUUID()}` } : {}),
-          "content-type": "application/json",
-          "content-length": body.length,
-          ...extra,
-        },
-        agent: false,
-      },
-      (incoming) => {
-        const chunks = [];
-        incoming.on("data", (chunk) => chunks.push(chunk));
-        incoming.once("error", reject);
-        incoming.once("end", () =>
-          resolve({
-            status: incoming.statusCode,
-            body: JSON.parse(Buffer.concat(chunks).toString()),
-          }),
-        );
-      },
-    );
-    outgoing.once("error", reject);
-    outgoing.end(body);
+// Session opens need an admission id; a fresh one per call unless the test names it.
+const control = (socketPath, method, path, value, extra = {}) =>
+  controlRequest(socketPath, method, path, value, {
+    ...(path === "/v1/sessions" ? { "x-admission-id": `${Date.now()}-${randomUUID()}` } : {}),
+    ...extra,
   });
-}
 
 // The relay consumes the real listener's response but disconnects its caller,
 // reproducing ambiguous loss after admission without replacing control behavior.
@@ -119,13 +93,11 @@ async function dropControlResponse(t, target) {
 }
 
 async function admissionFixture(t, onCreate) {
-  const resources = createResourceScope();
-  t.after(() => resources.close());
+  const resources = createTestResourceScope(t);
   const { callControl } = await appModule("drivers/repo/github/credentials/client/operator");
   const clock = createControlledClock();
   const tls = await createTlsMaterial(resources);
-  const base = await createServiceConfiguration(resources, { sessions: 1 });
-  const config = { ...base, gateway: { ...base.gateway, listen: "127.0.0.1:0" } };
+  const config = await createLoopbackServiceConfiguration(resources, { sessions: 1 });
   const upstream = await startAlternateUpstream(resources, { clock, tls });
   const driverFactory = createAlternateDriverFactory({
     origin: upstream.origin,
@@ -326,13 +298,11 @@ test(
   "private control socket opens, inspects and closes real sessions with bounded input",
   { timeout: 10000 },
   async (t) => {
-    const resources = createResourceScope();
-    t.after(() => resources.close());
+    const resources = createTestResourceScope(t);
     const { createSystemClock } = await appModule("drivers/repo/credentials/clock");
     const clock = createSystemClock();
     const tls = await createTlsMaterial(resources);
-    const base = await createServiceConfiguration(resources);
-    const config = { ...base, gateway: { ...base.gateway, listen: "127.0.0.1:0" } };
+    const config = await createLoopbackServiceConfiguration(resources);
     const github = await startGitHubFixture(resources, { clock, tls });
     const factory = await createGitHubServiceFactory(resources, {
       config,
@@ -547,14 +517,12 @@ test(
   "close after asynchronous authentication prevents actual upstream dispatch",
   { timeout: 10000 },
   async (t) => {
-    const resources = createResourceScope();
-    t.after(() => resources.close());
+    const resources = createTestResourceScope(t);
     const { createSystemClock } = await appModule("drivers/repo/credentials/clock");
     const clock = createSystemClock();
     const tls = await createTlsMaterial(resources);
     const upstream = await startAlternateUpstream(resources, { tls });
-    const base = await createServiceConfiguration(resources);
-    const config = { ...base, gateway: { ...base.gateway, listen: "127.0.0.1:0" } };
+    const config = await createLoopbackServiceConfiguration(resources);
     let resume;
     const barrier = new Promise((resolve) => {
       resume = resolve;
@@ -613,8 +581,7 @@ test(
   "Agent response completion and premature close preserve lifecycle outcomes",
   { timeout: 10000 },
   async (t) => {
-    const resources = createResourceScope();
-    t.after(() => resources.close());
+    const resources = createTestResourceScope(t);
     const [{ createSystemClock }, { createCredentialService }, { startListeners }] =
       await Promise.all([
         appModule("drivers/repo/credentials/clock"),
@@ -624,11 +591,10 @@ test(
     const clock = createSystemClock();
     const tls = await createTlsMaterial(resources);
     // A single exchange slot makes leaked ownership observable on the next request.
-    const base = await createServiceConfiguration(resources, {
+    const config = await createLoopbackServiceConfiguration(resources, {
       exchanges: 1,
       exchangesPerSession: 1,
     });
-    const config = { ...base, gateway: { ...base.gateway, listen: "127.0.0.1:0" } };
     const github = await startGitHubFixture(resources, { clock, tls });
     const received = [];
     let upstreamCancelled = false;
@@ -893,6 +859,49 @@ test(
     );
   },
 );
+
+test("control refuses loose requests before acting on them", { timeout: 15000 }, async (t) => {
+  const fixture = await boundControlFixture(t);
+  const { input, send, freshId, clock, namespaceId } = fixture;
+  const socket = fixture.config.gateway.controlSocket;
+  const refused = { status: 400, body: { error: "invalid-request" } };
+  const plainText = { "content-type": "text/plain" };
+  const id = freshId();
+  await fixture.receipts.prepare(id, input.repositoryRef, input.durationSeconds);
+  const body = { ...input, durableAdmission: true };
+  assert.deepEqual(
+    await control(socket, "POST", "/v1/sessions", body, { ...plainText, "x-admission-id": id }),
+    refused,
+  );
+  // The refused request reserved nothing: the same admission id still creates the session.
+  const created = await send(input, id);
+  assert.equal(created.status, 201);
+  const sessionId = created.body.session.sessionId;
+
+  // An empty list starts no background lookup; it is the well-formed baseline.
+  const lookup = { namespaceId, repositoryRefs: [] };
+  const describe = (value, headers) =>
+    control(socket, "POST", "/v1/repository-descriptions", value, headers);
+  assert.equal((await describe(lookup)).status, 200);
+  assert.deepEqual(await describe(lookup, plainText), refused);
+  assert.deepEqual(await describe({ ...lookup, extra: true }), refused);
+  for (const value of [[namespaceId], 7]) {
+    assert.deepEqual(await describe({ ...lookup, namespaceId: value }), refused);
+  }
+
+  // Reads and close carry no body. The request head refuses a GET body and the handler a
+  // close body; neither changes the session.
+  for (const [method, path] of [
+    ["GET", "/healthz"],
+    ["GET", "/v1/capabilities"],
+    ["GET", `/v1/sessions/${sessionId}`],
+    ["POST", `/v1/sessions/${sessionId}/close`],
+  ]) {
+    assert.deepEqual(await control(socket, method, path, {}), refused, `${method} ${path}`);
+  }
+  await clock.advance(0);
+  assert.equal(fixture.service.status(sessionId).state, "OPEN");
+});
 
 async function holdControlRequest(t, target) {
   const directory = await temporaryDirectory(t, "rcs-held-");
@@ -1194,8 +1203,7 @@ test(
   async (t) => {
     for (const closeBy of ["control", "deadline"]) {
       await t.test(closeBy, async (t) => {
-        const resources = createResourceScope();
-        t.after(() => resources.close());
+        const resources = createTestResourceScope(t);
         const clock = createControlledClock();
         const tls = await createTlsMaterial(resources);
         const github = await startGitHubFixture(resources, { clock, tls });
@@ -1230,8 +1238,7 @@ test(
           credentialDriverModule("service"),
           credentialDriverModule("server"),
         ]);
-        const base = await createServiceConfiguration(resources);
-        const config = { ...base, gateway: { ...base.gateway, listen: "127.0.0.1:0" } };
+        const config = await createLoopbackServiceConfiguration(resources);
         const factory = await createGitHubServiceFactory(resources, {
           config,
           clock,

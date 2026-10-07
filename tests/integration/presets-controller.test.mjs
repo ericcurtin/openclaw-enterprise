@@ -11,6 +11,7 @@ import { InMemoryAuditSink } from "../../packages/audit/src/index.ts";
 import { InMemoryPlatformState } from "../../packages/occ/src/index.ts";
 import { authenticatedHeaders } from "../helpers/auth-session.mjs";
 import { createConsoleAppFixture } from "../helpers/console-app.mjs";
+import { bindRole, grantRole } from "../helpers/iam-grants.mjs";
 
 async function createFixture(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), "occ-presets-"));
@@ -45,6 +46,22 @@ async function createPreset(fixture, namespaceId, name, template = {}) {
   });
   assert.equal(response.status, 201, JSON.stringify(response.body));
   return response.data;
+}
+
+// Reads a Preset artifact shipped in deploy/presets.
+async function shippedPreset(file) {
+  return JSON.parse(
+    await readFile(new URL(`../../deploy/presets/${file}`, import.meta.url), "utf8"),
+  );
+}
+
+// Creates the Agent Configuration of a rendered Preset template.
+async function createAgentConfiguration(fixture, namespaceId, rendered) {
+  const response = await fixture.request("POST", `/namespaces/${namespaceId}/configurations`, {
+    body: { kind: "agent", ...rendered.configuration },
+  });
+  assert.equal(response.status, 201, JSON.stringify(response.body));
+  return response;
 }
 
 async function deletePreset(fixture, namespaceId, presetId) {
@@ -83,19 +100,12 @@ test("Preset CRUD keeps Namespace names unique and filters reads by exact Native
   let limitedPrincipalId;
   const limited = await fixture.createAccountWithPolicy("preset-reader", (principal) => {
     limitedPrincipalId = principal.id;
-    fixture.policy.roles.push({
+    grantRole(fixture.policy, principal.id, {
       id: "preset-reader",
+      bindingId: "read-one-preset",
       namespaceId: alpha.id,
-      permissions: [{ action: "read", resourceKind: "preset" }],
-    });
-    fixture.policy.bindings.push({
-      id: "read-one-preset",
-      namespaceId: alpha.id,
-      subjectKind: "identity",
-      subjectId: principal.id,
-      roleId: "preset-reader",
-      resourceKind: "preset",
-      resourceId: visible.id,
+      permissions: { preset: ["read"] },
+      resource: { kind: "preset", id: visible.id },
     });
   });
   const session = await fixture.signIn(limited.credentials);
@@ -103,17 +113,11 @@ test("Preset CRUD keeps Namespace names unique and filters reads by exact Native
   // does not open the collection, so a refusal looks the same as for a missing Namespace.
   const unlisted = await fixture.request("GET", collection(alpha.id), { session });
   assert.equal(unlisted.status, 403, JSON.stringify(unlisted.body));
-  fixture.policy.roles.push({
+  grantRole(fixture.policy, limitedPrincipalId, {
     id: "alpha-namespace-reader",
+    bindingId: "read-alpha",
     namespaceId: alpha.id,
-    permissions: [{ action: "read", resourceKind: "namespace" }],
-  });
-  fixture.policy.bindings.push({
-    id: "read-alpha",
-    namespaceId: alpha.id,
-    subjectKind: "identity",
-    subjectId: limitedPrincipalId,
-    roleId: "alpha-namespace-reader",
+    permissions: { namespace: ["read"] },
   });
   const readable = await fixture.request("GET", collection(alpha.id), { session });
   assert.equal(readable.status, 200, JSON.stringify(readable.body));
@@ -140,6 +144,16 @@ test("Preset CRUD keeps Namespace names unique and filters reads by exact Native
   assert.equal(otherNamespace.status, 403);
   const wrongOwner = await fixture.request("GET", `${collection(beta.id)}/${visible.id}`);
   assert.equal(wrongOwner.status, 404);
+  // Writes addressed through the wrong Namespace are a scope miss, not a write conflict.
+  for (const method of ["PATCH", "DELETE"]) {
+    const misdirected = await fixture.request(
+      method,
+      `${collection(beta.id)}/${visible.id}`,
+      method === "PATCH" ? { body: { name: "Moved" } } : {},
+    );
+    assert.equal(misdirected.status, 404, `${method}: ${JSON.stringify(misdirected.body)}`);
+    assert.equal(misdirected.body.error.code, "NOT_FOUND", method);
+  }
 
   const renamed = await fixture.request("PATCH", `${collection(alpha.id)}/${visible.id}`, {
     body: { name: "Renamed" },
@@ -150,13 +164,22 @@ test("Preset CRUD keeps Namespace names unique and filters reads by exact Native
   await deletePreset(fixture, alpha.id, visible.id);
   const removed = await fixture.request("GET", `${collection(alpha.id)}/${visible.id}`);
   assert.equal(removed.status, 404);
-  assert.ok(
-    fixture.audit.events.some(
-      (event) =>
-        event.resource.kind === "preset" &&
-        event.resource.id === visible.id &&
-        event.outcome === "success",
-    ),
+  // Each successful write leaves exactly one attributable mutation row.
+  assert.deepEqual(
+    fixture.audit.events
+      .filter(
+        (event) =>
+          event.kind === "mutation" &&
+          event.resource.kind === "preset" &&
+          event.resource.id === visible.id &&
+          event.outcome === "success",
+      )
+      .map((event) => [event.action, event.resource.namespaceId]),
+    [
+      ["openclaw.presets.create", alpha.id],
+      ["openclaw.presets.update", alpha.id],
+      ["openclaw.presets.delete", alpha.id],
+    ],
   );
 });
 
@@ -215,14 +238,7 @@ test("Preset variables create independent ordinary Agent drafts that survive tem
   assert.deepEqual(read.data.template, template);
   // The API consumer uses the same renderer as the console, then the ordinary two-create flow.
   const rendered = renderPresetTemplate(read.data.template, { name: 'My "Agent"', enabled: false });
-  const configuration = await fixture.request(
-    "POST",
-    `/namespaces/${namespace.id}/configurations`,
-    {
-      body: { kind: "agent", ...rendered.configuration },
-    },
-  );
-  assert.equal(configuration.status, 201, JSON.stringify(configuration.body));
+  const configuration = await createAgentConfiguration(fixture, namespace.id, rendered);
   assert.equal(configuration.data.values.agents.defaults.model, "openai/gpt-5.1");
   assert.deepEqual(Object.keys(configuration.data.values.agents.defaults.models), [
     "openai/gpt-5.1",
@@ -347,20 +363,10 @@ test("Preset admission rejects malformed templates and credential leaks while pr
   const reader = await fixture.createAccountWithPolicy(
     "preset-user-without-secret",
     (principal) => {
-      fixture.policy.roles.push({
+      grantRole(fixture.policy, principal.id, {
         id: "preset-consumer",
         namespaceId: alpha.id,
-        permissions: [
-          { action: "read", resourceKind: "preset" },
-          { action: "create", resourceKind: "configuration" },
-        ],
-      });
-      fixture.policy.bindings.push({
-        id: "preset-consumer",
-        namespaceId: alpha.id,
-        subjectKind: "identity",
-        subjectId: principal.id,
-        roleId: "preset-consumer",
+        permissions: { preset: ["read"], configuration: ["create"] },
       });
     },
   );
@@ -488,14 +494,7 @@ test("method-only Preset authentication is a default, not an Agent credential", 
     model: "gpt-6-astra",
   });
   assert.deepEqual(rendered.agent.harnessAuth, { method: "codex_pat" });
-  const configuration = await fixture.request(
-    "POST",
-    `/namespaces/${namespace.id}/configurations`,
-    {
-      body: { kind: "agent", ...rendered.configuration },
-    },
-  );
-  assert.equal(configuration.status, 201, JSON.stringify(configuration.body));
+  const configuration = await createAgentConfiguration(fixture, namespace.id, rendered);
   const rejected = await fixture.request("POST", `/namespaces/${namespace.id}/agents`, {
     body: { ...rendered.agent, configurationId: configuration.data.id },
   });
@@ -558,6 +557,17 @@ test("Presets block Namespace deletion and deleting one removes only its managed
     bindings.push(binding.data);
   }
   await deletePreset(fixture, namespace.id, target.id);
+  const deletion = fixture.audit.events.filter(
+    (event) =>
+      event.action === "openclaw.presets.delete" &&
+      event.resource.id === target.id &&
+      event.outcome === "success",
+  );
+  assert.equal(deletion.length, 1);
+  assert.deepEqual(
+    deletion[0].details.removedAccessBindings.map((binding) => binding.id),
+    [bindings[0].id],
+  );
   const remaining = await fixture.request("GET", `/namespaces/${namespace.id}/iam/access-bindings`);
   assert.equal(remaining.status, 200);
   assert.deepEqual(
@@ -581,9 +591,7 @@ test("standard Codex Preset installs and creates a dedicated Agent with restrict
   const fixture = await createFixture(t);
   const namespace = await fixture.createNamespace("Standard Codex", { ready: true });
   const secret = await fixture.createSecret(namespace.id, "Model key", "synthetic-model-key");
-  const artifact = JSON.parse(
-    await readFile(new URL("../../deploy/presets/standard-codex.json", import.meta.url), "utf8"),
-  );
+  const artifact = await shippedPreset("standard-codex.json");
   // Install the shipped request through the operator API, then render the
   // persisted template as the existing console chooser does.
   const installed = await fixture.request("POST", collection(namespace.id), { body: artifact });
@@ -603,14 +611,7 @@ test("standard Codex Preset installs and creates a dedicated Agent with restrict
     model: "gpt-5.1",
     modelSecret: "synthetic-model-key",
   });
-  const configuration = await fixture.request(
-    "POST",
-    `/namespaces/${namespace.id}/configurations`,
-    {
-      body: { kind: "agent", ...rendered.configuration },
-    },
-  );
-  assert.equal(configuration.status, 201, JSON.stringify(configuration.body));
+  const configuration = await createAgentConfiguration(fixture, namespace.id, rendered);
   const agent = await fixture.request("POST", `/namespaces/${namespace.id}/agents`, {
     body: {
       ...rendered.agent,
@@ -681,14 +682,7 @@ test("standard Codex Preset installs and creates a dedicated Agent with restrict
     { body: { template: boundTemplate } },
   );
   assert.equal(crossNamespaceUpdate.status, 400, JSON.stringify(crossNamespaceUpdate.body));
-  const otherConfiguration = await fixture.request(
-    "POST",
-    `/namespaces/${other.id}/configurations`,
-    {
-      body: { kind: "agent", ...rendered.configuration },
-    },
-  );
-  assert.equal(otherConfiguration.status, 201, JSON.stringify(otherConfiguration.body));
+  const otherConfiguration = await createAgentConfiguration(fixture, other.id, rendered);
   const rejected = await fixture.request("POST", `/namespaces/${other.id}/agents`, {
     body: {
       ...rendered.agent,
@@ -706,9 +700,7 @@ test("standard OpenClaw Preset installs and creates an embedded Agent with nativ
   const fixture = await createFixture(t);
   const namespace = await fixture.createNamespace("Standard OpenClaw", { ready: true });
   const secret = await fixture.createSecret(namespace.id, "Model key", "synthetic-model-key");
-  const artifact = JSON.parse(
-    await readFile(new URL("../../deploy/presets/standard-openclaw.json", import.meta.url), "utf8"),
-  );
+  const artifact = await shippedPreset("standard-openclaw.json");
   const installed = await fixture.request("POST", collection(namespace.id), { body: artifact });
   assert.equal(installed.status, 201, JSON.stringify(installed.body));
   const catalog = await fixture.request("GET", collection(namespace.id));
@@ -720,14 +712,7 @@ test("standard OpenClaw Preset installs and creates an embedded Agent with nativ
     model: "gpt-6-sol",
     modelSecret: "synthetic-model-key",
   });
-  const configuration = await fixture.request(
-    "POST",
-    `/namespaces/${namespace.id}/configurations`,
-    {
-      body: { kind: "agent", ...rendered.configuration },
-    },
-  );
-  assert.equal(configuration.status, 201, JSON.stringify(configuration.body));
+  const configuration = await createAgentConfiguration(fixture, namespace.id, rendered);
   const agent = await fixture.request("POST", `/namespaces/${namespace.id}/agents`, {
     body: {
       ...rendered.agent,
@@ -771,27 +756,18 @@ test("default-codex Preset creates a Configuration that references the generated
     "standard-openclaw.json",
     "swe-preset.json",
   ]) {
-    const bundled = JSON.parse(
-      await readFile(new URL(`../../deploy/presets/${file}`, import.meta.url), "utf8"),
-    );
+    const bundled = await shippedPreset(file);
     assert.deepEqual(
       bundled.template.configuration.values.gateway.auth,
       { password: gatewayPassword },
       file,
     );
   }
-  const artifact = JSON.parse(
-    await readFile(new URL("../../deploy/presets/default-codex.json", import.meta.url), "utf8"),
-  );
+  const artifact = await shippedPreset("default-codex.json");
   const installed = await fixture.request("POST", collection(namespace.id), { body: artifact });
   assert.equal(installed.status, 201, JSON.stringify(installed.body));
   const rendered = renderPresetTemplate(installed.data.template, {});
-  const configuration = await fixture.request(
-    "POST",
-    `/namespaces/${namespace.id}/configurations`,
-    { body: { kind: "agent", ...rendered.configuration } },
-  );
-  assert.equal(configuration.status, 201, JSON.stringify(configuration.body));
+  const configuration = await createAgentConfiguration(fixture, namespace.id, rendered);
   assert.equal(rendered.agent.executionMode, "dedicated");
   assert.deepEqual(configuration.data.values.gateway.auth, { password: gatewayPassword });
 });
@@ -806,9 +782,7 @@ test("SWE Agent Preset defaults to Astra and reuses an existing service-account 
     "Existing service account token",
     "synthetic-existing-service-account-token",
   );
-  const artifact = JSON.parse(
-    await readFile(new URL("../../deploy/presets/swe-preset.json", import.meta.url), "utf8"),
-  );
+  const artifact = await shippedPreset("swe-preset.json");
   const originalTemplate = structuredClone(artifact.template);
   validatePresetTemplate(originalTemplate);
   assert.equal(artifact.name, "SWE Agent");
@@ -858,14 +832,7 @@ test("SWE Agent Preset defaults to Astra and reuses an existing service-account 
   assert.equal(retained.status, 200, JSON.stringify(retained.body));
   assert.deepEqual(retained.data.template, originalTemplate);
 
-  const configuration = await fixture.request(
-    "POST",
-    `/namespaces/${namespace.id}/configurations`,
-    {
-      body: { kind: "agent", ...rendered.configuration },
-    },
-  );
-  assert.equal(configuration.status, 201, JSON.stringify(configuration.body));
+  const configuration = await createAgentConfiguration(fixture, namespace.id, rendered);
   assert.deepEqual(configuration.data.values.channels.slack.replyToModeByChatType, {
     channel: "all",
   });
@@ -952,9 +919,7 @@ test("Installation YAML seeds authorized default Presets for new and existing Na
   const { loadInstallationFile } = await import("../helpers/installation-file.mjs");
   const { OpenClawController } = await import("../../packages/occ/src/index.ts");
   const configuration = createInstallationDriverConfiguration();
-  const customPreset = JSON.parse(
-    await readFile(new URL("../../deploy/presets/swe-preset.json", import.meta.url), "utf8"),
-  );
+  const customPreset = await shippedPreset("swe-preset.json");
   configuration.presets = {
     includeDefaults: true,
     files: [fileURLToPath(new URL("../../deploy/presets/swe-preset.json", import.meta.url))],
@@ -1004,6 +969,11 @@ test("Installation YAML seeds authorized default Presets for new and existing Na
       createdAt: new Date().toISOString(),
     }),
   );
+  // A Namespace that is being deleted is skipped and does not fail startup. Its unmodified
+  // defaults from creation do not block the deletion request.
+  const leaving = await fixture.createNamespace("Leaving namespace", { ready: true });
+  const leave = await fixture.request("DELETE", `/namespaces/${leaving.id}`);
+  assert.equal(leave.status, 202, JSON.stringify(leave.body));
   await Promise.all([
     fixture.controller.initializeDefaultPresets(principal.id),
     fixture.controller.initializeDefaultPresets(principal.id),
@@ -1024,15 +994,9 @@ test("Installation YAML seeds authorized default Presets for new and existing Na
 
   // Namespace creation must roll back if its caller cannot create the defaults.
   const limited = await fixture.createAccountWithPolicy("namespace-only", (identity) => {
-    fixture.policy.roles.push({
+    grantRole(fixture.policy, identity.id, {
       id: "namespace-only",
-      permissions: [{ action: "create", resourceKind: "namespace" }],
-    });
-    fixture.policy.bindings.push({
-      id: "namespace-only",
-      subjectKind: "identity",
-      subjectId: identity.id,
-      roleId: "namespace-only",
+      permissions: { namespace: ["create"] },
     });
   });
   const session = await fixture.signIn(limited.credentials);
@@ -1054,12 +1018,21 @@ test("Installation YAML seeds authorized default Presets for new and existing Na
     body: { name: "Denied defaults" },
   });
   assert.equal(permitted.status, 201);
-  assert.deepEqual(
-    (await fixture.request("GET", collection(permitted.data.id))).data
-      .map((preset) => preset.name)
-      .sort(),
-    defaultNames,
-  );
+  const provisioningPresets = (await fixture.request("GET", collection(permitted.data.id))).data;
+  assert.deepEqual(provisioningPresets.map((preset) => preset.name).sort(), defaultNames);
+  // Startup seeds the defaults while the Namespace provisions; callers wait until it is ready.
+  for (const [method, path, body] of [
+    ["POST", collection(permitted.data.id), { name: "Too early", template: {} }],
+    [
+      "PATCH",
+      `${collection(permitted.data.id)}/${provisioningPresets[0].id}`,
+      { name: "Too early" },
+    ],
+  ]) {
+    const early = await fixture.request(method, path, { body });
+    assert.equal(early.status, 409, `${method}: ${JSON.stringify(early.body)}`);
+    assert.equal(early.body.error.code, "NAMESPACE_NOT_READY", method);
+  }
   // Startup must skip a persisted non-administrator even when it is returned first.
   await initializeInstallationPresets(
     fixture.controller,
@@ -1104,13 +1077,10 @@ test("startup seeds default Presets with an administrator who can create them wh
   // The administrator Role bound to the Installation resource only: it administers the
   // Installation but grants nothing inside a Namespace.
   const scoped = await fixture.createAccountWithPolicy("installation-only", (identity) => {
-    fixture.policy.bindings.push({
+    bindRole(fixture.policy, identity.id, {
       id: "installation-only-admin",
-      subjectKind: "identity",
-      subjectId: identity.id,
       roleId: adminRoleId,
-      resourceKind: "installation",
-      resourceId: installationId,
+      resource: { kind: "installation", id: installationId },
     });
   });
   const administers = await iam.authorize({
@@ -1278,13 +1248,7 @@ test("Namespace deletion removes unmodified default Presets and names what still
 
 // Shipped versions of the bundled defaults, read from the archive the release ships.
 async function archivedDefault(file, version) {
-  const stem = file.replace(/\.json$/, "");
-  return JSON.parse(
-    await readFile(
-      new URL(`../../deploy/presets/archive/${stem}/${version}.json`, import.meta.url),
-      "utf8",
-    ),
-  );
+  return shippedPreset(`archive/${file.replace(/\.json$/, "")}/${version}.json`);
 }
 
 async function bundledRuntime(t, includeDefaults) {
@@ -1506,13 +1470,10 @@ test("startup skips and warns about a default refresh the policy refuses instead
   const { principal: scoped } = await fixture.createAccountWithPolicy(
     "installation-only",
     (identity) => {
-      fixture.policy.bindings.push({
+      bindRole(fixture.policy, identity.id, {
         id: "installation-only-admin",
-        subjectKind: "identity",
-        subjectId: identity.id,
         roleId: adminRoleId,
-        resourceKind: "installation",
-        resourceId: installationId,
+        resource: { kind: "installation", id: installationId },
       });
     },
   );
@@ -1620,6 +1581,71 @@ test("startup skips and warns about a default refresh the policy refuses instead
   );
 });
 
+test("startup keeps a default missing where a deny Restriction refuses its creation", async (t) => {
+  const { initializeInstallationPresets } =
+    await import("../../apps/controller/src/composition/installation-config.ts");
+  const { emitOccLogEvent } = await import("../../apps/controller/src/logging.ts");
+  const runtime = await bundledRuntime(t, true);
+  const fixture = await createFixture(t, {
+    defaultPresets: runtime.defaultPresets,
+    bundledPresetVersions: runtime.bundledPresetVersions,
+    refreshBundledDefaultPresets: runtime.installation.presets.includeDefaults,
+  });
+  const iam = fixture.controller.selectDriver("iam", "console-native-iam");
+  const principal = fixture.policy.identities.find((identity) => identity.kind === "principal");
+  // An operator removed one default copy, then froze the Namespace's Presets.
+  const frozen = await fixture.createNamespace("Frozen presets", { ready: true });
+  const removed = (await fixture.request("GET", collection(frozen.id))).data.find(
+    (preset) => preset.name === "default-codex",
+  );
+  await deletePreset(fixture, frozen.id, removed.id);
+  fixture.policy.restrictions.push({
+    id: "freeze-preset-creation",
+    namespaceId: frozen.id,
+    action: "create",
+    resourceKind: "preset",
+    effect: "deny",
+  });
+  // Another Namespace is missing the same default and may still receive it.
+  const open = await fixture.createNamespace("Open presets", { ready: true });
+  const openCopy = (await fixture.request("GET", collection(open.id))).data.find(
+    (preset) => preset.name === "default-codex",
+  );
+  await deletePreset(fixture, open.id, openCopy.id);
+  const names = async (namespaceId) =>
+    (await fixture.request("GET", collection(namespaceId))).data
+      .map((preset) => preset.name)
+      .sort();
+  const before = await names(frozen.id);
+  const lines = [];
+  const logger = Object.fromEntries(
+    ["error", "warn", "info", "debug"].map((level) => [
+      level,
+      (record) => lines.push({ level, ...record }),
+    ]),
+  );
+
+  await initializeInstallationPresets(
+    fixture.controller,
+    iam,
+    [principal],
+    runtime.defaultPresets,
+    (event) => emitOccLogEvent(logger, event),
+  );
+  assert.deepEqual(await names(frozen.id), before);
+  assert.ok((await names(open.id)).includes("default-codex"));
+  assert.deepEqual(lines, [
+    {
+      level: "warn",
+      event: "presets.default-create-skipped",
+      namespaceId: frozen.id,
+      presetName: "default-codex",
+      reason: "An applicable Restriction denies the exact action and resource.",
+      restrictionIds: ["freeze-preset-creation"],
+    },
+  ]);
+});
+
 test("Namespace deletion treats every shipped bundled version as unmodified, even with defaults off", async (t) => {
   const runtime = await bundledRuntime(t, false);
   assert.deepEqual(runtime.defaultPresets, []);
@@ -1627,9 +1653,7 @@ test("Namespace deletion treats every shipped bundled version as unmodified, eve
     defaultPresets: runtime.defaultPresets,
     bundledPresetVersions: runtime.bundledPresetVersions,
   });
-  const currentCodex = JSON.parse(
-    await readFile(new URL("../../deploy/presets/default-codex.json", import.meta.url), "utf8"),
-  );
+  const currentCodex = await shippedPreset("default-codex.json");
   const shipped = [
     currentCodex,
     await archivedDefault("default-codex.json", "32576b8f13976778"),

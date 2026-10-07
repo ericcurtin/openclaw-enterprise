@@ -8,7 +8,15 @@ export interface RepositoryCredentialClientConfiguration {
   readonly pushRefAllowlist?: readonly string[];
 }
 
-/** True when `value` contains a C0 control character (U+0000-U+001F) or DEL (U+007F). */
+/**
+ * True when `value` contains a C0 control character (U+0000-U+001F) or DEL (U+007F).
+ *
+ * A deliberate copy of `hasControlCharacter` from `@openclaw-enterprise/utils`. The isolated
+ * repository-credentials runtimes never load a workspace package: the build closures in
+ * scripts/build-repository-credentials.mjs reject bare specifiers, and
+ * scripts/verify-repository-credentials-boundary.mjs has no reviewed import for one. The
+ * utils conformance suite checks that both copies flag exactly the same characters.
+ */
 export function hasControlCharacter(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);

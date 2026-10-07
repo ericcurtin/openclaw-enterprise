@@ -154,20 +154,28 @@ OCE identifies an IdP account only by the ID token's `sub` claim for this issuer
 
 ## Attach and detach
 
-Read the account version with `GET /api/auth/accounts/:userId`, then attach:
+As a human Installation administrator, [sign in as a human administrator](../../reference/authentication/service-api-keys.md#sign-in-as-a-human-administrator)
+so `OCC_URL`, `OCC_ORIGIN` and `OCC_SESSION_COOKIE_JAR` are set, and set `USER_ID` to the
+account's `id`. Read the account version, then attach:
 
 ```bash
-curl -sS -X POST "$OCC_AUTH_BASE_URL/api/auth/accounts/$USER_ID/providers/oidc" \
-  -H "Origin: $OCC_AUTH_BASE_URL" -H 'Content-Type: application/json' \
-  -b "$COOKIE_JAR" \
-  --data '{"subject":"<sub>","expectedVersion":1}'
+VERSION="$(curl --fail-with-body --silent --show-error \
+  --cookie "$OCC_SESSION_COOKIE_JAR" -H "Origin: $OCC_ORIGIN" \
+  "$OCC_URL/api/auth/accounts/$USER_ID" | jq -er .data.version)" &&
+jq -n --arg subject '<sub>' --argjson version "$VERSION" \
+  '{subject: $subject, expectedVersion: $version}' |
+  curl --fail-with-body --silent --show-error \
+    --cookie "$OCC_SESSION_COOKIE_JAR" -H "Origin: $OCC_ORIGIN" \
+    -H 'Content-Type: application/json' --data-binary @- \
+    "$OCC_URL/api/auth/accounts/$USER_ID/providers/oidc"
 ```
 
 The subject is 1–255 printable ASCII characters without spaces. The call returns `409`
 when OIDC is off, the version is stale, the account is disabled, or another account
 holds the subject ("The external identity is already assigned."). Attachment advances
 the account version and ends the account's sessions. The method's `providerId` starts
-with `oidc:`; detach it with `POST /api/auth/accounts/:userId/methods/:methodId/detach`.
+with `oidc:`; detach it with `POST /api/auth/accounts/:userId/methods/:methodId/detach`,
+which ends every session of the account, password sessions included.
 
 Accounts are created with a password, and an OIDC identity can be attached only
 afterwards. To add someone who should sign in only through the IdP, follow
@@ -178,7 +186,7 @@ afterwards. To add someone who should sign in only through the IdP, follow
 - The provider instance is derived from the issuer and client ID. Changing either is a
   new instance: attach every identity again, then detach the old methods. Sessions
   signed in through the old instance, or through OIDC once it is removed, end on their
-  next request; password sessions and other providers' sessions are unaffected.
+  next request. Detaching an old method ends every session of that account.
 - Rotating only the client secret keeps attachments and voids pending sign-ins.
 - The API reads the JWKS on every callback, so IdP key rotation needs no restart.
 - OCE does not learn when the IdP disables someone: offboarding also means detaching or

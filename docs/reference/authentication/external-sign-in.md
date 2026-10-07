@@ -10,8 +10,9 @@ covers bootstrap, password sessions, request origin, provisioning, and failures.
 GitHub sign-in requires one serving controller, one Installation, PostgreSQL with
 its restricted application role, native IAM, one GitHub App on github.com, and one
 canonical HTTPS Console origin with host-only cookies. Shared-cookie native
-administration, other session readers, rolling or mixed-version serving, and
-mutable Installation policy are unsupported. Keep bootstrap, seeding, external
+administration (startup fails with `EXTERNAL_SIGN_IN_NATIVE_ADMIN_UNSUPPORTED`),
+other session readers, rolling or mixed-version serving, and mutable Installation
+policy are unsupported. Keep bootstrap, seeding, external
 policy writers, and recovery-affecting changes stopped.
 Native IAM's policy read remains separate from State's actor guard. Loopback
 development does not qualify deployed HTTPS.
@@ -77,8 +78,10 @@ does not learn when someone leaves the organization or GitHub suspends them: wit
 an allowlist someone who left can still sign in, and live sessions continue until they
 expire (at most 8 hours). Offboarding also means acting in OCE
 ([account controls](#session-and-recovery-controls)): disable the account to end all
-access and its sessions, or detach its GitHub method to end GitHub sign-in and those
-sessions; revoke ends sessions but allows a fresh sign-in.
+access and its sessions, or detach its GitHub method to end GitHub sign-in and all its
+sessions; revoke ends sessions but allows a fresh sign-in. None of these ends a
+[service key](service-api-keys.md#revoke-or-rotate-a-service-key) the person uses
+from the CLI: revoke it, or delete its service principal's AccessBindings.
 
 `GET /api/auth/providers` returns `github`, `google`, `oidc`, and `sessionBinding` as `true` when enabled,
 with `oidcSignIn` (`label`, `authorizationUrl`) while OIDC is configured,
@@ -92,7 +95,10 @@ The callback consumes a short-lived, browser-bound attempt once before code
 exchange and resolves the immutable numeric GitHub user ID's exact enrollment.
 Unknown identities fail without signup. Success returns to exactly `/console/`
 and sets a two-minute HttpOnly, `SameSite=Strict` login receipt; failure returns
-to `/console/?authError=github` without automatic retry. The starting tab sends its
+to `/console/?authError=github` without automatic retry. An identity attached to a
+disabled account returns with `authReason=account-disabled`, audited as `ACCOUNT_DISABLED`
+with the account's `userId`; only the person the provider just authenticated reaches it,
+and every other refusal stays generic. The starting tab sends its
 `attemptId` with the configured Origin to `POST /api/auth/providers/github/result`,
 which returns the callback session's `sessionKey` once, only while that session's
 cookie is current. It never issues or extends a session.
@@ -125,8 +131,8 @@ logins, and `OCC_AUTH_GITHUB_ALLOWED_TEAMS` (`auth.github.allowedTeams`) lists `
 entries, whose active members may use GitHub sign-in. Both are empty by default,
 which admits any attached identity as above. Entries are lowercased, at most 10 in total;
 other values, or either list without the GitHub client, fail startup. Helm refuses invalid
-entries and renders the lists only with `auth.github.enabled`; the installation profile wants
-them lowercase.
+entries, and either list without `auth.github.enabled`, at render time; the installation
+profile wants them lowercase.
 
 With a list, the callback reads membership with the user token after `GET /user` and before
 the account lookup, so a refusal reveals nothing about OCE accounts. It reads
@@ -244,12 +250,12 @@ session. A stale
 
 Send the version just read, such as `{"expectedVersion":1}`:
 
-| Operation                                                  | Effect                                                                                     |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `POST /api/auth/accounts/:userId/disable`                  | Disables the account, invalidating sessions and pending proofs; refuses the recovery user. |
-| `POST /api/auth/accounts/:userId/enable`                   | Re-enables a disabled account; users sign in again.                                        |
-| `POST /api/auth/accounts/:userId/revoke`                   | Invalidates all account sessions and pending proofs; fresh sign-in still works.            |
-| `POST /api/auth/accounts/:userId/methods/:methodId/detach` | Removes one attached external identity and its sessions; password methods return `409`.    |
+| Operation                                                  | Effect                                                                                                |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `POST /api/auth/accounts/:userId/disable`                  | Disables the account, invalidating sessions and pending proofs; refuses the recovery user.            |
+| `POST /api/auth/accounts/:userId/enable`                   | Re-enables a disabled account; users sign in again.                                                   |
+| `POST /api/auth/accounts/:userId/revoke`                   | Invalidates all account sessions and pending proofs; fresh sign-in still works.                       |
+| `POST /api/auth/accounts/:userId/methods/:methodId/detach` | Removes one attached external identity and ends every account session; password methods return `409`. |
 
 `POST /api/auth/accounts/:userId/enrol` (no body) enrolls a skipped account holding
 its Principal and one password. These operations serialize with session issuance

@@ -1,7 +1,7 @@
 ---
 created: 2026-08-25
-updated: "2026-10-01"
-last_updated_session: "authoring-run/e288dbbe-6d08-4251-adaa-860443c31b44"
+updated: "2026-10-05"
+last_updated_session: "01a0f9e4-a0bf-76f1-acdb-e6b55ada490a"
 ---
 
 # Production Startup Flow
@@ -99,13 +99,13 @@ images from Helm values or rewrite Driver configuration.
 
 `scripts/prepare-bootstrap-volume:124`
 
-Before the first install, the operator creates the bootstrap PVC named by
-`bootstrap.password.claimName` and runs the helper with explicit kubeconfig,
-context, namespace, claim, approved Node-capable image, and optional repeated
-`--node-selector KEY=VALUE` labels. The helper launches a bounded preparation
-Pod, applies the selectors before WaitForFirstConsumer storage binds, verifies
-the mounted root is fresh except for filesystem-owned `lost+found`, sets UID/GID
-`1000` with mode `0700`, and refuses to continue on any other entry.
+Before the first install, the operator creates the `bootstrap.password.claimName`
+PVC and runs the helper with explicit kubeconfig, context, namespace, claim,
+approved Node-capable image, and optional `--node-selector KEY=VALUE` labels.
+The preparation Pod preserves string namespaces and selector keys, applying selectors
+before WaitForFirstConsumer binding. The helper requires a fresh
+root except for filesystem-owned `lost+found`, sets UID/GID `1000` with mode
+`0700`, and refuses other entries.
 
 If cluster policy forbids the helper Pod, storage administration owns the same
 state transition through an approved storage workflow. A preprepared claim goes
@@ -165,8 +165,9 @@ Deployments. The API validates production listener settings, Better Auth,
 database access, trusted Installation YAML, selected Drivers, Backend
 membership, and Kubernetes Compute preflight before readiness. It serves private
 controller routes, `/healthz`, and database-backed `/readyz` behind the
-operator-managed endpoint. A startup probe on `/healthz` (5-second period, 24
-failures) gives the API 2 minutes to listen before liveness checks begin.
+operator-managed endpoint. A `/healthz` startup probe (1-second period, 120
+failures) gives the API 2 minutes to listen and lets readiness start within a
+second of listening.
 
 `apps/controller/src/index.ts:createFastifyApp`
 
@@ -182,9 +183,8 @@ failed close logs `shutdown.failed` and exits `1`. A log ending at
 
 When `controlPlane.nodeSelector` is non-empty, the chart places the API and
 worker Pods with that selector. The same selector applies to the initialization
-Job that runs the migration init container and bootstrap container, so production
-operators can keep migration, bootstrap, API, and worker Pods on a reviewed
-control-plane node pool.
+Job (migration and bootstrap), so all four stay on a reviewed control-plane node
+pool.
 `deploy/helm/openclaw-enterprise/templates/gateway-routing.yaml` also projects
 that selector into `EnvoyProxy.spec.provider.kubernetes.envoyDeployment.pod`,
 so the credential-checking private proxy stays on the trusted pool.
@@ -292,9 +292,12 @@ model calls remain unproven until the tenant deployment and TUI procedures run.
   `KUBERNETES_API_UNAVAILABLE` means the Compute preflight got no answer from
   the Kubernetes API server named by `host` and `port`. Check that
   `cluster.cidrs` still lists that address; a restarted cluster can move it.
+- Code `PRESET_FILE_INVALID`: a bad `presets.files` list or file (missing,
+  unreadable, malformed, invalid, duplicate).
 - `kubectl -n openclaw-system logs job/oce-initialization -c bootstrap` is the
-  first check for unsafe output storage, existing output files, database-role
-  failures, auth origin errors, and administrator/IAM mismatch.
+  first check for unsafe output storage, existing outputs, database-role
+  failures, auth errors (`AUTH_SECRET_INVALID`, `AUTH_BASE_URL_INVALID`), and
+  administrator/IAM mismatch.
 - `occ installation get` must display an `ID` equal to `meta.installationId`
   from the retrieved key file.
 - Changing an external startup Secret alone does not restart the API or worker;
@@ -321,6 +324,10 @@ model calls remain unproven until the tenant deployment and TUI procedures run.
 
 ## Changelog
 
+- 2026-10-05 06:59: Preserve bootstrap Pod namespace strings. (01a0f9e4-a0bf-76f1-acdb-e6b55ada490a - 66a4a07028fd0a08c29ea80e8f95cadc48a74932)
+
+- 2026-10-05: Name Preset file failures `PRESET_FILE_INVALID`.
+- 2026-10-04: Poll the startup probe every second.
 - 2026-10-04: Time API startup phases in `listening`.
 - 2026-10-04: Add the API startup probe.
 - 2026-10-04: Log the API's shutdown start and completion.

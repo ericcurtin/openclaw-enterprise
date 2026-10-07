@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -76,12 +77,16 @@ func New(out, errOut io.Writer) *cobra.Command {
 		},
 		PersistentPreRunE: func(command *cobra.Command, _ []string) error {
 			app.ctx = command.Context()
+			if printsTextOnly(command) {
+				return nil
+			}
 			return app.validateOptions(command)
 		},
 	}
 	command.SetOut(out)
 	command.SetErr(errOut)
 	command.SetVersionTemplate("occ {{.Version}}\n")
+	command.SetHelpFunc(helpWithOutputFormats(command.HelpFunc()))
 
 	flags := command.PersistentFlags()
 	flags.StringVar(&app.url, "url", os.Getenv("OCC_URL"), "OCC endpoint URL")
@@ -115,6 +120,7 @@ func New(out, errOut io.Writer) *cobra.Command {
 		app.installationCommand(),
 		app.namespaceCommand(),
 		app.iamCommand(),
+		app.serviceKeyCommand(),
 		app.configurationCommand(),
 		app.secretCommand(),
 		app.presetCommand(),
@@ -122,6 +128,12 @@ func New(out, errOut io.Writer) *cobra.Command {
 		app.agentCommand(),
 		developmentCommand(),
 	)
+	command.InitDefaultHelpCmd()
+	for _, child := range command.Commands() {
+		if child.Name() == "help" {
+			child.Run, child.RunE = nil, helpTopic
+		}
+	}
 	return command
 }
 
@@ -256,7 +268,175 @@ func (app *application) namespaceCommand() *cobra.Command {
 
 func (app *application) iamCommand() *cobra.Command {
 	command := commandGroup("iam", "Manage Namespace IAM policy")
-	command.AddCommand(app.iamRoleCommand(), app.iamAccessBindingCommand())
+	command.AddCommand(
+		app.iamRoleCommand(),
+		app.iamAccessBindingCommand(),
+		app.iamServicePrincipalCommand(),
+	)
+	return command
+}
+
+func (app *application) iamServicePrincipalCommand() *cobra.Command {
+	command := commandGroup("service-principal", "Manage Namespace ServicePrincipals for automation and CLI keys")
+
+	create := &cobra.Command{
+		Use:     "create",
+		Short:   "Create a Namespace ServicePrincipal with no grants",
+		Example: iamServicePrincipalCreateExample,
+		Args:    cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			namespace, client, err := app.namespaceClient()
+			if err != nil {
+				return err
+			}
+			principal, err := client.CreateIAMServicePrincipal(namespace)
+			if err != nil {
+				return err
+			}
+			return app.printIAMServicePrincipal(principal, false)
+		},
+	}
+
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List Namespace ServicePrincipals",
+		Args:  cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			namespace, client, err := app.namespaceClient()
+			if err != nil {
+				return err
+			}
+			principals, err := client.ListIAMServicePrincipals(namespace)
+			if err != nil {
+				return err
+			}
+			return app.printIAMServicePrincipal(principals, true)
+		},
+	}
+
+	get := &cobra.Command{
+		Use:   "get ID",
+		Short: "Show a Namespace ServicePrincipal",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			namespace, client, err := app.namespaceClient()
+			if err != nil {
+				return err
+			}
+			principal, err := client.GetIAMServicePrincipal(namespace, args[0])
+			if err != nil {
+				return err
+			}
+			return app.printIAMServicePrincipal(principal, false)
+		},
+	}
+
+	command.AddCommand(create, list, get)
+	return command
+}
+
+func (app *application) serviceKeyCommand() *cobra.Command {
+	command := commandGroup("service-key", "Issue and revoke service keys")
+
+	var principalID, name, outFile string
+	var expiresInDays int
+	create := &cobra.Command{
+		Use:     "create",
+		Short:   "Issue a key for a ServicePrincipal and write it to a new key file",
+		Example: serviceKeyCreateExample,
+		Args:    cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if expiresInDays != 0 && (expiresInDays < 1 || expiresInDays > 365) {
+				return fmt.Errorf("--expires-in-days must be between 1 and 365")
+			}
+			if app.namespace != "" {
+				if err := namespaceIDArg.check(app.namespace); err != nil {
+					return fmt.Errorf("OCC_NAMESPACE or --namespace: %w", err)
+				}
+			}
+			// Create the file first, so an existing path or a bad directory fails
+			// before a key exists that nothing could save.
+			file, err := os.OpenFile(outFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if err != nil {
+				return fmt.Errorf("failed to create key file: %w", err)
+			}
+			written := false
+			defer func() {
+				_ = file.Close()
+				if !written {
+					_ = os.Remove(outFile)
+				}
+			}()
+			client, err := app.client()
+			if err != nil {
+				return err
+			}
+			body := map[string]any{"servicePrincipalId": principalID, "name": name}
+			if app.namespace != "" {
+				body["namespaceId"] = app.namespace
+			}
+			if expiresInDays != 0 {
+				body["expiresIn"] = expiresInDays * 24 * 60 * 60
+			}
+			key, err := client.CreateServiceKey(body)
+			if err != nil {
+				return err
+			}
+			details, ok := key.(map[string]any)
+			keyID, _ := details["id"].(string)
+			if !ok || keyID == "" {
+				return fmt.Errorf("OCC returned an invalid service key")
+			}
+			// The file holds the issuance envelope, which --service-key-file reads.
+			writeErr := json.MarshalWrite(file, map[string]any{"data": key})
+			if writeErr == nil {
+				writeErr = file.Close()
+			}
+			if writeErr != nil {
+				// Nobody holds the unsaved key: revoke it, and name it if that fails too.
+				if _, revokeErr := client.RevokeServiceKey(keyID); revokeErr != nil {
+					return fmt.Errorf(
+						"failed to write key file (%w); revoke unsaved service key %s with occ service-key revoke",
+						writeErr,
+						keyID,
+					)
+				}
+				return fmt.Errorf("failed to write key file (%w); the unsaved service key %s was revoked", writeErr, keyID)
+			}
+			written = true
+			delete(details, "key")
+			return app.printServiceKey(details)
+		},
+	}
+	create.Flags().StringVar(&principalID, "service-principal", "", "ServicePrincipal ID")
+	create.Flags().StringVar(&name, "name", "", "Key name (1-32 characters)")
+	create.Flags().StringVar(&outFile, "out", "", "New key file to write (mode 0600; must not exist)")
+	create.Flags().IntVar(&expiresInDays, "expires-in-days", 0, "Lifetime in days, 1-365 (default 30)")
+	_ = create.MarkFlagRequired("service-principal")
+	_ = create.MarkFlagRequired("name")
+	_ = create.MarkFlagRequired("out")
+
+	revoke := &cobra.Command{
+		Use:   "revoke ID",
+		Short: "Revoke a service key",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			client, err := app.client()
+			if err != nil {
+				return err
+			}
+			result, err := client.RevokeServiceKey(args[0])
+			if err != nil {
+				return err
+			}
+			return app.printItems(result, false, []column{
+				{title: "ID", key: "id"},
+				{title: "REVOKED", key: "revoked"},
+			})
+		},
+	}
+
+	command.AddCommand(create, revoke)
 	return command
 }
 
@@ -523,7 +703,7 @@ func (app *application) secretCommand() *cobra.Command {
 
 	get := &cobra.Command{
 		Use:   "get ID",
-		Short: "Show Secret metadata",
+		Short: "Show Secret metadata and the resources that reference it",
 		Args:  idArgs(secretIDArg),
 		RunE: func(_ *cobra.Command, args []string) error {
 			namespace, client, err := app.namespaceClient()
@@ -534,7 +714,7 @@ func (app *application) secretCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return app.printSecret(secret, false)
+			return app.printSecretDetail(secret)
 		},
 	}
 
@@ -1095,7 +1275,7 @@ func (app *application) agentRevision(
 		if err != nil {
 			return "", nil, err
 		}
-		fmt.Fprintf(notices, "agent %s has no active revision; using latest revision %s\n", agentID, latest)
+		noticef(notices, "agent %s has no active revision; using latest revision %s", agentID, latest)
 		return latest, nil, nil
 	}
 	// A newer revision than the active one is being deployed or has failed; while
@@ -1104,22 +1284,22 @@ func (app *application) agentRevision(
 	probe := newerRevisionWithPods(client, namespace, agentID, active)
 	switch {
 	case probe.hasPods:
-		fmt.Fprintf(
+		noticef(
 			notices,
-			"notice: reading revision %s, newer than the active revision %s and not yet active; pass --revision %s for the active revision\n",
+			"notice: reading revision %s, newer than the active revision %s and not yet active; pass --revision %s for the active revision",
 			probe.latest, active, active,
 		)
 		return probe.latest, probe.description, nil
 	case probe.err != nil:
 		// The runtime probe needs more permission than reading logs, so a log
 		// reader may be refused here yet allowed to read the newer revision.
-		fmt.Fprintf(
+		noticef(
 			notices,
-			"notice: reading the active revision %s; a newer revision %s exists but its runtime could not be read (%v); pass --revision %s to read it\n",
+			"notice: reading the active revision %s; a newer revision %s exists but its runtime could not be read (%v); pass --revision %s to read it",
 			active, probe.latest, probe.err, probe.latest,
 		)
 	default:
-		fmt.Fprintf(notices, "notice: reading the active revision %s\n", active)
+		noticef(notices, "notice: reading the active revision %s", active)
 	}
 	return active, nil, nil
 }
@@ -1283,6 +1463,9 @@ func (app *application) runAgentLogs(command *cobra.Command, agentID string, opt
 	notices := command.ErrOrStderr()
 	revisionID, _, err := app.agentRevision(client, notices, namespace, agentID, options.revision)
 	if err != nil {
+		if options.follow && ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	cursor := ""
@@ -1389,14 +1572,81 @@ func (app *application) agentRuntimeCredentialsCommand() *cobra.Command {
 	return command
 }
 
+// helpOnlyAnnotation marks a command whose only action is printing its help.
+const helpOnlyAnnotation = "occ/help-only"
+
 func commandGroup(use, short string) *cobra.Command {
 	return &cobra.Command{
-		Use:   use,
-		Short: short,
-		Args:  cobra.NoArgs,
+		Use:         use,
+		Short:       short,
+		Args:        cobra.NoArgs,
+		Annotations: map[string]string{helpOnlyAnnotation: "true"},
 		RunE: func(command *cobra.Command, _ []string) error {
 			return command.Help()
 		},
+	}
+}
+
+// printsTextOnly reports commands that never call OCC: the root and command
+// groups, which print their help, the help command, and shell completion. An
+// invalid OCC_TIMEOUT_SECONDS or -o must not stop them.
+func printsTextOnly(command *cobra.Command) bool {
+	if !command.HasParent() || command.Annotations[helpOnlyAnnotation] != "" {
+		return true
+	}
+	if command.Parent() != command.Root() {
+		// Cobra's "completion bash" and its siblings.
+		return command.Parent().Name() == "completion" && command.Parent().Parent() == command.Root()
+	}
+	switch command.Name() {
+	case "help", "completion", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
+		return true
+	}
+	return false
+}
+
+// helpTopic is the help command's action. Cobra's own prints the closest
+// command's help and exits 0 for a mistyped topic; this one fails instead.
+func helpTopic(command *cobra.Command, args []string) error {
+	target, rest, err := command.Root().Find(args)
+	if err != nil {
+		return err
+	}
+	if len(rest) > 0 {
+		message := fmt.Sprintf("unknown help topic %q", strings.Join(args, " "))
+		if target.SuggestionsMinimumDistance <= 0 {
+			target.SuggestionsMinimumDistance = 2 // cobra's default for unknown commands
+		}
+		if suggestions := target.SuggestionsFor(rest[0]); len(suggestions) > 0 {
+			topic := append(strings.Fields(target.CommandPath())[1:], suggestions[0])
+			return fmt.Errorf("%s; did you mean %q?", message, strings.Join(topic, " "))
+		}
+		return fmt.Errorf("%s; run \"occ help\" for the command list", message)
+	}
+	if target.Context() == nil {
+		target.SetContext(command.Context())
+	}
+	target.InitDefaultHelpFlag()
+	target.InitDefaultVersionFlag()
+	return target.Help()
+}
+
+// helpWithOutputFormats makes help for a command with its own -o formats (see
+// outputFormatsAnnotation) describe those formats instead of the global ones.
+func helpWithOutputFormats(help func(*cobra.Command, []string)) func(*cobra.Command, []string) {
+	return func(command *cobra.Command, args []string) {
+		annotated, ok := command.Annotations[outputFormatsAnnotation]
+		flag := command.Root().PersistentFlags().Lookup("output")
+		if !ok || flag == nil {
+			help(command, args)
+			return
+		}
+		formats := strings.Split(annotated, ",")
+		usage, defValue := flag.Usage, flag.DefValue
+		flag.Usage = "Output format: " + strings.Join(formats, ", ")
+		flag.DefValue = formats[0]
+		defer func() { flag.Usage, flag.DefValue = usage, defValue }()
+		help(command, args)
 	}
 }
 

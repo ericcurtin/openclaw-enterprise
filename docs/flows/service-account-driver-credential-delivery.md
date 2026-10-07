@@ -1,7 +1,7 @@
 ---
 created: 2026-08-24
-updated: 2026-09-23
-last_updated_session: codex/01a0cf72-6985-7712-ba92-d8cc32470f24
+updated: 2026-10-05
+last_updated_session: c0a8f27c-4c0f-42ed-b6e8-be41aff648c7
 ---
 
 # Service Account Driver Credential Delivery Flow
@@ -80,6 +80,13 @@ upstream account, registers rollback, and persists its private Backend binding
 in the same PostgreSQL transaction, including Backend, Driver, Namespace,
 account, and workspace identity.
 
+`apps/controller/src/backends/chatgpt.ts:ChatGPTClient.request` owns each
+upstream HTTP response. It consumes successful replies and the structured 404
+replies needed to confirm already-absent resources. Before rejecting another
+HTTP status or a response declared larger than its 4 MiB allowance, it cancels
+the unused body. That releases transport capacity before the next operation;
+a cancellation failure does not replace the sanitized Backend error.
+
 Account creation and credential issuance are separate operations. Creating the
 account does not issue a token, and later issuance or deletion requires that
 exact binding to match the current configured Backend and member Driver.
@@ -156,6 +163,11 @@ Refresh, rotation, and automated reconciliation remain deferred.
 
 ## Debugging and Verification
 
+- Run `node --test tests/conformance/service-account-driver.test.mjs` for
+  controller lifecycle coverage and native HTTPS response-release regressions.
+  The latter call the actual Backend with built-in fetch, a single-connection
+  pool and a loopback TLS server. They prove recovery after rejected 429, 503 and
+  oversized declared responses, not live provider accounts or model execution.
 - Run `node --test tests/integration/service-account-driver-real.test.mjs`
   with `OCC_TEST_CHATGPT_SERVICE_ACCOUNT_REAL=1`, a protected admin-key file,
   `OCC_TEST_CHATGPT_WORKSPACE_ID`, disposable Kubernetes/PostgreSQL, and real
@@ -180,6 +192,8 @@ Refresh, rotation, and automated reconciliation remain deferred.
 [keep this for the user to add notes. do not change between edits]
 
 ## Changelog
+
+- 2026-10-05 20:51: Trace rejected Backend HTTP response disposal and native HTTPS recovery coverage. (c0a8f27c-4c0f-42ed-b6e8-be41aff648c7 - b5b3ba296f38dd5090c1f4bb1287ed87ae3f9eba)
 
 - 2026-09-23 12:22: Move canonical credential sources to CP and describe revision-scoped Harness delivery in the accompanying change. (codex/01a0cf72-6985-7712-ba92-d8cc32470f24 - 623d56dec26a8ef0f72b562254687cabecdbbf82)
 

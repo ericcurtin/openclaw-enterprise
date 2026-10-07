@@ -50,7 +50,7 @@ input is not supported. The server validates document fields against the
 | `occ configuration delete ID`                          | Deletes an unreferenced Configuration.                                                                                                                           |
 | `occ secret create --file FILE`                        | Stores a Namespace Secret from a protected JSON document.                                                                                                        |
 | `occ secret list`                                      | Lists Namespace Secret metadata, never values.                                                                                                                   |
-| `occ secret get ID`                                    | Reads Secret metadata, never its value.                                                                                                                          |
+| `occ secret get ID`                                    | Reads Secret metadata, never its value, and the readable resources that reference it (`CONSUMERS`).                                                              |
 | `occ secret update ID --file FILE`                     | Replaces the Secret value; consumers require explicit redeployment.                                                                                              |
 | `occ secret delete ID`                                 | Deletes an unreferenced Namespace Secret.                                                                                                                        |
 | `occ preset list`                                      | Lists the Namespace's [Presets](presets.md) the caller can read: ID, name, and creation time.                                                                    |
@@ -69,6 +69,11 @@ input is not supported. The server validates document fields against the
 | `occ iam access-binding get ID`                        | Reads a Namespace AccessBinding.                                                                                                                                 |
 | `occ iam access-binding create --file FILE`            | Grants a Role to a principal for an exact resource.                                                                                                              |
 | `occ iam access-binding delete ID`                     | Deletes a Namespace AccessBinding.                                                                                                                               |
+| `occ iam service-principal create`                     | Creates a Namespace ServicePrincipal with no grant, for automation or a member's CLI key.                                                                        |
+| `occ iam service-principal list`                       | Lists the Namespace's non-Agent ServicePrincipals.                                                                                                               |
+| `occ iam service-principal get ID`                     | Reads a Namespace ServicePrincipal.                                                                                                                              |
+| `occ service-key create`                               | With `--service-principal ID --name NAME --out FILE`, issues a [service key](authentication/service-api-keys.md) into a new `0600` file; never prints the key.   |
+| `occ service-key revoke ID`                            | Revokes a service key.                                                                                                                                           |
 | `occ agent delete ID`                                  | Begins asynchronous Agent deletion, including its owned runtime state.                                                                                           |
 | `occ agent list`                                       | Lists authorized Agents in the selected Namespace.                                                                                                               |
 | `occ agent get ID`                                     | Reads an Agent's desired state and active revision.                                                                                                              |
@@ -121,8 +126,11 @@ notice names the newer revision to pass. `runtime` accepts `-o table|json|yaml`
 and needs Agent `operate` and `read` plus `read` on the revision. Its table output
 ends with each Pod's Events (`POD`, `CONTAINER`, `TYPE`, `REASON`, `COUNT`,
 `LAST SEEN`, `MESSAGE`); `CONTAINER` is `-` for Pod-level Events. `logs` needs
-Agent `read_logs` (or `administer`) and `read` plus `read` on the revision, and each view is
-audited.
+Agent `read_logs` (or `administer`) and `read`, which cover every revision, and
+each view is audited. Default revision selection lists only revisions you can
+`read`: without revision grants, `logs` reads the active revision without
+checking for a newer one, and an Agent with no active revision needs
+`--revision ID`.
 
 | `occ agent logs` flag  | Meaning                                                                                                                                                                                                    |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -138,7 +146,9 @@ audited.
 
 Text output prints `TIME LEVEL KIND [SUBSYSTEM] MESSAGE key=value` per line.
 Gap and withheld records are printed to stderr as `notice:` lines; in JSON mode
-they are also records on stdout. With `--follow`, the CLI waits for
+they are also records on stdout. Text lines and notices show an invisible or
+control character, such as a bidirectional override, as an escape like
+`\u202e`; a field value holding one is quoted. JSON records are unchanged. With `--follow`, the CLI waits for
 `Retry-After` after a `429`, retries after a `504`, starts a new audited view
 when the cursor is rejected, and exits cleanly on Ctrl-C. `501`, `503` and
 permission errors end the command with a nonzero exit. `--follow` cannot be
@@ -153,13 +163,16 @@ occ agent logs agt_... --source gateway --follow -o json | jq -r .message
 ## Output and errors
 
 Table output is meant for people; it prints `-` for unset fields and `No
-resources found.` for an empty list. JSON and YAML print the resource or array
+resources found.` for an empty list. A cell holding an invisible or control
+character, such as a bidirectional override in a name, is printed quoted with
+that character escaped; so is a value that starts with `"`. JSON and YAML print the exact resource or array
 without the HTTP envelope. Deleting a Configuration prints
 `Deleted configuration ID.` in table mode; structured output contains
 `deleted`, `kind`, and `id`.
 
 Failures go to stderr and the CLI exits nonzero. For HTTP errors, the CLI prints
-the status and, when present, the API error code and message. It does not print
+the status and, when present, the API error code and message, and the
+`Retry-After` delay in seconds. It does not print
 the server's request ID. To capture that ID for a failed request, use the
 [HTTP API directly](../guides/http-api.md#troubleshoot).
 
@@ -181,3 +194,6 @@ printed by startup so it selects the same profile and state directory.
 The explicitly selected Kubernetes-only profile rejects Compose options. Use
 `scripts/dev-up` and `scripts/dev-down` as the common entry points for every
 profile; the Compute and Sandbox Driver settings select the implementation.
+When `scripts/dev-up` fails on the Docker profile, `occ dev up` exits with the
+script's status (`2` for a usage or configuration error) and prints nothing
+beyond the script's own message.

@@ -244,6 +244,24 @@ export interface SecretMetadata extends SecretIdentity {
   readonly ref: SecretReference;
 }
 
+/**
+ * Current references that keep a Secret from deletion, limited to resources the caller may
+ * read. `unreadable` counts the examined references the caller may not read, without naming
+ * them; `truncated` means more references exist than OCC examined.
+ */
+export interface SecretConsumers {
+  readonly agents: readonly string[];
+  readonly configurations: readonly string[];
+  readonly credentialSources: readonly string[];
+  readonly provisioningRequests: readonly string[];
+  readonly unreadable: number;
+  readonly truncated: boolean;
+}
+
+export interface SecretDetail extends SecretMetadata {
+  readonly consumers: SecretConsumers;
+}
+
 export interface SecretBinding {
   readonly source: SecretReference;
   readonly delivery?: { readonly type: "env" };
@@ -949,20 +967,35 @@ export type SandboxEnvironmentVariable =
       };
     };
 
-export interface HarnessWorkloadRequirements {
-  readonly loginMode: HarnessAuthBinding["method"];
-  readonly image: string;
-  readonly command: readonly string[];
+export interface SandboxWorkloadFile {
+  /** Safe logical name; the Sandbox implementation selects the absolute workload path. */
+  readonly name: string;
+  /** Immutable, non-secret UTF-8 content admitted with the revision. */
+  readonly content: string;
+  /** Environment variable through which the workload opens the implementation-selected path. */
+  readonly environmentVariable: string;
+}
+
+export interface SandboxWorkloadIdentity {
   readonly serviceAccountName: string;
-  readonly serviceAccountToken: {
+  readonly token: {
     readonly audience: string;
     readonly expirationSeconds: number;
     readonly mountPath: string;
     readonly path: string;
     readonly readOnly: true;
   };
+}
+
+export interface HarnessWorkloadRequirements {
+  readonly loginMode: HarnessAuthBinding["method"];
+  readonly image: string;
+  readonly command: readonly string[];
+  /** Optional identity that a Sandbox must preserve in full or reject before provisioning. */
+  readonly workloadIdentity?: SandboxWorkloadIdentity;
   readonly workspaceMounts: readonly SandboxWorkspaceMount[];
   readonly environment: readonly SandboxEnvironmentVariable[];
+  readonly files: readonly SandboxWorkloadFile[];
   /** Credential Gateway attachments the paired Sandbox must consume in full. */
   readonly credentialAttachments: readonly CredentialSourceAttachment[];
   readonly labels: Readonly<Record<string, string>>;
@@ -973,6 +1006,13 @@ export interface SandboxResourceRef {
   readonly resourceName: string;
   readonly agentId: string;
   readonly revisionId: string;
+}
+
+/** Provider-owned endpoint through which the Agent Gateway reaches its dedicated Harness. */
+export interface SandboxHarnessEndpoint {
+  readonly url: string;
+  /** Provider-local workspace root served by the Harness workspace node. */
+  readonly workspaceRoot?: string;
 }
 
 export interface SandboxNamespaceContext {
@@ -1051,6 +1091,19 @@ export interface IAMDriver extends Driver {
     namespaceId: string,
     bindingId: string,
   ): Promise<boolean>;
+  listNamespaceServicePrincipals?(
+    context: IAMPolicyReadContext,
+    namespaceId: string,
+  ): Promise<readonly Readonly<ServicePrincipal>[]>;
+  getNamespaceServicePrincipal?(
+    context: IAMPolicyReadContext,
+    namespaceId: string,
+    servicePrincipalId: string,
+  ): Promise<Readonly<ServicePrincipal> | undefined>;
+  createNamespaceServicePrincipal?(
+    context: IAMPolicyManagementContext,
+    input: IAMManagedServicePrincipalInput,
+  ): Promise<Readonly<ServicePrincipal>>;
 }
 
 export interface IAMPolicyReadRepository {
@@ -1071,6 +1124,12 @@ export interface IAMPolicyReadRepository {
     resourceKind: ResourceKind,
     resourceIds: readonly string[],
   ): Promise<readonly Readonly<Restriction>[]>;
+  /** Non-Agent ServicePrincipals of the exact Namespace; Agent identities are excluded. */
+  listServicePrincipals(namespaceId: string): Promise<readonly Readonly<ServicePrincipal>[]>;
+  getServicePrincipal(
+    namespaceId: string,
+    servicePrincipalId: string,
+  ): Promise<Readonly<ServicePrincipal> | undefined>;
 }
 
 export interface IAMPolicyRepository extends IAMPolicyReadRepository {
@@ -1078,6 +1137,7 @@ export interface IAMPolicyRepository extends IAMPolicyReadRepository {
   deleteRole(namespaceId: string, roleId: string): Promise<boolean>;
   createAccessBinding(binding: AccessBinding): Promise<Readonly<AccessBinding>>;
   deleteAccessBinding(namespaceId: string, bindingId: string): Promise<boolean>;
+  createServicePrincipal(servicePrincipal: ServicePrincipal): Promise<Readonly<ServicePrincipal>>;
 }
 
 export interface IAMPolicyReadContext {
@@ -1113,6 +1173,12 @@ export interface IAMManagedAccessBindingInput {
   readonly roleId: string;
   readonly resourceKind: ManagedIAMResourceKind;
   readonly resourceId: string;
+}
+
+/** A non-Agent automation identity fixed to one Namespace; it carries no grant. */
+export interface IAMManagedServicePrincipalInput {
+  readonly id: string;
+  readonly namespaceId: string;
 }
 
 export interface ServiceAccountDriver extends Driver {
@@ -1228,6 +1294,12 @@ export interface SandboxDriver extends Driver {
   ensureNamespace?(context: SandboxNamespaceContext): Promise<void>;
   provisionHarness?(context: SandboxHarnessContext): Promise<SandboxResourceRef>;
   /**
+   * Returns the provider-owned transport for the exact provisioned Harness. When present,
+   * Compute must route the Agent Gateway through this endpoint instead of its native Harness
+   * Service. Implementations must fail closed until the endpoint is observable and exact.
+   */
+  harnessEndpoint?(context: SandboxHarnessContext): Promise<SandboxHarnessEndpoint>;
+  /**
    * The exact Sandbox `provisionHarness` creates for this revision, derived without effects.
    * Required to revoke credentials from a running revision.
    */
@@ -1326,6 +1398,13 @@ export interface NamespaceEnsureResult extends Scope {
   readonly namespaceId: string;
   readonly namespaceReady: boolean;
   readonly failure?: NamespaceLifecycleFailure;
+  /**
+   * Optional bounded, non-secret operator explanation of `failure`, at most 256 printable
+   * characters. It names only this Namespace's own placement, never another tenant's
+   * identifiers or marker values. The worker logs it; status and audit keep only `failure`.
+   * The log keeps only letters, digits, spaces and `. _ : / @ -`; other text is dropped.
+   */
+  readonly reason?: string;
 }
 
 export interface NamespaceDeleteResult extends Scope {
@@ -1374,6 +1453,20 @@ export interface ComputeReadiness extends Scope {
   /** Only on an unready observation; the worker ignores unknown values. */
   readonly pendingReason?: ComputePendingReason;
   readonly repositoryCredentialMaterialMissing?: readonly RepositoryCredentialMaterialRef[];
+}
+
+/** Safe operational context for one failed Compute preparation attempt. */
+export interface ComputePrepareRevisionFailureDiagnostic {
+  /** Stable Driver-owned reason code; never a provider response or credential value. */
+  readonly code: string;
+  /** Stable preparation stage that identifies the failed reconciliation boundary. */
+  readonly stage: string;
+  /** Reviewed error classification, not an arbitrary constructor or provider value. */
+  readonly errorClass?: string;
+  /** Optional bounded, non-secret operator explanation. */
+  readonly message?: string;
+  /** Optional dependency status code when it is safe and meaningful. */
+  readonly status?: number;
 }
 
 /** Authorized, server-admitted resource identities for an Agent-owned runtime. */
@@ -1670,6 +1763,12 @@ export interface ComputeDriver extends Driver {
     readonly apiKey: string;
   }): Promise<readonly { readonly id: string; readonly name: string }[]>;
   validateAgentProvisioning?(input: ComputeAgentProvisioningInput): void;
+  /**
+   * Side-effect-free deployment admission check of the caller's native gateway settings.
+   * Throws ComputeGatewaySettingError, naming the setting but never its value, for a setting
+   * every preparation attempt would refuse; other refusals stay with preparation.
+   */
+  validateGatewaySettings?(configuration: Readonly<OpenClawConfigurationDocument>): void;
   validateHarnessAuth?(
     harness: RevisionHarnessDescriptor,
     auth: HarnessAuthSnapshot,
@@ -1731,6 +1830,10 @@ export interface ComputeDriver extends Driver {
     revision: AgentRevision,
     context?: ComputeRevisionContext,
   ): Promise<ComputeReadiness>;
+  /** Maps a rejected preparation to bounded operational fields; never return raw errors. */
+  describePrepareRevisionFailure?(
+    error: unknown,
+  ): ComputePrepareRevisionFailureDiagnostic | undefined;
   activateRevision?(revision: AgentRevision, context?: ComputeRevisionContext): Promise<void>;
   deactivateRevision?(revision: AgentRevision): Promise<void>;
   stopRevision(revision: AgentRevision): Promise<void>;

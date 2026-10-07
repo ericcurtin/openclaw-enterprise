@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1047,9 +1048,16 @@ test("documentation workflow selects documentation checks and omits product test
     assert.ok(match, `workflow contains ${name}`);
     return match[1];
   };
-  const docs = job("docs-checks");
+  const docs = job("static-checks");
   assert.match(docs, /needs\.impact\.outputs\.mode == 'docs'/);
-  for (const command of ["format:check", "docs:check", "docs:build"]) {
+  for (const command of [
+    "check:workspace",
+    "lint",
+    "format:check",
+    "openapi:check",
+    "docs:check",
+    "docs:build",
+  ]) {
     assert.match(docs, new RegExp(`\\bpnpm ${command}\\b`));
   }
   // Keep the documentation route free of product-test and lane invocations.
@@ -1064,6 +1072,97 @@ test("documentation workflow selects documentation checks and omits product test
   const aggregate = required.split("      - name: Aggregate CI results\n")[1];
   assert.ok(aggregate, "required job contains aggregation");
   assert.match(aggregate, /if:.*needs\.impact\.outputs\.mode == 'full'/);
+});
+
+test("CI Required always reports and fails at once when a dependency was cancelled", () => {
+  const { loadYaml } = createRequire(
+    new URL("../../apps/controller/package.json", import.meta.url),
+  )("@kubernetes/client-node");
+  const workflow = loadYaml(readFileSync(join(repositoryRoot, ".github/workflows/ci.yml"), "utf8"));
+  const required = workflow.jobs["ci-required"];
+  // A skipped required job counts as passing, so failed dependencies must not skip it.
+  assert.equal(required.if, "always()");
+  // cancelled() is false in a job that starts after a cancellation, so the
+  // dependency results decide.
+  const cancelled = "contains(needs.*.result, 'cancelled')";
+  const [first, ...rest] = required.steps;
+  assert.equal(first.if, cancelled);
+  assert.match(first.run, /^exit 1$/m);
+  // A superseding run waits for this one; no later step may run once a dependency is cancelled.
+  for (const step of rest) {
+    const condition = String(step.if ?? "");
+    assert.doesNotMatch(condition, /always\(\)/, step.name ?? step.uses);
+    if (condition) {
+      // A status function keeps the step running after an earlier step failed.
+      assert.ok(condition.includes(`!cancelled() && !${cancelled}`), step.name ?? step.uses);
+    }
+  }
+});
+
+test("full-integration lanes read NODE_BASE_IMAGE from a variable their environment has", () => {
+  // Only the integration-model and integration-otel environments define NODE_BASE_IMAGE; every
+  // other lane reads the repository variable, or it can never start (finding 662).
+  const { loadYaml } = createRequire(
+    new URL("../../apps/controller/package.json", import.meta.url),
+  )("@kubernetes/client-node");
+  const source = readFileSync(
+    join(repositoryRoot, ".github/workflows/full-integration.yml"),
+    "utf8",
+  );
+  const workflow = loadYaml(source);
+  const lanes = Object.entries(workflow.jobs).filter(([, job]) => job.env?.NODE_BASE_IMAGE);
+  const repository = "${{ vars.CONTAINER_NODE_BASE_IMAGE }}";
+  const environment = "${{ vars.NODE_BASE_IMAGE }}";
+  for (const [lane, job] of lanes) {
+    const name = job.environment?.name ?? job.environment;
+    const allowed = ["integration-model", "integration-otel"].includes(name)
+      ? [repository, environment]
+      : [repository];
+    assert.ok(allowed.includes(job.env.NODE_BASE_IMAGE), lane);
+  }
+  // No workflow- or step-level read escapes the job check.
+  assert.equal(
+    source.split("vars.NODE_BASE_IMAGE").length - 1,
+    lanes.filter(([, job]) => job.env.NODE_BASE_IMAGE === environment).length,
+  );
+  const names = lanes.map(([name]) => name);
+  for (const lane of ["gateway-routing", "slack", "openshell"]) {
+    assert.ok(names.includes(lane), lane);
+  }
+});
+
+test("Static Checks runs every check the CI lanes skip", () => {
+  const { loadYaml } = createRequire(
+    new URL("../../apps/controller/package.json", import.meta.url),
+  )("@kubernetes/client-node");
+  const workflow = loadYaml(readFileSync(join(repositoryRoot, ".github/workflows/ci.yml"), "utf8"));
+  const action = loadYaml(
+    readFileSync(join(repositoryRoot, ".github/actions/run-ci-lane/action.yml"), "utf8"),
+  );
+  const lane = workflow.jobs["pr-safe"].steps.find(
+    (step) => step.uses === "./.github/actions/run-ci-lane",
+  );
+  assert.equal(lane.with["static-checks"], "false");
+  assert.equal(action.inputs["static-checks"].default, "true");
+  const skipped = action.runs.steps.filter((step) =>
+    String(step.if ?? "").includes("inputs.static-checks != 'false'"),
+  );
+  assert.deepEqual(
+    skipped.map((step) => step.run),
+    [
+      "pnpm check:workspace",
+      "pnpm lint",
+      "pnpm format:check",
+      "pnpm openapi:check",
+      "pnpm docs:install && pnpm docs:check && pnpm docs:build",
+    ],
+  );
+  // A check moved out of the lanes must still gate CI Required in every mode.
+  const runs = workflow.jobs["static-checks"].steps.map((step) => step.run);
+  for (const step of skipped) {
+    assert.ok(runs.includes(step.run), step.run);
+  }
+  assert.ok(workflow.jobs["ci-required"].needs.includes("static-checks"));
 });
 
 test("workflow selection flows through the gate and full-mode source-bound aggregate", (t) => {
@@ -1133,7 +1232,7 @@ test("workflow selection flows through the gate and full-mode source-bound aggre
     const needs = {
       impact: { result: "success", outputs: { mode } },
       audit: { result: "success", outputs: {} },
-      "docs-checks": { result: mode === "docs" ? "success" : "skipped", outputs: {} },
+      "static-checks": { result: "success", outputs: {} },
       "pr-safe": { result: mode === "docs" ? "skipped" : "success", outputs: {} },
       "runtime-image-fixture": { result: mode === "docs" ? "skipped" : "success", outputs: {} },
     };
@@ -1155,9 +1254,9 @@ test("workflow selection flows through the gate and full-mode source-bound aggre
       for (const lane of lanes) {
         assert.notEqual(output[lane]?.result, "success", lane);
       }
-      needs["docs-checks"].result = "failure";
+      needs["static-checks"].result = "failure";
       assert.notEqual(runGate().status, 0);
-      needs["docs-checks"].result = "success";
+      needs["static-checks"].result = "success";
       needs["pr-safe"].result = "success";
       assert.notEqual(runGate().status, 0);
       continue;
@@ -2154,8 +2253,12 @@ test("workflow runs selected lanes in tests mode and gates them by the verified 
     job("runtime-image-fixture"),
     /needs\.impact\.outputs\.mode == 'tests' && needs\.impact\.outputs\.fixture == 'true'/,
   );
-  // Documentation checks, the smoke and the advisory job stay off in tests mode.
-  assert.match(job("docs-checks"), /if: \$\{\{ needs\.impact\.outputs\.mode == 'docs' \}\}/);
+  // Static checks (lint, format, OpenAPI, docs) run in every mode; the smoke
+  // and the advisory job stay off in tests mode.
+  assert.match(
+    job("static-checks"),
+    /if: \$\{\{ needs\.impact\.outputs\.mode == 'docs' \|\| needs\.impact\.outputs\.mode == 'full' \|\| needs\.impact\.outputs\.mode == 'tests' \}\}/,
+  );
   for (const name of ["first-agent-smoke", "affected-packages"]) {
     assert.doesNotMatch(job(name), /'tests'/, name);
   }
@@ -2191,7 +2294,7 @@ test("tests mode flows through the gate to a source-bound aggregate of only its 
   const needs = {
     impact: { result: "success", outputs: { mode: "tests", lanes } },
     audit: { result: "success", outputs: {} },
-    "docs-checks": { result: "skipped", outputs: {} },
+    "static-checks": { result: "success", outputs: {} },
     "pr-safe": { result: "success", outputs: {} },
     "runtime-image-fixture": { result: "skipped", outputs: {} },
   };

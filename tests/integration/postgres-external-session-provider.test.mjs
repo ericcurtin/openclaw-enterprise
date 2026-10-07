@@ -1,15 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import pg from "pg";
-import { PostgresPlatformState } from "../../packages/occ/src/index.ts";
 import {
-  bootstrapProductionInstallation,
+  assertProviderAttached,
   clientAddresses,
   composeProductionSignIn,
   consoleOrigin as origin,
   currentSession,
-  defaultInstallSettings,
   fakeGoogle,
   fakeOidc,
   fixtureOidcIssuer,
@@ -17,10 +14,11 @@ import {
   githubUpgradeSettings,
   googleSignIn,
   googleUpgradeSettings,
-  installationRoles,
   oidcSignIn,
   oidcUpgradeSettings,
+  onboardPasswordAccounts,
   passwordSignIn,
+  postgresSignInState,
   readAccount,
   signedInHeaders,
   startFakeGitHub,
@@ -77,13 +75,8 @@ test(
   "PostgreSQL sessions end when their external provider instance is no longer configured",
   requiresPostgres,
   async (t) => {
-    const pool = new pg.Pool({ connectionString: databaseUrl });
-    const state = new PostgresPlatformState(pool);
     let app;
-    t.after(async () => {
-      await app?.close();
-      await pool.end();
-    });
+    const { pool, state } = postgresSignInState(t, () => [app]);
     await startFakeGitHub(t);
     const google = fakeGoogle(t, {
       clientId: googleClientId,
@@ -91,32 +84,21 @@ test(
     });
     const idp = fakeOidc(t, { clientId: oidcClientId, clientSecret: oidcClientSecret });
     const address = clientAddresses("198.23");
-    const adminPassword = await bootstrapProductionInstallation(t, {
+    const {
+      admin,
+      accounts: { member },
+    } = await onboardPasswordAccounts(t, {
       databaseUrl,
+      state,
+      pool,
       email: adminEmail,
       authSecret,
-    });
-    const admin = { email: adminEmail, password: adminPassword };
-    const roles = await installationRoles(state, pool);
-
-    app = await composeProductionSignIn(t, {
-      databaseUrl,
-      settings: defaultInstallSettings,
       secrets,
+      password,
+      remoteAddress: address(),
+      accounts: { member: { email: "session-provider-member@example.test" } },
     });
-    let adminHeaders = await signedInHeaders(app, origin, admin, address());
-    admin.id = (await currentSession(app, adminHeaders.cookie)).user.id;
-    const member = { email: "session-provider-member@example.test", password };
-    const created = await app.inject({
-      method: "POST",
-      url: "/api/auth/accounts",
-      headers: adminHeaders,
-      payload: { ...member, roleId: roles.reader.id },
-    });
-    assert.equal(created.statusCode, 201, created.body);
-    member.id = created.json().data.id;
-    await app.close();
-    app = undefined;
+    let adminHeaders;
 
     async function restart(options = {}, overrides = {}) {
       await app?.close();
@@ -197,16 +179,7 @@ test(
       await restart();
       adminHeaders = await signedInHeaders(app, origin, admin, address());
       for (const provider of ["github", "google", "oidc"]) {
-        const attached = await app.inject({
-          method: "POST",
-          url: `/api/auth/accounts/${member.id}/providers/${provider}`,
-          headers: adminHeaders,
-          payload: {
-            subject: subjects[provider],
-            expectedVersion: (await readAccount(app, adminHeaders, member.id)).version,
-          },
-        });
-        assert.equal(attached.statusCode, 200, attached.body);
+        await assertProviderAttached(app, adminHeaders, member.id, provider, subjects[provider]);
       }
       const methods = (await readAccount(app, adminHeaders, member.id)).methods
         .map(({ providerId }) => providerId)

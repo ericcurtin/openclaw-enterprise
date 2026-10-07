@@ -15,6 +15,8 @@ let namespaceId = null;
 let observabilityUrl = null;
 // Session owner whose Installation-admin observability read has settled.
 let observabilityOwner = null;
+// The Installation-access probe still being answered, for the session owner that sent it.
+let installationAccessProbe = null;
 // Whether that owner administers the Installation: true, false, or null when unknown.
 let installationAdmin = null;
 const installationAccessStorageKey = "occ.console.installationAccess";
@@ -201,6 +203,48 @@ function recalledInstallationAccess(owner) {
     // Unreadable tab storage falls back to a fresh probe.
   }
   return null;
+}
+
+// One probe per session owner, shared by every page load until it settles. A navigation
+// joins the probe in flight instead of aborting it and asking again: the API has usually
+// already answered, and audited a denial, by then. A settled answer is kept even when the
+// view that asked is gone, as long as the same session owner is signed in.
+function probeInstallationAccess(owner) {
+  if (owner && installationAccessProbe?.owner === owner) {
+    return installationAccessProbe.answer;
+  }
+  const probe = { owner };
+  probe.answer = request("/observability", { outlivesView: true })
+    .then(
+      (data) => ({
+        url: typeof data?.url === "string" ? data.url : null,
+        admin: true,
+        settled: true,
+      }),
+      (error) => {
+        if (error.status === 401) {
+          throw error;
+        }
+        const denied = error.status === 403;
+        return { url: null, admin: denied ? false : null, settled: denied };
+      },
+    )
+    .then((answer) => {
+      if (owner && answer.settled && sessionOwnerKey(session) === owner) {
+        observabilityUrl = answer.url;
+        installationAdmin = answer.admin;
+        observabilityOwner = owner;
+        rememberInstallationAccess(owner, answer.admin, answer.url);
+      }
+      return answer;
+    })
+    .finally(() => {
+      if (installationAccessProbe === probe) {
+        installationAccessProbe = null;
+      }
+    });
+  installationAccessProbe = owner ? probe : null;
+  return probe.answer;
 }
 
 function forgetInstallationAccess() {
@@ -489,6 +533,7 @@ function clearPrivate() {
   namespaceId = null;
   observabilityUrl = null;
   observabilityOwner = null;
+  installationAccessProbe = null;
   installationAdmin = null;
   clearRetainedViews();
 }
@@ -864,20 +909,7 @@ async function loadPage({ fromNavigation = false, reuseView = fromNavigation } =
         ? null
         : recalled
           ? { ...recalled, settled: true }
-          : request("/observability").then(
-              (data) => ({
-                url: typeof data?.url === "string" ? data.url : null,
-                admin: true,
-                settled: true,
-              }),
-              (error) => {
-                if (error.status === 401) {
-                  throw error;
-                }
-                const denied = error.status === 403;
-                return { url: null, admin: denied ? false : null, settled: denied };
-              },
-            ),
+          : probeInstallationAccess(owner),
     ]);
     if (!lifetime.isCurrent(active)) {
       return;
@@ -892,9 +924,6 @@ async function loadPage({ fromNavigation = false, reuseView = fromNavigation } =
       observabilityUrl = observability.url;
       installationAdmin = observability.admin;
       observabilityOwner = observability.settled ? owner : null;
-      if (owner && observability.settled && !recalled) {
-        rememberInstallationAccess(owner, observability.admin, observability.url);
-      }
     }
     namespaceId =
       current.namespace ??

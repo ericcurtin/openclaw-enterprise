@@ -23,9 +23,10 @@ Use `ghcr.io/openclaw/openclaw-enterprise-controller:latest` and
 `CONTROLLER_IMAGE` and `RUNTIME_IMAGE` and selects the matching checkout and
 chart. Complete it before generating configuration; then skip the build section.
 
-Public GHCR pulls need no pull Secret. For private registry copies, configure
-pull credentials for control-plane and tenant Pods; workstation `docker login`
-does not authenticate cluster nodes.
+Public GHCR pulls need no pull Secret. For private registry copies, give every node
+that runs control-plane or tenant Pods its own pull access; see
+[private registry delivery](private-registry-images.md#configure-node-pull-access).
+Workstation `docker login` does not authenticate cluster nodes.
 
 ## Build and publish production images
 
@@ -95,7 +96,8 @@ under `/secure/occ`.
 
 To reuse profile output or verified YAML from
 [local operations](local-operations.md#build-images-for-local-kubernetes), set
-`OCC_INPUT_DIRECTORY` to it, skip both generation branches, and continue with the
+`OCC_INPUT_DIRECTORY` to it, copy the cluster kubeconfig there as `kubeconfig`
+with mode `0600`, skip both generation branches, and continue with the
 [shared checks](#shared-bootstrap-pvc-and-configuration-checks).
 
 ```bash
@@ -114,7 +116,8 @@ Kubernetes older than 1.35 is unsupported; the API and worker emit
 ### Recommended: generate profile configuration
 
 Choose `openclaw` or `codex` from the [profile options](installation-profiles.md#choose-a-profile).
-Generation requires Node.js 24+ on the operator host. Manual YAML does not, but
+Generation requires Node.js 24+ on the operator host (and `pnpm install` with
+native admin). Manual YAML does not, but
 the later Agent transport-provisioning example does; without Node, provision
 transports in the console.
 
@@ -194,7 +197,14 @@ before running the checks:
 - `values.yaml`: set auth URL, admin email, database and cluster CIDRs,
   control-plane node selector, database CA, DNS, API clients, and bootstrap
   password claim. Keep native admin enabled for the password profile, and gateway
-  routing enabled with the reviewed GatewayClass and Secret names.
+  routing enabled with the reviewed GatewayClass and Secret names. Helm refuses an
+  `auth.baseUrl` that is not an `https` origin (`http` only for `localhost` or
+  `127.0.0.1`), has a path other than `/`, a query, fragment or user info (even a
+  bare `?` or `#`), or contains Unicode spaces or invisible characters (ASCII
+  spaces at either end are ignored) or compatibility forms the API's URL parser
+  refuses, such as full-width `？`. A joiner (U+200C, U+200D) in a position IDNA
+  does not allow passes Helm but fails the bootstrap Job. With native admin, it
+  must be `https` and its host inside `agentNativeAdmin.sharedCookieDomain`.
 - `installation.yaml`: set cluster name, log level, DNS selectors,
   service-principal token settings, Secret prefixes, runtime storage class,
   immutable runtime image digests, and PluginDriver catalog. Set
@@ -225,7 +235,8 @@ yq e -e '.auth.baseUrl != "" and .bootstrap.adminEmail != "" and
   (.api.clients | length > 0) and .gatewayRouting.enabled == true and
   .gatewayRouting.gatewayClassName != "" and
   .gatewayRouting.apiKeySecretName != "" and (.agentNativeAdmin.enabled == true or
-  .auth.github.enabled == true or .auth.google.enabled == true)' \
+  .auth.github.enabled == true or .auth.google.enabled == true or
+  .auth.oidc.enabled == true)' \
   "$OCC_INPUT_DIRECTORY/values.yaml" >/dev/null
 yq e -e '.drivers.compute.configuration.images.requireImmutableDigest == true and
   (.drivers.compute.configuration.images.gateway | test("@sha256:[a-f0-9]{64}$")) and
@@ -452,7 +463,8 @@ including its [model-response check](production-agents.md#verify-production-work
 
 ## Enable GitHub browser sign-in
 
-The published controller lacks GitHub sign-in; [build a compatible image](#build-and-publish-production-images).
+Use a controller image that includes GitHub sign-in: a [published image](#use-published-images)
+from a revision that has it, or [your own build](#build-and-publish-production-images).
 Follow the [single-controller profile](../../reference/authentication/external-sign-in.md#github-sign-in-for-existing-accounts)
 during stopped maintenance, after first installing without GitHub as above.
 

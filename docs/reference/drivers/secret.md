@@ -82,8 +82,12 @@ so when the commit outcome is unknown. Updates overwrite the backend value: OCC
 keeps no prior value for rollback, and success means stored, not delivered.
 Deletion is refused with `409` while a Configuration, credential source, Agent
 draft, active revision, pending deployment, or queued or running Agent
-provisioning request still references the Secret; the message lists these
-kinds, not the specific resources. A failed provisioning request does not block
+provisioning request still references the Secret. The message names each
+referencing resource the caller may read, by kind and ID, as many as fit the
+256-character message, and only counts the others. The exact Secret read lists
+the same references as `consumers`; see
+[Find a Secret's consumers](kubernetes-secret.md#find-a-secrets-consumers).
+A failed provisioning request does not block
 deletion; reading or retrying it then names the deleted Secret. Otherwise OCC calls the
 Driver before removing its own record.
 
@@ -110,8 +114,8 @@ model API keys go only to the Harness that executes the model.
 - No public value reads, version history, rollback, credential issuance, or general
   per-access broker. Environment projection is the supported workload delivery
   mechanism; plugin discovery uses the transient server-side callback.
-- Updating a Secret does not restart workloads. Redeploy or restart consumers
-  before expecting a new value to appear in their environment.
+- Updating a Secret does not restart workloads. Redeploy consumers through OCE
+  to refresh revision projections before expecting a new environment value.
 - Kubernetes is the only selectable implementation. Arbitrary installed Secret
   packages and SSH delivery are unsupported; selection alone does not enable them.
 

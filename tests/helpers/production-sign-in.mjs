@@ -1,7 +1,9 @@
+import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
+import pg from "pg";
 import { composeProduction } from "../../apps/controller/src/composition/production.ts";
 import { loadInstallationConfiguration } from "../../apps/controller/src/composition/installation-config.ts";
 import {
@@ -10,6 +12,7 @@ import {
 } from "../../apps/controller/src/auth/index.ts";
 import { createOccLogger } from "../../apps/controller/src/logging.ts";
 import { NativeIAMDriver } from "../../packages/iam/src/index.ts";
+import { PostgresPlatformState } from "../../packages/occ/src/index.ts";
 import { createInstallationDriverConfiguration } from "./installation-driver-configuration.mjs";
 import { createTestConfigurationDriver } from "./configuration-driver.mjs";
 import { createTestSecretDriver } from "./secret-driver.mjs";
@@ -19,32 +22,17 @@ import {
   runBootstrapInstallation,
 } from "./bootstrap-installation.mjs";
 import { cookieHeaderFromSetCookie } from "./auth-session.mjs";
+import { createReadyComputeDriver } from "./development.mjs";
 import { idTokenSigner, rsaSigningKey } from "./id-token.mjs";
+import { databaseUrl as testDatabaseUrl } from "./postgres-database.mjs";
 
 // Only Compute is passive: no Agent is deployed, so sign-in proofs need no cluster.
 // Authentication, State, IAM, audit and Fastify are the production implementations.
 function passiveComputeDriver(id) {
-  return {
-    id,
-    capability: "compute",
+  return createReadyComputeDriver(id, {
     implementation: "sign-in-proof-memory-compute",
     async preflight() {},
-    async ensureNamespace(namespace) {
-      return { namespaceId: namespace.id, namespaceReady: true };
-    },
-    async deleteNamespace(namespace) {
-      return { namespaceId: namespace.id, namespaceDeleted: true };
-    },
-    async prepareRevision(revision) {
-      return {
-        namespaceId: revision.namespaceId,
-        agentId: revision.agentId,
-        revisionId: revision.id,
-        ready: true,
-      };
-    },
-    async retireRevision() {},
-  };
+  });
 }
 
 /** Runs the chart's initialization Job command and returns the generated administrator password. */
@@ -86,6 +74,7 @@ export function memoryLogger() {
 }
 
 export const consoleOrigin = "https://console.oce.example.internal";
+export const sessionCookieName = "__Host-openclaw_occ.session_token";
 const gatewayApiKeyPath = "/etc/openclaw/gateway-api-key/key";
 const secretRef = (name, key) => ({ secretKeyRef: { name, key } });
 
@@ -302,6 +291,80 @@ export async function currentSession(app, cookie) {
   return (await app.inject({ url: "/api/auth/session", headers: { cookie } })).json().data;
 }
 
+/** Asserts that a sign-in response's cookie is a session for `userId`; returns the cookie header. */
+export async function assertSessionUser(app, response, userId) {
+  const cookie = cookieHeaderFromSetCookie(response.headers["set-cookie"]);
+  assert.equal((await currentSession(app, cookie)).user.id, userId);
+  return cookie;
+}
+
+/** Asserts that a provider callback lands on the Console signed in as `userId`; returns the cookie header. */
+export async function assertConsoleSignIn(app, callback, userId) {
+  assert.equal(callback.headers.location, "/console/", callback.body);
+  return assertSessionUser(app, callback, userId);
+}
+
+/** Audited login denials with `reason`, only those for `provider` when one is given. */
+export async function loginDenialCount(state, reason, provider) {
+  return (await state.transact((unit) => unit.audit.list())).filter(
+    ({ action, outcome, reasonCode, details }) =>
+      action === "authentication.login" &&
+      outcome === "denied" &&
+      reasonCode === reason &&
+      (provider === undefined || details?.provider === provider),
+  ).length;
+}
+
+/**
+ * Asserts that an external provider's callback was refused: a redirect to the Console with
+ * `authError=<provider>`, no session cookie, no new user, method or session row, and one more
+ * login denial with `reason`. `signIn()` resolves to `{ callback }`; `denials(reason)` resolves
+ * to the number of matching denials so far (usually `loginDenialCount`).
+ */
+export async function assertExternalSignInRefused(
+  { pool, provider, denials, signIn },
+  message,
+  reason = "EXTERNAL_IDENTITY_REJECTED",
+  consoleReason = undefined,
+) {
+  const before = await authRowCounts(pool);
+  const deniedBefore = await denials(reason);
+  const { callback } = await signIn();
+  assert.equal(callback.statusCode, 302, message);
+  assert.equal(
+    callback.headers.location,
+    consoleReason === undefined
+      ? `/console/?authError=${provider}`
+      : `/console/?authError=${provider}&authReason=${consoleReason}`,
+    message,
+  );
+  assert.equal(
+    String(callback.headers["set-cookie"] ?? "").includes(sessionCookieName),
+    false,
+    `${message}: no session cookie`,
+  );
+  assert.deepEqual(await authRowCounts(pool), before, `${message}: no user, method or session`);
+  assert.equal(await denials(reason), deniedBefore + 1, `${message}: the denial is audited`);
+}
+
+/**
+ * A pool and PlatformState on the test database for one sign-in test. After the test, each
+ * object `closeFirst()` returns (an app, or anything with `close()`) closes in order, then
+ * the pool ends.
+ * `let app; const { pool, state } = postgresSignInState(t, () => [app]);`
+ */
+export function postgresSignInState(context, closeFirst = () => []) {
+  const pool = new pg.Pool({ connectionString: testDatabaseUrl });
+  const state = new PostgresPlatformState(pool);
+  context.after(async () => {
+    for (const closable of closeFirst()) {
+      await closable?.close();
+    }
+    await pool.end();
+  });
+  return { pool, state };
+}
+
 /** Distinct client addresses, so a suite's many sign-ins never meet the per-address limit. */
 export function clientAddresses(prefix = "198.18") {
   let next = 0;
@@ -336,8 +399,26 @@ export async function installationRoles(state, pool) {
 }
 
 /**
- * A local stand-in for github.com and api.github.com. The controller's fixed provider
- * endpoints are redirected here by mocking fetch, as postgres-github-sign-in.test.mjs does.
+ * Listens `server` on loopback and, for the rest of test `t`, mocks fetch so the controller's
+ * fixed github.com and api.github.com endpoints reach it; other origins pass through. The
+ * caller owns closing `server`. Returns the server's origin.
+ */
+export async function serveAsGitHub(t, server) {
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const providerOrigin = `http://127.0.0.1:${server.address().port}`;
+  const originalFetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.origin === "https://github.com" || url.origin === "https://api.github.com") {
+      return originalFetch(new URL(url.pathname + url.search, providerOrigin), init);
+    }
+    return originalFetch(input, init);
+  });
+  return providerOrigin;
+}
+
+/**
+ * A local stand-in for github.com and api.github.com, served through `serveAsGitHub`.
  * The authorization code names the GitHub subject: `subject-<id>`; its login is
  * `fixture-<id>`. Modes: "up", "error" (503) and "hang" (never answers). Set
  * `fixture.membership(path, subject)` to answer the allowlist's membership lookups with
@@ -374,6 +455,7 @@ export async function startFakeGitHub(t) {
         ),
       );
     } else if (request.url === "/user") {
+      // Strict on purpose: suites rely on this 401 to catch a wrong Authorization header.
       const subject = /^Bearer ghu_fixture_([0-9]+)$/.exec(request.headers.authorization ?? "");
       if (subject === null) {
         response.writeHead(401);
@@ -395,16 +477,7 @@ export async function startFakeGitHub(t) {
       response.end("{}");
     }
   });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const providerOrigin = `http://127.0.0.1:${server.address().port}`;
-  const originalFetch = globalThis.fetch;
-  t.mock.method(globalThis, "fetch", (input, init) => {
-    const url = new URL(input instanceof Request ? input.url : input);
-    if (url.origin === "https://github.com" || url.origin === "https://api.github.com") {
-      return originalFetch(new URL(url.pathname + url.search, providerOrigin), init);
-    }
-    return originalFetch(input, init);
-  });
+  await serveAsGitHub(t, server);
   t.after(async () => {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
@@ -730,6 +803,108 @@ export async function oidcSignIn(app, origin, idp, authorization, remoteAddress 
     headers: { cookie: bindingCookie },
   });
   return { start, callback, attemptId, url, state, bindingCookie };
+}
+
+/**
+ * Creates a password account through the administrator route, bound to `roleId` when given.
+ * Returns `{ id, email, password }`, which signs in with passwordSignIn.
+ */
+export async function createAccount(app, headers, { email, password, roleId }) {
+  const response = await app.inject({
+    method: "POST",
+    url: "/api/auth/accounts",
+    headers,
+    payload: { email, password, ...(roleId === undefined ? {} : { roleId }) },
+  });
+  if (response.statusCode !== 201) {
+    throw new Error(`Account creation failed with ${response.statusCode}: ${response.body}`);
+  }
+  return { id: response.json().data.id, email, password };
+}
+
+/**
+ * The password onboarding each external sign-in proof starts from. Bootstraps a production
+ * Installation, composes its default password install, signs the recovery administrator in
+ * (from `remoteAddress` when given) and creates one password account per `accounts` entry,
+ * then closes that app. `accounts` maps a name to its email and its Installation Role from
+ * installationRoles: "reader" (the default) or "admin". Every account uses `password`.
+ * Returns `{ admin: { email, password, id }, roles, accounts: { [name]: { id, email, password } } }`.
+ */
+export async function onboardPasswordAccounts(
+  context,
+  {
+    databaseUrl,
+    state,
+    pool,
+    email,
+    authSecret,
+    secrets,
+    password,
+    accounts = {},
+    remoteAddress,
+    passwordSlowLaneFloors,
+  },
+) {
+  const admin = {
+    email,
+    password: await bootstrapProductionInstallation(context, { databaseUrl, email, authSecret }),
+  };
+  const roles = await installationRoles(state, pool);
+  const app = await composeProductionSignIn(context, {
+    databaseUrl,
+    settings: defaultInstallSettings,
+    secrets,
+    passwordSlowLaneFloors,
+  });
+  try {
+    const headers = await signedInHeaders(app, consoleOrigin, admin, remoteAddress);
+    admin.id = (await currentSession(app, headers.cookie)).user.id;
+    const created = {};
+    for (const [name, account] of Object.entries(accounts)) {
+      const roleName = account.role ?? "reader";
+      const role = Object.hasOwn(roles, roleName) ? roles[roleName] : undefined;
+      if (role === undefined) {
+        throw new Error(`Unknown Installation Role ${account.role} for ${name}.`);
+      }
+      created[name] = await createAccount(app, headers, {
+        email: account.email,
+        password,
+        roleId: role.id,
+      });
+    }
+    return { admin, roles, accounts: created };
+  } finally {
+    await app.close();
+  }
+}
+
+/** Attaches a provider subject to an account at its current version; returns the response. */
+export async function attachProvider(app, headers, userId, provider, subject) {
+  const { version } = await readAccount(app, headers, userId);
+  return app.inject({
+    method: "POST",
+    url: `/api/auth/accounts/${userId}/providers/${provider}`,
+    headers,
+    payload: { subject, expectedVersion: version },
+  });
+}
+
+/** Attaches a provider subject like attachProvider and asserts that the attach succeeded. */
+export async function assertProviderAttached(app, headers, userId, provider, subject) {
+  const response = await attachProvider(app, headers, userId, provider, subject);
+  assert.equal(response.statusCode, 200, response.body);
+  return response;
+}
+
+/** Rows that sign-in creates: users, their sign-in methods (occ.account) and sessions. */
+export async function authRowCounts(pool) {
+  return (
+    await pool.query(
+      `SELECT (SELECT count(*)::int FROM occ."user") AS users,
+              (SELECT count(*)::int FROM occ.account) AS methods,
+              (SELECT count(*)::int FROM occ.session) AS sessions`,
+    )
+  ).rows[0];
 }
 
 /** The guarded account read an administrator uses for expectedVersion. */

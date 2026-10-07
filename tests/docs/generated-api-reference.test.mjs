@@ -86,6 +86,18 @@ test("generated API reference stays on the approved single page", async () => {
   }
 });
 
+test("every operation with a request body documents 413 and 415", async () => {
+  // The controller answers an oversized body 413 and a non-JSON media type 415 on every
+  // route that reads a body; updateCredentialSource and the /api/auth/* operations
+  // documented neither.
+  const document = JSON.parse(await readFile(contractPath, "utf8"));
+  const missing = contractOperations(document)
+    .filter((operation) => operation.requestBody !== undefined)
+    .filter((operation) => !("413" in operation.responses && "415" in operation.responses))
+    .map((operation) => operation.operationId);
+  assert.deepEqual(missing, []);
+});
+
 test("AccessBinding creation documents request body target read permissions", async () => {
   const document = JSON.parse(await readFile(contractPath, "utf8"));
   const operation =
@@ -193,5 +205,42 @@ test("OpenAPI check rejects unexpected generated API child pages in an isolated 
   assert.match(
     result.stderr + result.stdout,
     /Unexpected generated API reference file: docs\/reference\/api\/unexpected-ci-check\.md/,
+  );
+});
+
+test("operations without a request body do not list 413 or 415", async () => {
+  // The reference introduction says when any request answers 413 or 415; an operation
+  // lists them only when it takes a body. Three bodiless operations listed them.
+  const document = JSON.parse(await readFile(contractPath, "utf8"));
+  const listed = contractOperations(document)
+    .filter((operation) => operation.requestBody === undefined)
+    .filter((operation) => "413" in operation.responses || "415" in operation.responses)
+    .map((operation) => operation.operationId);
+  assert.deepEqual(listed, []);
+});
+
+test("every operation with a request body documents 400", async () => {
+  // Every body is validated against its operation's schema before the handler runs. Eleven
+  // /api/auth/* operations, whose schemas are inline rather than in the shared route
+  // contract, once omitted the 400 that validation answers.
+  const document = JSON.parse(await readFile(contractPath, "utf8"));
+  const missing = contractOperations(document)
+    .filter((operation) => operation.requestBody !== undefined)
+    .filter((operation) => !("400" in operation.responses))
+    .map((operation) => operation.operationId);
+  assert.deepEqual(missing, []);
+});
+
+test("the error envelope table documents the shared ErrorResponse, not an inline copy", async () => {
+  // Inline /api/auth/* error schemas also carry `details` so schema 400s keep their field
+  // pointers. The reference introduction must still describe the shared envelope's codes
+  // and limits, which those inline copies do not repeat.
+  const document = JSON.parse(await readFile(contractPath, "utf8"));
+  const page = generateApiReferenceOutputs(document)[0].content;
+  const section = page.slice(page.indexOf("## Error responses"), page.indexOf("## Resources"));
+  assert.match(section, /^\| `error\.code` \| `"INVALID_REQUEST" or /m);
+  assert.match(
+    section,
+    /^\| `error\.message` \| `string` \| Yes \| min length: 1; max length: 256 \|$/m,
   );
 });

@@ -1,3 +1,5 @@
+{{- /* One IPv4 host. Go's ParseCIDR rejects an octet above 255 and a leading zero. */ -}}
+{{- define "openclaw.ipv4Host32" -}}^(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])){3}/32${{- end -}}
 {{- define "openclaw.validate" -}}
 {{- if hasKey .Values "integrations" -}}{{- fail "integrations is retired; configure ChatGPT packaging under backend.chatgpt" -}}{{- end -}}
 {{- if hasKey .Values "workspaceFiles" -}}{{- fail "workspaceFiles is retired; configure private Envoy Gateway routing under gatewayRouting" -}}{{- end -}}
@@ -140,13 +142,26 @@ an allowlist without its provider is refused: the API treats it as a startup err
 {{- if or $proxy.cidrs $proxy.clientAddressHeader -}}{{- fail "api.trustedProxy.cidrs and clientAddressHeader require api.trustedProxy.preset" -}}{{- end -}}
 {{- else -}}
 {{- if or (not (kindIs "slice" $proxy.cidrs)) (not $proxy.cidrs) -}}{{- fail (printf "api.trustedProxy.preset %s requires api.trustedProxy.cidrs: the proxy addresses the API Pod sees as the connecting peer" $preset) -}}{{- end -}}
+{{- /* The API parses these with Node isIP and refuses a zero prefix. ::ffff:d.d.d.d is rewritten to IPv4, so that form uses a prefix of 1 through 32. */ -}}
 {{- range $cidr := $proxy.cidrs -}}
 {{- $value := toString $cidr -}}
 {{- if regexMatch "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([1-9]|[12][0-9]|3[0-2])$" $value -}}
 {{- range $octet := splitList "." (first (splitList "/" $value)) -}}
-{{- if gt (int $octet) 255 -}}{{- fail "api.trustedProxy.cidrs contains an invalid IPv4 address" -}}{{- end -}}
+{{- if or (gt (int $octet) 255) (and (gt (len $octet) 1) (hasPrefix "0" $octet)) -}}{{- fail "api.trustedProxy.cidrs contains an invalid IPv4 address" -}}{{- end -}}
 {{- end -}}
-{{- else if not (regexMatch "^[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*/([1-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$" $value) -}}
+{{- else if regexMatch "^[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*/([1-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$" $value -}}
+{{- $addr := first (splitList "/" $value) -}}
+{{- $prefix := int (last (splitList "/" $value)) -}}
+{{- /* A dotted tail has to end the address. Replacing it with 0:0 leaves one hex grammar: at most one ::, then fewer than 8 groups, or exactly 8 without it. */ -}}
+{{- $tail := regexFind ":(?:0|[1-9][0-9]{0,2})(?:\\.(?:0|[1-9][0-9]{0,2})){3}$" $addr -}}
+{{- range $octet := splitList "." (default ":0.0.0.0" $tail | trimPrefix ":") -}}
+{{- if gt (int $octet) 255 -}}{{- fail "api.trustedProxy.cidrs contains an invalid IPv6 address" -}}{{- end -}}
+{{- end -}}
+{{- $hex := ternary (printf "%s:0:0" (trimSuffix $tail $addr)) $addr (ne $tail "") -}}
+{{- $groups := len (regexFindAll "[0-9A-Fa-f]+" $hex -1) -}}
+{{- if or (not (regexMatch "^(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?:::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)?$" $hex)) (ternary (gt $groups 7) (ne $groups 8) (contains "::" $hex)) -}}{{- fail "api.trustedProxy.cidrs contains an invalid IPv6 address" -}}{{- end -}}
+{{- if and (regexMatch "^(?i)::ffff:(?:0|[1-9][0-9]{0,2})(?:\\.(?:0|[1-9][0-9]{0,2})){3}$" $addr) (gt $prefix 32) -}}{{- fail "api.trustedProxy.cidrs contains an IPv4-mapped address, whose prefix must be 1 through 32" -}}{{- end -}}
+{{- else -}}
 {{- fail "api.trustedProxy.cidrs requires IPv4 or IPv6 CIDRs with a nonzero prefix" -}}
 {{- end -}}
 {{- include "openclaw.trustedProxy.validateCidrRange" $value -}}
@@ -176,6 +191,11 @@ an allowlist without its provider is refused: the API treats it as a startup err
 {{- /* The bootstrap Job, in production, refuses plain HTTP unless the host is 127.0.0.1 or localhost. Other spellings of 127.0.0.1 (127.1, 0177.0.0.1, a trailing dot) are refused here. */ -}}
 {{- if and (ne $baseUrl.scheme "https") (not (has (lower $baseUrl.hostname) (list "127.0.0.1" "localhost"))) -}}{{- fail "auth.baseUrl must use HTTPS unless its host is 127.0.0.1 or localhost; the bootstrap Job refuses plain HTTP elsewhere" -}}{{- end -}}
 {{- if not .Values.bootstrap.adminEmail -}}{{- fail "bootstrap.adminEmail must identify the first administrator account" -}}{{- end -}}
+{{- /* The bootstrap Job checks installation.name with isName before it creates anything. */ -}}
+{{- $installationName := toString .Values.installation.name -}}
+{{- if or (ne $installationName (trim $installationName)) (hasPrefix "\uFEFF" $installationName) (hasSuffix "\uFEFF" $installationName) (not (regexMatch "^[^\\x00-\\x1f\\x7f-\\x9f\\x{2028}\\x{2029}]{1,200}$" $installationName)) -}}
+{{- fail "installation.name must follow the Name rule: 1 to 200 characters, with no leading or trailing whitespace and no control characters or line or paragraph separators" -}}
+{{- end -}}
 {{- if or (not .Values.bootstrap.password.claimName) (not .Values.bootstrap.password.mountPath) (not .Values.bootstrap.password.fileName) -}}
 {{- fail "bootstrap.password must reference an existing protected PVC output path" -}}
 {{- end -}}
@@ -189,6 +209,10 @@ an allowlist without its provider is refused: the API treats it as a startup err
 {{- end -}}
 {{- if eq .Values.bootstrap.password.fileName .Values.bootstrap.serviceKey.fileName -}}
 {{- fail "bootstrap service key and password output file names must be distinct" -}}
+{{- end -}}
+{{- /* The server reads OCC_PORT with decimal Number(); Kubernetes YAML reads an unquoted leading zero as octal. */ -}}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString .Values.api.port))) (gt (int .Values.api.port) 65535) -}}
+{{- fail "api.port must be an integer TCP port from 1 to 65535" -}}
 {{- end -}}
 {{- if not .Values.api.clients -}}{{- fail "api.clients must contain exact approved client selectors" -}}{{- end -}}
 {{- range $index, $client := .Values.api.clients -}}
@@ -206,7 +230,7 @@ an allowlist without its provider is refused: the API treats it as a startup err
 {{- fail (printf "%s.cidrs must contain at least one explicit IPv4 /32 host" $name) -}}
 {{- end -}}
 {{- range $index, $cidr := $cidrs -}}
-{{- if not (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/32$" $cidr) -}}
+{{- if not (regexMatch (include "openclaw.ipv4Host32" .) $cidr) -}}
 {{- fail (printf "%s.cidrs[%d] must identify exactly one IPv4 host with /32" $name $index) -}}
 {{- end -}}
 {{- end -}}
@@ -251,7 +275,7 @@ an allowlist without its provider is refused: the API treats it as a startup err
 {{- if or (gt (len $proxy.serviceName) 63) (not (regexMatch "^[a-z]([-a-z0-9]*[a-z0-9])?$" $proxy.serviceName)) -}}
 {{- fail "slackProxy.serviceName must be a DNS-1035 Service name" -}}
 {{- end -}}
-{{- if or (not (regexMatch "^[0-9]+$" (toString $proxy.port))) (lt (int $proxy.port) 1) (gt (int $proxy.port) 65535) -}}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString $proxy.port))) (lt (int $proxy.port) 1) (gt (int $proxy.port) 65535) -}}
 {{- fail "slackProxy.port must be an integer TCP port from 1 to 65535" -}}
 {{- end -}}
 {{- end -}}
@@ -477,6 +501,38 @@ capabilities:
 
 {{- define "openclaw.repositoryCredentials.serviceName" -}}
 {{- default "git" .Values.repositoryCredentials.serviceName -}}
+{{- end -}}
+
+{{/* Reject obvious quantity syntax errors; Kubernetes owns full quantity validation.
+     Preserve its JSON-text whitespace handling without emulating exponent bounds or numeric parsing. */}}
+{{- define "openclaw.quantity" -}}
+{{- $pattern := "^[+-]?([0-9]*(\\.[0-9]*)?)?(([KMGT]i)|[numkMGTPE]|([eE][+-]?[0-9]+))?$|^[+-]?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)[PE]i$" -}}
+{{- $encoded := toJson (toString .value) -}}
+{{- $quantity := $encoded -}}
+{{- if ge (len $encoded) 2 -}}
+{{- $last := int (sub (len $encoded) 1) -}}
+{{- if and (eq (substr 0 1 $encoded) "\"") (eq (substr $last (len $encoded) $encoded) "\"") -}}
+{{- $quantity = trim (substr 1 $last $encoded) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (eq $quantity "") (not (regexMatch $pattern $quantity)) -}}
+{{- fail (printf "%s must be a Kubernetes quantity" .name) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* A null map clears chart defaults. Skip it; indexing nil aborts install and upgrade. */}}
+{{- define "openclaw.resourceRequirements" -}}
+{{- if .requirements -}}
+{{- $name := .name -}}
+{{- $requirements := .requirements -}}
+{{- range $section := list "requests" "limits" -}}
+{{- with index $requirements $section -}}
+{{- range $key, $qty := . -}}
+{{- include "openclaw.quantity" (dict "name" (printf "%s.%s.%s" $name $section $key) "value" $qty) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "openclaw.repositoryCredentials.clusterDomain" -}}

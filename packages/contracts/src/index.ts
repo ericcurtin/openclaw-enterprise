@@ -220,6 +220,11 @@ export interface SecretReference extends ResourceRef {
   readonly namespaceId: string;
 }
 
+export interface ServiceAccountReference extends ResourceRef {
+  readonly kind: "service_account";
+  readonly namespaceId: string;
+}
+
 export interface SecretIdentity {
   readonly id: string;
   readonly namespaceId: string;
@@ -355,16 +360,31 @@ export interface CredentialWithdrawal {
  * or running. A `pending` withdrawal without one has no attempt queued (attempts ran out or a
  * permanent failure ended them): nothing retries it until the withdraw request is sent again,
  * or revision maintenance, where Compute or repository credentials schedule it, queues one.
+ * Maintenance never re-queues one whose last attempt was denied to its requester.
+ * The API reports the active revision's withdrawal unless another revision that may still run
+ * with the source has a `pending` one, preferring one with no attempt queued.
  */
 export interface CredentialWithdrawalStatus extends CredentialWithdrawal {
   readonly withdrawalInProgress: boolean;
+}
+
+/** A non-model credential source the Agent's Harness may use at its source's endpoints. */
+export interface AgentCredentialSourceBinding {
+  readonly sourceId: string;
+}
+
+/** Private admission metadata for one non-model source frozen into a revision. */
+export interface CredentialSourceSnapshot {
+  readonly sourceId: string;
+  readonly credentialGatewayId: string;
+  readonly sourceType: string;
 }
 
 export type HarnessAuthBinding =
   | { readonly method: "api_key"; readonly source: SecretReference }
   | { readonly method: "codex_pat"; readonly source: SecretReference }
   | { readonly method: "oauth"; readonly source: SecretReference }
-  | { readonly method: "chatgpt_service_account"; readonly serviceAccountId: string }
+  | { readonly method: "codex_pat"; readonly source: ServiceAccountReference }
   | { readonly method: "credential_source"; readonly sourceId: string }
   | { readonly method: "runtime" };
 
@@ -387,8 +407,8 @@ export type HarnessAuthSnapshot =
       readonly secretDriverId: string;
     }
   | {
-      readonly method: "chatgpt_service_account";
-      readonly serviceAccountId: string;
+      readonly method: "codex_pat";
+      readonly source: ServiceAccountReference;
       readonly credential: ServiceAccountCredential & { readonly kind: "access_token" };
       readonly backendBinding: {
         readonly backendId: string;
@@ -407,17 +427,19 @@ export type HarnessAuthSnapshot =
 
 /** Authoritative delivery references, resolved again at dispatch; never secret values. */
 export type ResolvedHarnessAuth =
-  | (Extract<HarnessAuthSnapshot, { method: "api_key" | "codex_pat" | "oauth" }> & {
+  | (Extract<HarnessAuthSnapshot, { source: SecretReference }> & {
       readonly backendRef: SecretBackendRef;
     })
   | (Extract<HarnessAuthSnapshot, { method: "credential_source" }> & {
       readonly source: Readonly<CredentialSource>;
     })
-  | Extract<HarnessAuthSnapshot, { method: "chatgpt_service_account" | "runtime" }>;
+  | Extract<HarnessAuthSnapshot, { source: ServiceAccountReference } | { method: "runtime" }>;
 
 export interface ComputeRevisionContext {
   readonly workspaceSetup?: Readonly<WorkspaceSetup>;
   readonly harnessAuth: ResolvedHarnessAuth;
+  /** Non-model sources resolved again at dispatch, in admission order. */
+  readonly credentialSources?: readonly Readonly<CredentialSource>[];
   readonly secretEnvironment: readonly SecretEnvironmentProjection[];
   readonly repositoryCredentials?: readonly RepositoryCredentialRuntimeBinding[];
 }
@@ -641,6 +663,7 @@ export interface Agent extends Scope {
   readonly configurationId: string;
   readonly backendId: BackendRef;
   readonly harnessAuth: HarnessAuthBinding | null;
+  readonly credentialSources?: readonly AgentCredentialSourceBinding[];
   readonly executionMode: HarnessExecutionMode;
   readonly plugins?: PluginDesiredState;
   readonly pluginApprovers?: PluginApprovers;
@@ -660,6 +683,7 @@ export interface ConfigurationReadError {
     | "repositoryBindings"
     | "repositoryAccess"
     | "harnessAuth"
+    | "credentialSources"
     | "secretBindings"
     | "repositoryCredentials"
     | "configuration";
@@ -667,7 +691,12 @@ export interface ConfigurationReadError {
 
 export type AgentMetadata = Omit<
   Agent,
-  "plugins" | "pluginApprovers" | "repositoryBindings" | "repositoryAccess" | "harnessAuth"
+  | "plugins"
+  | "pluginApprovers"
+  | "repositoryBindings"
+  | "repositoryAccess"
+  | "harnessAuth"
+  | "credentialSources"
 >;
 
 export type AgentRead =
@@ -724,6 +753,7 @@ export interface AgentRevision extends Scope {
   readonly pluginApprovers?: PluginApprovers;
   readonly repositoryCredentials?: RepositoryRevisionState;
   readonly harnessAuth: HarnessAuthSnapshot;
+  readonly credentialSources?: readonly CredentialSourceSnapshot[];
   readonly servicePrincipalId: string;
   readonly createdAt: string;
 }
@@ -754,6 +784,9 @@ export function freezeAgentRevision(revision: AgentRevision): Readonly<AgentRevi
     harness: Object.freeze({ ...revision.harness }),
     compute: Object.freeze({ ...revision.compute }),
     harnessAuth: immutableCopy(revision.harnessAuth),
+    ...(revision.credentialSources === undefined
+      ? {}
+      : { credentialSources: immutableCopy(revision.credentialSources) }),
   });
 }
 
@@ -1026,6 +1059,20 @@ export interface SandboxHarnessContext extends SandboxNamespaceContext {
   readonly requirements: HarnessWorkloadRequirements;
 }
 
+export interface SandboxHarnessStatusContext extends SandboxHarnessContext {
+  /** The Agent transport token the Agent Gateway presents to the Harness. */
+  readonly transportToken: string;
+}
+
+/**
+ * What the provider-owned Harness answers at its endpoint. `failed` carries the Harness's own
+ * held startup failure, unvalidated; Compute validates it like a Compute-owned status port.
+ */
+export type SandboxHarnessStatus =
+  | { readonly state: "starting" }
+  | { readonly state: "serving" }
+  | { readonly state: "failed"; readonly runtimeFailure: unknown };
+
 export interface ComputeLifecycleHooks {
   afterNamespacePrepared?(namespace: Readonly<Namespace>, signal: AbortSignal): Promise<void>;
   beforeWorkloadStart?(
@@ -1239,6 +1286,11 @@ export interface CredentialWithdrawalContext extends CredentialGatewayContext {
   /** The Sandbox provisioning created for `revision`. */
   readonly sandbox: SandboxResourceRef;
   readonly sourceId: string;
+  /**
+   * Re-checks a withdrawal already recorded `revoked`: the gateway detaches again only when
+   * the Sandbox still lists the source, and otherwise reports `revoked` without a mutation.
+   */
+  readonly recheck?: boolean;
 }
 
 /** Opaque grant that only the paired SandboxDriver can consume. */
@@ -1299,6 +1351,12 @@ export interface SandboxDriver extends Driver {
    * Service. Implementations must fail closed until the endpoint is observable and exact.
    */
   harnessEndpoint?(context: SandboxHarnessContext): Promise<SandboxHarnessEndpoint>;
+  /**
+   * Observes the provider-owned Harness through the endpoint `harnessEndpoint` returns, with the
+   * Agent transport token. Compute treats only `serving` as ready and fails the revision with a
+   * valid held `runtimeFailure`. `serving` requires an authenticated transport handshake.
+   */
+  harnessStatus?(context: SandboxHarnessStatusContext): Promise<SandboxHarnessStatus>;
   /**
    * The exact Sandbox `provisionHarness` creates for this revision, derived without effects.
    * Required to revoke credentials from a running revision.
@@ -1820,11 +1878,13 @@ export interface ComputeDriver extends Driver {
    * Revokes `source` from the revision's paired Sandbox through the selected Credential
    * Gateway. Returns `revoked` only after the gateway confirms revocation, and `absent` when
    * the revision has no Sandbox or attachment left to revoke. Required for withdrawal.
+   * `options.recheck` is passed through to the gateway's withdrawal context.
    */
   withdrawCredentialSource?(
     revision: Readonly<AgentRevision>,
     source: Readonly<CredentialSource>,
     signal: AbortSignal,
+    options?: { readonly recheck?: boolean },
   ): Promise<CredentialAttachmentStatus>;
   prepareRevision(
     revision: AgentRevision,
@@ -1859,7 +1919,12 @@ export * from "./api/common.ts";
 export * from "./api/resources.ts";
 export * from "./api/routes.ts";
 
-export { normalizeHarnessAuthBinding, harnessAuthBindingFromSnapshot } from "./harness-auth.ts";
+export {
+  normalizeHarnessAuthBinding,
+  harnessAuthBindingFromSnapshot,
+  isSecretHarnessAuth,
+  isServiceAccountHarnessAuth,
+} from "./harness-auth.ts";
 
 export type { Preset, PresetTemplate, PresetLaunchSettings, PresetVariable } from "./presets.ts";
 export { normalizePresetTemplate } from "./presets.ts";

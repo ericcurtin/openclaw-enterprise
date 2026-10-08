@@ -24,10 +24,12 @@ import type {
   AgentRevision,
   AuditEvent,
   CredentialSource,
+  CredentialSourceSnapshot,
   CredentialWithdrawal,
   SecretReference,
   HarnessExecutionMode,
   HarnessAuthBinding,
+  AgentCredentialSourceBinding,
   HarnessAuthSnapshot,
   Identity,
   Installation,
@@ -53,6 +55,8 @@ import {
   normalizePluginDesiredState,
   normalizePluginApprovers,
   normalizeHarnessAuthBinding,
+  isSecretHarnessAuth,
+  isServiceAccountHarnessAuth,
   harnessAuthBindingFromSnapshot,
   normalizeSecretBindings,
   validPluginRevisionState,
@@ -173,6 +177,7 @@ export interface AgentRepository extends AgentReadRepository {
     repositoryBindings?: readonly RepositoryBindingSelection[],
     pluginApprovers?: PluginApprovers | null,
     repositoryAccess?: RepositoryAccess | null,
+    credentialSources?: readonly AgentCredentialSourceBinding[],
   ): Promise<Readonly<Agent> | undefined>;
   compareAndSetActiveRevision(
     namespaceId: string,
@@ -362,6 +367,17 @@ export interface CredentialSourceRepository extends CredentialSourceReadReposito
   requestCredentialWithdrawal(
     withdrawal: CredentialWithdrawal,
   ): Promise<Readonly<CredentialWithdrawal>>;
+  /**
+   * Makes `requestedBy` the requester of a pending withdrawal: the principal whose
+   * `agent:operate` the worker rechecks. `requestedAt` keeps the first request's time, and a
+   * revoked withdrawal never changes.
+   */
+  reassignCredentialWithdrawal(
+    namespaceId: string,
+    revisionId: string,
+    credentialSourceId: string,
+    requestedBy: string,
+  ): Promise<Readonly<CredentialWithdrawal> | undefined>;
   /** Records the worker's latest outcome code on a pending withdrawal. */
   recordCredentialWithdrawalAttempt(
     namespaceId: string,
@@ -479,27 +495,18 @@ export function validHarnessAuthSnapshot(value: HarnessAuthSnapshot, namespaceId
         value.loginMode === "api_key"
       );
     }
-    const binding =
-      value.method === "api_key" || value.method === "codex_pat" || value.method === "oauth"
-        ? normalizeHarnessAuthBinding({ method: value.method, source: value.source })
-        : normalizeHarnessAuthBinding({
-            method: value.method,
-            serviceAccountId: value.serviceAccountId,
-          });
-    if (
-      binding?.method === "api_key" ||
-      binding?.method === "codex_pat" ||
-      binding?.method === "oauth"
-    ) {
+    const binding = normalizeHarnessAuthBinding({ method: value.method, source: value.source });
+    if (isSecretHarnessAuth(binding)) {
       return (
         Object.keys(value).length === 3 &&
         binding.source.namespaceId === namespaceId &&
-        (value.method === "api_key" || value.method === "codex_pat" || value.method === "oauth") &&
+        isSecretHarnessAuth(value) &&
         isNonEmptyString(value.secretDriverId)
       );
     }
     if (
-      value.method !== "chatgpt_service_account" ||
+      !isServiceAccountHarnessAuth(value) ||
+      value.source.namespaceId !== namespaceId ||
       Object.keys(value).length !== 4 ||
       !validCredential(value.credential) ||
       value.credential.kind !== "access_token"
@@ -532,19 +539,16 @@ export function harnessAuthMatches(
   if (binding.method === "runtime") {
     return true;
   }
-  return (binding.method === "api_key" ||
-    binding.method === "codex_pat" ||
-    binding.method === "oauth") &&
-    (snapshot.method === "api_key" ||
-      snapshot.method === "codex_pat" ||
-      snapshot.method === "oauth")
-    ? binding.source.namespaceId === snapshot.source.namespaceId &&
-        binding.source.id === snapshot.source.id
-    : binding.method === "credential_source" && snapshot.method === "credential_source"
-      ? binding.sourceId === snapshot.sourceId
-      : binding.method === "chatgpt_service_account" &&
-        snapshot.method === "chatgpt_service_account" &&
-        binding.serviceAccountId === snapshot.serviceAccountId;
+  if (binding.method === "credential_source" && snapshot.method === "credential_source") {
+    return binding.sourceId === snapshot.sourceId;
+  }
+  return (
+    "source" in binding &&
+    "source" in snapshot &&
+    binding.source.kind === snapshot.source.kind &&
+    binding.source.namespaceId === snapshot.source.namespaceId &&
+    binding.source.id === snapshot.source.id
+  );
 }
 
 function harnessSecretReference(
@@ -553,9 +557,7 @@ function harnessSecretReference(
   secretId: string,
 ): boolean {
   return (
-    (binding?.method === "api_key" ||
-      binding?.method === "codex_pat" ||
-      binding?.method === "oauth") &&
+    isSecretHarnessAuth(binding) &&
     binding.source.namespaceId === namespaceId &&
     binding.source.id === secretId
   );
@@ -572,9 +574,7 @@ function harnessAccountReference(
   binding: HarnessAuthBinding | undefined | null,
   serviceAccountId: string,
 ): boolean {
-  return (
-    binding?.method === "chatgpt_service_account" && binding.serviceAccountId === serviceAccountId
-  );
+  return isServiceAccountHarnessAuth(binding) && binding.source.id === serviceAccountId;
 }
 
 export async function assertHarnessAuthAvailable(
@@ -591,11 +591,7 @@ export async function assertHarnessAuthAvailable(
   if (binding === null || binding.method === "runtime") {
     return;
   }
-  if (
-    binding.method === "api_key" ||
-    binding.method === "codex_pat" ||
-    binding.method === "oauth"
-  ) {
+  if (isSecretHarnessAuth(binding)) {
     if (
       binding.source.namespaceId !== namespaceId ||
       (await state.secrets.findSecret(namespaceId, binding.source.id)) === undefined
@@ -615,13 +611,81 @@ export async function assertHarnessAuthAvailable(
       );
     }
   } else if (
-    (await state.serviceAccounts.findServiceAccount(namespaceId, binding.serviceAccountId)) ===
-    undefined
+    binding.source.namespaceId !== namespaceId ||
+    (await state.serviceAccounts.findServiceAccount(namespaceId, binding.source.id)) === undefined
   ) {
     throw new ScopeViolationError(
       "The Agent harness authentication references an unavailable ServiceAccount.",
     );
   }
+}
+
+/** In-memory mirror of `agents_harness_credential_source_listed`. */
+export function assertHarnessCredentialSourceListed(
+  harnessAuth: HarnessAuthBinding | null,
+  bindings: readonly AgentCredentialSourceBinding[] | undefined,
+): void {
+  if (
+    harnessAuth?.method === "credential_source" &&
+    !(bindings ?? []).some(({ sourceId }) => sourceId === harnessAuth.sourceId)
+  ) {
+    throw new ScopeViolationError("The Agent's Harness credential source must be listed.");
+  }
+}
+
+/** In-memory mirror of the `agent_credential_sources` foreign key. */
+export async function assertAgentCredentialSourcesAvailable(
+  state: Pick<PlatformReadView, "credentialSources">,
+  namespaceId: string,
+  bindings: readonly AgentCredentialSourceBinding[] | undefined,
+): Promise<void> {
+  for (const { sourceId } of bindings ?? []) {
+    if ((await state.credentialSources.findCredentialSource(namespaceId, sourceId)) === undefined) {
+      throw new ScopeViolationError("The Agent references an unavailable credential source.");
+    }
+  }
+}
+
+function agentCredentialSourceReference(
+  bindings: readonly { readonly sourceId: string }[] | undefined,
+  credentialSourceId: string,
+): boolean {
+  return (bindings ?? []).some(({ sourceId }) => sourceId === credentialSourceId);
+}
+
+/** A revision freezes exactly the owner's non-model sources, in order. */
+export function credentialSourcesMatch(
+  bindings: readonly AgentCredentialSourceBinding[] | undefined,
+  snapshots: readonly CredentialSourceSnapshot[] | undefined,
+): boolean {
+  const owner = (bindings ?? []).map(({ sourceId }) => sourceId);
+  const frozen = (snapshots ?? []).map(({ sourceId }) => sourceId);
+  return owner.length === frozen.length && owner.every((sourceId, i) => sourceId === frozen[i]);
+}
+
+export function validCredentialSourceSnapshots(value: unknown): boolean {
+  if (value === undefined) {
+    return true;
+  }
+  if (!Array.isArray(value) || value.length === 0 || value.length > 8) {
+    return false;
+  }
+  const seen = new Set<string>();
+  return value.every((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return false;
+    }
+    const keys = Object.keys(entry).sort();
+    const snapshot = entry as Record<string, unknown>;
+    const valid =
+      keys.join(",") === "credentialGatewayId,sourceId,sourceType" &&
+      isNonEmptyString(snapshot.sourceId) &&
+      isNonEmptyString(snapshot.credentialGatewayId) &&
+      isNonEmptyString(snapshot.sourceType) &&
+      !seen.has(snapshot.sourceId);
+    seen.add(snapshot.sourceId as string);
+    return valid;
+  });
 }
 
 function assertAdmittedAgentRevision(revision: AgentRevision): void {
@@ -658,6 +722,7 @@ function assertAdmittedAgentRevision(revision: AgentRevision): void {
     (revision.secretDriverId !== undefined && !isNonEmptyString(revision.secretDriverId)) ||
     Object.hasOwn(revision, "serviceAccount") ||
     !validHarnessAuthSnapshot(revision.harnessAuth, revision.namespaceId) ||
+    !validCredentialSourceSnapshots(revision.credentialSources) ||
     !validPluginRevisionState(revision.plugins) ||
     !validPluginApprovers(revision.pluginApprovers) ||
     (revision.repositoryCredentials !== undefined &&
@@ -1691,6 +1756,26 @@ function repositories(
       );
       return immutableCopy(saved);
     },
+    reassignCredentialWithdrawal: async (
+      namespaceId,
+      revisionId,
+      credentialSourceId,
+      requestedBy,
+    ) => {
+      const current = await findCredentialWithdrawal(namespaceId, revisionId, credentialSourceId);
+      if (current === undefined || current.state !== "pending") {
+        return undefined;
+      }
+      if (!isNonEmptyString(requestedBy)) {
+        throw new ScopeViolationError("A credential withdrawal requester is missing.");
+      }
+      const saved = immutableCopy({ ...current, requestedBy });
+      snapshot.credentialWithdrawals.set(
+        withdrawalKey(namespaceId, revisionId, credentialSourceId),
+        saved,
+      );
+      return immutableCopy(saved);
+    },
     recordCredentialWithdrawalAttempt: async (
       namespaceId,
       revisionId,
@@ -1835,7 +1920,9 @@ function repositories(
           return (
             agent.namespaceId === namespaceId &&
             (harnessCredentialSourceReference(agent.harnessAuth, credentialSourceId) ||
-              harnessCredentialSourceReference(activeRevision?.harnessAuth, credentialSourceId))
+              harnessCredentialSourceReference(activeRevision?.harnessAuth, credentialSourceId) ||
+              agentCredentialSourceReference(agent.credentialSources, credentialSourceId) ||
+              agentCredentialSourceReference(activeRevision?.credentialSources, credentialSourceId))
           );
         }) ||
         snapshot.operations.some((operation) => {
@@ -1848,7 +1935,10 @@ function repositories(
               (candidate) =>
                 candidate.namespaceId === namespaceId && candidate.id === operation.resourceId,
             );
-          return harnessCredentialSourceReference(revision?.harnessAuth, credentialSourceId);
+          return (
+            harnessCredentialSourceReference(revision?.harnessAuth, credentialSourceId) ||
+            agentCredentialSourceReference(revision?.credentialSources, credentialSourceId)
+          );
         })
       );
     },
@@ -2097,6 +2187,12 @@ function repositories(
         agent.namespaceId,
         agent.harnessAuth,
       );
+      await assertAgentCredentialSourcesAvailable(
+        { credentialSources },
+        agent.namespaceId,
+        agent.credentialSources,
+      );
+      assertHarnessCredentialSourceListed(agent.harnessAuth, agent.credentialSources);
       const key = agentKey(agent.namespaceId, agent.id);
       if (snapshot.agents.has(key)) {
         throw new ResourceConflictError("The server generated an existing Agent identity.");
@@ -2186,6 +2282,7 @@ function repositories(
       nextRepositoryBindings,
       nextPluginApprovers,
       nextRepositoryAccess,
+      nextCredentialSources,
     ) => {
       const current = await agents.findAgent(namespaceId, agentId);
       if (!current) {
@@ -2205,12 +2302,23 @@ function repositories(
         throw new ScopeViolationError("The Agent references an unavailable Configuration.");
       }
       await assertConfigurationUsableByAgent(configurations, secrets, namespaceId, configurationId);
+      // Like PostgreSQL, only a supplied binding must be available; omission keeps the stored one.
+      if (harnessAuth !== undefined) {
+        await assertHarnessAuthAvailable(
+          { secrets, serviceAccounts, credentialSources },
+          namespaceId,
+          harnessAuth,
+        );
+      }
       const association = harnessAuth === undefined ? current.harnessAuth : harnessAuth;
-      await assertHarnessAuthAvailable(
-        { secrets, serviceAccounts, credentialSources },
+      await assertAgentCredentialSourcesAvailable(
+        { credentialSources },
         namespaceId,
-        association,
+        nextCredentialSources,
       );
+      const agentCredentialSources =
+        nextCredentialSources === undefined ? current.credentialSources : nextCredentialSources;
+      assertHarnessCredentialSourceListed(association, agentCredentialSources);
       const nextBackendId = backendId === undefined ? current.backendId : backendId;
       const plugins = nextPlugins === undefined ? current.plugins : normalizedPlugins(nextPlugins);
       const pluginApprovers =
@@ -2236,6 +2344,7 @@ function repositories(
         plugins: _currentPlugins,
         pluginApprovers: _currentPluginApprovers,
         repositoryBindings: _currentRepositoryBindings,
+        credentialSources: _currentCredentialSources,
         ...withoutPlugins
       } = current;
       const updated = immutableCopy({
@@ -2244,6 +2353,9 @@ function repositories(
         backendId: nextBackendId,
         executionMode: executionMode ?? current.executionMode,
         harnessAuth: association,
+        ...(agentCredentialSources === undefined || agentCredentialSources.length === 0
+          ? {}
+          : { credentialSources: agentCredentialSources }),
         ...(plugins === undefined ? {} : { plugins }),
         ...(pluginApprovers === undefined ? {} : { pluginApprovers }),
         ...(repositoryBindings === undefined ? {} : { repositoryBindings }),
@@ -2316,7 +2428,8 @@ function repositories(
         owner === undefined ||
         owner.servicePrincipalId !== revision.servicePrincipalId ||
         owner.backendId !== revision.backendId ||
-        !harnessAuthMatches(owner.harnessAuth, revision.harnessAuth)
+        !harnessAuthMatches(owner.harnessAuth, revision.harnessAuth) ||
+        !credentialSourcesMatch(owner.credentialSources, revision.credentialSources)
       ) {
         throw new ScopeViolationError("The AgentRevision belongs to an unavailable Agent.");
       }

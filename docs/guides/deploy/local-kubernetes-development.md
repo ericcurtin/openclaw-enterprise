@@ -159,12 +159,19 @@ the profile exports for startup and cleanup. Without profile selections,
 startup uses the Compose control-plane preview with Docker Compute.
 
 State, the kubeconfig, and credentials, including the initial administrator
-service key, are written to the private `/tmp/openclaw-development` directory by
-default. Set the absolute
-`OCC_DEVELOPMENT_STATE_DIRECTORY` before both startup and cleanup to use
-another location. `OCC_DEVELOPMENT_STARTUP_TIMEOUT_SECONDS` bounds k3d
+service key, are written to a private
+[state directory](../../reference/settings/development.md#required-development-controller-environment)
+that startup prints. By default it is `openclaw-development` in the temporary
+directory, which on macOS is a per-user `/private/var/folders/<id>/T` path.
+Set the absolute `OCC_DEVELOPMENT_STATE_DIRECTORY` before both startup and
+cleanup to use another location. Its parent must not contain symlinks; on macOS,
+use `/private/tmp/...` instead of `/tmp/...`.
+`OCC_DEVELOPMENT_STARTUP_TIMEOUT_SECONDS` bounds k3d
 readiness and each later startup wait. A cluster timeout triggers owned-resource
-rollback; follow the printed cleanup instruction if state is retained. Startup
+rollback; follow the printed cleanup instruction if state is retained. A failed
+exclusive key-file write removes its partial output so you can retry after
+resolving the filesystem error. Existing destination files are never removed;
+if removal itself fails, the error reports both failures. Startup
 refuses an existing state directory or cluster. To pick up source changes,
 [rebuild the running services](#rebuild-after-a-source-edit); cleanup is for
 discarding the Installation. The state directory remains mode `0700`; generated

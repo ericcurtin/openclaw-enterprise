@@ -102,6 +102,14 @@ Each Pod then checks the stored Installation name from the helper's
 `occ installation get` with the image's `isName`, the check the controller
 applies after it reads the name from the database (`INSTALLATION_NAME_INVALID`);
 an image without the rule skips it.
+On the experimental two-cluster profile, each Pod also runs
+`KubernetesComputeDriver.verifyExecutionTenantGrants` for its component, which
+startup does not run. In each execution tenant Namespace where its identity holds
+the release-era tenant grant, SelfSubjectAccessReviews ask for the newer
+`openclaw-execution` rules (API: Pod and `pods/proxy` reads, plus `pods/log` and
+Event reads with runtime logs; worker: Pod `patch`). A missing rule refuses the
+candidate and points to
+[upgrading the execution chart](../testing/two-cluster-local.md#upgrade-the-execution-chart).
 Because the chart's default-deny NetworkPolicy also selects these Pods, the
 helper first creates a temporary NetworkPolicy carrying the rendered
 `openclaw-enterprise-dependency-egress` (and execution-cluster API) egress rules.
@@ -243,6 +251,8 @@ access, and required restore behavior.
 [keep this for the user to add notes. do not change between edits]
 
 ## Changelog
+
+- 2026-10-07 21:20: Refuse a two-cluster upgrade before quiescence when the execution chart lacks this release's tenant grants. (fix-758)
 
 - 2026-10-07 12:00: Say that a controller-only release leaves existing revisions on their old Pod specification until the next deployment. (dogfood-r43)
 

@@ -66,13 +66,16 @@ A representative account-creation body is:
 accepts `{}` and issues a credential through the selected Driver. The `201`
 account envelope exposes safe credential readiness metadata; backend Secret
 locators and Backend/workspace identities remain private.
-Compute creates one account-owned token/workspace Secret in the tenant control plane; the Driver privately
+Compute creates one account-owned token Secret in the tenant control plane; the Driver privately
 persists the upstream credential ID for exact cleanup. A second issuance fails
-with `409`; rotation and reconciliation are not implemented. Calling issuance
-without a selected ServiceAccount Driver fails with `503 DEPENDENCY_UNAVAILABLE`.
+with `409`; rotation and reconciliation are not implemented. On an Installation
+with no ChatGPT Backend, and so no ServiceAccount Driver, issuance fails with
+`409 SERVICE_ACCOUNT_DRIVER_NOT_CONFIGURED` naming the fix, after the account
+`update` check and lookup. A selected Driver that is unavailable or fails
+returns `503 DEPENDENCY_UNAVAILABLE`.
 
 An Agent binds the same-Namespace account through
-`harnessAuth: { method: "chatgpt_service_account", serviceAccountId }`.
+`harnessAuth: { method: "codex_pat", source: { kind: "service_account", namespaceId, id: serviceAccountId } }`.
 Association and deployment require `read` on the exact account. Updating or
 detaching an associated account requires current-account `read`; replacement
 requires `read` on both accounts. An Agent can reference an account before it
@@ -87,7 +90,11 @@ Inactive historical revisions and permanently failed deployments do not block
 deletion unless the account is still referenced by other live state.
 Backend-managed deletion removes
 the exact upstream credential, the account-owned Secret, and the upstream
-account before deleting OCC account state. Native deletion removes OCC account
+account before deleting OCC account state. If the account holds an issued
+access token and the Installation no longer has a ChatGPT Backend, deletion
+fails with `409 SERVICE_ACCOUNT_DRIVER_NOT_CONFIGURED`, after the `delete`
+grant and the account lookup, and keeps the account: configure the same
+ChatGPT Backend again (same `backendId`), then retry. Native deletion removes OCC account
 state; the operator owns the referenced source Secret.
 
 ## Revision snapshots and credential delivery
@@ -105,19 +112,21 @@ For an `access_token`, the Agent must select the binding's exact nonnull
 Admission and worker reconciliation validate that private metadata before
 workload effects; a public credential kind is not proof of ownership. Only
 dedicated Codex execution is supported. Kubernetes
-delivers both keys from the account-owned CP source through a revision-owned
+delivers the token from the account-owned CP source through a revision-owned
 data-plane runtime Secret into the exact
 Codex Pod:
 
-| Account Secret key | Codex environment variable   | Purpose                              |
-| ------------------ | ---------------------------- | ------------------------------------ |
-| `token`            | `CODEX_ACCESS_TOKEN`         | One upstream account access token.   |
-| `workspace-id`     | `CODEX_CHATGPT_WORKSPACE_ID` | Forced upstream workspace selection. |
+| Account Secret key | Codex environment variable | Purpose                            |
+| ------------------ | -------------------------- | ---------------------------------- |
+| `token`            | `CODEX_ACCESS_TOKEN`       | One upstream account access token. |
 
-Codex authenticates through
-`codex -c cli_auth_credentials_store=file -c forced_chatgpt_workspace_id="<workspace-id>" login --with-access-token`
-and saves login state only in its bounded ephemeral workload volume. Its
-gateway receives neither key. The trusted worker reads the source and manages
+Both managed-account and Secret sources use `codex_pat` with
+`CODEX_LOGIN_MODE=codex_pat`. Codex authenticates through
+`codex -c cli_auth_credentials_store=file login --with-access-token`, derives
+account identity from the token, and saves login state only in its bounded
+ephemeral workload volume. Workspace ownership remains a control-plane
+admission and reconciliation check; no workspace override is projected into
+Codex. The separate Gateway receives no model credential. The trusted worker reads the source and manages
 the revision projection; workloads receive no Secret API permission. No API-key
 fallback is used. The projection does not narrow provider-side token authority.
 
@@ -151,6 +160,10 @@ provider, not IAM, Compute, OCC, or the Harness.
 - `409 RESOURCE_CONFLICT`: Duplicate account name, existing credential,
   referenced-account deletion, missing credential, or unsupported Harness or
   OAuth deployment, or mismatched managed Backend binding.
+- `409 SERVICE_ACCOUNT_DRIVER_NOT_CONFIGURED`: The Installation has no ChatGPT
+  Backend, so issuance, deploying an Agent bound to an account without an
+  access token, and deleting an account that holds one cannot succeed. Configure the
+  [ChatGPT Backend](../guides/integrations/chatgpt.md).
 - Provider denial or Kubernetes failure: Creation fails closed; compensation deletes
   only the newly created exact provider account, provider credential, or
   account-owned Secret when durable state confirms it was not committed.

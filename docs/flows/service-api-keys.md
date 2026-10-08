@@ -112,8 +112,9 @@ changing IAM scope later does not widen an existing credential. PostgreSQL
 uses the official Drizzle adapter and the `occ.apikey` table. Key-based sessions
 and public plugin management routes are not enabled.
 
-The controller appends an issuance audit containing the resolved issuer and
-non-secret key/principal IDs, then returns `201` with the plaintext key once.
+The controller appends an issuance audit containing the resolved issuer, the
+principal ID, and the key's ID (`serviceKeyId`) and name (`serviceKeyName`), then
+returns `201` with the plaintext key once.
 There is no plaintext retrieval endpoint. If creation or audit persistence
 fails, the response is `503` with no credential. If creation already succeeded,
 the controller attempts deletion of the unreturned key; this cleanup is best
@@ -156,7 +157,10 @@ A denied decision records authorization evidence and returns `403`. Unavailable
 required dependencies fail closed with `503`. An allowed read returns the
 Namespace response through the existing OCC API envelope. Other resource
 operations retain their own OCC authorization and mutation-audit behavior;
-key admission does not bypass them.
+key admission does not bypass them. Admission keeps the verified key's ID, and
+every route audit event built for the request (change, audited read, or denial)
+records it as `details.actorServiceKeyId`. Events OCC appends for the work
+itself, such as `openclaw.agents.provision`, carry only the principal.
 
 ### 5. Delete the credential and record revocation
 

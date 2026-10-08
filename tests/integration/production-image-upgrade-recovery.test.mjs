@@ -266,11 +266,13 @@ async function collectorConfigSecret(name, collector) {
 }
 
 // A stand-in Kubernetes API for the startup preflight's Compute check. It serves
-// only the version and Namespace list reads that check makes, over verified HTTPS
-// with a bearer token, from the Namespaces a case seeds. The real Kubernetes
-// Compute Driver in the preflight Pod decides whether that state may start; this
-// is not live cluster or RBAC proof.
-async function kubernetesApi(t, directory, namespaces, denied) {
+// only the version, Namespace and SelfSubjectAccessReview requests that check makes,
+// over verified HTTPS with a bearer token, from the Namespaces a case seeds. With
+// `execution`, a second stand-in serves the two-cluster execution target under the
+// kubeconfig context `execution`, granting the rules its `allows` callback admits.
+// The real Kubernetes Compute Driver in the preflight Pod decides whether that state
+// may start; this is not live cluster or RBAC proof.
+async function kubernetesApi(t, directory, namespaces, denied, execution = null) {
   const certificate = join(directory, "kubernetes-api.crt");
   const key = join(directory, "kubernetes-api.key");
   await execute("openssl", [
@@ -290,26 +292,51 @@ async function kubernetesApi(t, directory, namespaces, denied) {
     "-out",
     certificate,
   ]);
-  const reads = [];
-  const server = createServer(
-    { key: await readFile(key), cert: await readFile(certificate) },
-    (request, response) => {
+  const tls = { key: await readFile(key), cert: await readFile(certificate) };
+  const serve = async ({ namespaces, uid, allows }) => {
+    const reads = [];
+    const reviews = [];
+    const server = createServer(tls, async (request, response) => {
       const url = new URL(request.url, "https://127.0.0.1");
       const reply = (status, body) => {
         response.writeHead(status, { "content-type": "application/json" });
         response.end(JSON.stringify(body));
       };
+      const review =
+        request.method === "POST" &&
+        url.pathname === "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews";
       if (
         denied ||
-        request.method !== "GET" ||
+        (request.method !== "GET" && !review) ||
         request.headers.authorization !== "Bearer preflight-token"
       ) {
         reply(403, { kind: "Status", apiVersion: "v1", status: "Failure", code: 403 });
         return;
       }
+      if (review) {
+        let body = "";
+        for await (const chunk of request) {
+          body += chunk;
+        }
+        const attributes = JSON.parse(body).spec.resourceAttributes;
+        // `allows` answers a decision, or a whole review status such as an evaluation error.
+        const decision = allows(attributes);
+        const status = typeof decision === "object" ? decision : { allowed: decision };
+        reviews.push({ ...attributes, allowed: status.allowed });
+        reply(201, {
+          kind: "SelfSubjectAccessReview",
+          apiVersion: "authorization.k8s.io/v1",
+          spec: { resourceAttributes: attributes },
+          status,
+        });
+        return;
+      }
       reads.push(url.pathname);
       if (url.pathname === "/version") {
         reply(200, { major: "1", minor: "35", gitVersion: "v1.35.0" });
+      } else if (url.pathname === "/api/v1/namespaces/kube-system") {
+        // Two-cluster preflight tells the clusters apart by this Namespace's UID.
+        reply(200, { kind: "Namespace", apiVersion: "v1", metadata: { name: "kube-system", uid } });
       } else if (url.pathname === "/api/v1/namespaces") {
         // Only label-existence selectors, which is what Compute preflight sends.
         const keys = (url.searchParams.get("labelSelector") ?? "").split(",").filter(Boolean);
@@ -320,11 +347,26 @@ async function kubernetesApi(t, directory, namespaces, denied) {
       } else {
         reply(404, { kind: "Status", apiVersion: "v1", status: "Failure", code: 404 });
       }
-    },
-  );
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  t.after(() => new Promise((resolve) => server.close(resolve)));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    return { port: server.address().port, reads, reviews };
+  };
+  const control = await serve({ namespaces, uid: "control-cluster", allows: () => false });
+  const target =
+    execution === null
+      ? null
+      : await serve({
+          namespaces: execution.namespaces,
+          uid: "execution-cluster",
+          allows: execution.allows,
+        });
+  const authority = (await readFile(certificate)).toString("base64");
+  const cluster = (name, port) => ({
+    name,
+    cluster: { server: `https://127.0.0.1:${port}`, "certificate-authority-data": authority },
+  });
   const kubeconfig = join(directory, "preflight-kubeconfig.json");
   await writeFile(
     kubeconfig,
@@ -332,22 +374,27 @@ async function kubernetesApi(t, directory, namespaces, denied) {
       apiVersion: "v1",
       kind: "Config",
       clusters: [
-        {
-          name: "preflight",
-          cluster: {
-            server: `https://127.0.0.1:${server.address().port}`,
-            "certificate-authority-data": (await readFile(certificate)).toString("base64"),
-          },
-        },
+        cluster("preflight", control.port),
+        ...(target === null ? [] : [cluster("execution", target.port)]),
       ],
       users: [{ name: "preflight", user: { token: "preflight-token" } }],
-      contexts: [{ name: "preflight", context: { cluster: "preflight", user: "preflight" } }],
+      contexts: [
+        { name: "preflight", context: { cluster: "preflight", user: "preflight" } },
+        ...(target === null
+          ? []
+          : [{ name: "execution", context: { cluster: "execution", user: "preflight" } }]),
+      ],
       "current-context": "preflight",
     }),
   );
   // The controller image's unprivileged user reads this file through a bind mount.
   await chmod(kubeconfig, 0o644);
-  return { kubeconfig, reads };
+  return {
+    kubeconfig,
+    reads: control.reads,
+    executionReads: target?.reads ?? [],
+    reviews: target?.reviews ?? [],
+  };
 }
 
 async function fixture(
@@ -364,6 +411,7 @@ async function fixture(
     preflightResults = null,
     kubernetesNamespaces = [],
     kubernetesDenied = false,
+    executionCluster = null,
     installationName = "Production",
   } = {},
 ) {
@@ -478,19 +526,45 @@ if (args[0] === 'scripts/upgrade-repository-image-probe.mjs') {
       secretName: "occ-installation-startup",
       key: "installation.yaml",
     };
-    values = JSON.stringify(exampleValues);
+    values = JSON.stringify(chart.values ? chart.values(exampleValues) : exampleValues);
     const exampleInstallation = await example("installation.yaml");
     exampleInstallation.drivers.compute.configuration.network.gatewayTrustedProxyCidrs = [
       "10.42.0.0/16",
     ];
     // Outside a cluster the preflight Pod has no service account, so Compute
     // reaches the stand-in Kubernetes API through an explicit kubeconfig.
-    api = await kubernetesApi(t, directory, kubernetesNamespaces, kubernetesDenied);
-    exampleInstallation.drivers.compute.configuration.authentication = {
+    api = await kubernetesApi(
+      t,
+      directory,
+      kubernetesNamespaces,
+      kubernetesDenied,
+      executionCluster,
+    );
+    const compute = exampleInstallation.drivers.compute.configuration;
+    compute.authentication = {
       mode: "kubeconfig",
       kubeconfigPath: api.kubeconfig,
       context: "preflight",
     };
+    if (executionCluster) {
+      // The experimental two-cluster profile: the same kubeconfig selects the
+      // execution stand-in, with documentation-range endpoint CIDRs.
+      compute.gatewayRouting.hostname = "gateway.example.test";
+      compute.executionCluster = {
+        authentication: {
+          mode: "kubeconfig",
+          kubeconfigPath: api.kubeconfig,
+          context: "execution",
+        },
+        harnessRouting: { ...compute.gatewayRouting, hostname: "harness.example.test" },
+        network: {
+          dns: compute.network.dns,
+          harnessEndpointCidrs: ["192.0.2.2/32"],
+          gatewayEndpointCidrs: ["192.0.2.1/32"],
+          pluginStatusProxySourceCidrs: ["192.0.2.2/32"],
+        },
+      };
+    }
     installation = JSON.stringify(chart.installation(exampleInstallation));
   }
   const state = {
@@ -596,6 +670,8 @@ if (args[0] === 'scripts/upgrade-repository-image-probe.mjs') {
     directory,
     evidence,
     kubernetesReads: api?.reads ?? [],
+    executionReads: api?.executionReads ?? [],
+    accessReviews: api?.reviews ?? [],
     run: (...extra) => execute(script, [...args, ...extra], { cwd: repository, env }),
     state: async () => JSON.parse(await readFile(join(directory, "state.json"), "utf8")),
     events: async () =>
@@ -1441,6 +1517,185 @@ test("a denied Kubernetes API stops the startup preflight as incomplete", async 
   assert.deepEqual(await f.events(), []);
   assert.deepEqual(state.preflight.pods, {});
   assert.deepEqual(state.preflight.networkpolicies, {});
+});
+
+// Two-cluster tenant grants in the execution stand-in. Both preflight Pods share
+// one kubeconfig there, so a grant set is the union of the API and worker roles.
+const tenantNamespaces = ["oce-unbound", "oce-tenant"].map((name) => ({
+  metadata: { name, labels: { "openclaw.dev/namespace": `ns_${name}` } },
+}));
+const rule = (attributes) =>
+  [
+    attributes.group === "apps" ? "apps" : "core",
+    attributes.verb,
+    attributes.resource + (attributes.subresource ? `/${attributes.subresource}` : ""),
+  ].join(" ");
+// The openclaw-execution release-era tenant roles: API Deployment lists; worker Pod
+// reads and proxy reads (plus writes the check never asks about).
+const releaseTenantRules = [
+  "apps list deployments",
+  "core get pods",
+  "core list pods",
+  "core get pods/proxy",
+];
+const currentTenantRules = [
+  ...releaseTenantRules,
+  "core patch pods",
+  "core get pods/log",
+  "core get events",
+  "core list events",
+];
+// oce-unbound has no tenant RoleBinding, so nothing is allowed there.
+const tenantGrants = (rules) => (attributes) =>
+  attributes.namespace === "oce-tenant" && rules.includes(rule(attributes));
+
+// The execution chart is a separate Helm release that the helper does not upgrade.
+// Each startup preflight Pod asks the execution cluster, as its own identity, for
+// the tenant rules this release needs, so a chart left at the release-era grants
+// stops the upgrade before any writer stops and names the documented step.
+test("a two-cluster execution chart without the new tenant grants stops the startup preflight", async (t) => {
+  if (!realHelm) {
+    t.skip("helm is unavailable to render the real chart");
+    return;
+  }
+  const f = await fixture(t, {
+    controllerOnly: true,
+    chart: { installation: (installation) => installation },
+    executionCluster: { namespaces: tenantNamespaces, allows: tenantGrants(releaseTenantRules) },
+  });
+  await assert.rejects(f.run(), (error) => {
+    for (const [component, missing] of [
+      ["api", "get pods/log, get events, list events"],
+      ["worker", "patch pods"],
+    ]) {
+      assert.match(
+        error.stderr,
+        new RegExp(
+          `the ${component} startup preflight stopped: Kubernetes Compute startup preflight refused the candidate release: The execution cluster's tenant ${component} grant in Namespace oce-tenant lacks ${missing}\\. Upgrade the openclaw-execution chart before this release\\. No OCC writer was stopped; the old release keeps serving\\. Upgrade the execution release as in docs/testing/two-cluster-local\\.md#upgrade-the-execution-chart`,
+        ),
+      );
+    }
+    return true;
+  });
+  // The unbound tenant Namespace was skipped after its baseline review.
+  assert.deepEqual(
+    f.accessReviews
+      .filter((review) => review.namespace === "oce-unbound")
+      .map(rule)
+      .sort(),
+    ["apps list deployments", "core get pods"],
+  );
+  const state = await f.state();
+  assert.equal(state.api, 1);
+  assert.equal(state.worker, 1);
+  assert.equal(state.version, 1);
+  assert.deepEqual(await f.events(), []);
+  assert.deepEqual(state.preflight.secrets, {});
+  assert.deepEqual(state.preflight.pods, {});
+  assert.deepEqual(state.preflight.networkpolicies, {});
+});
+
+test("a two-cluster execution chart with the new tenant grants passes the startup preflight", async (t) => {
+  if (!realHelm) {
+    t.skip("helm is unavailable to render the real chart");
+    return;
+  }
+  const f = await fixture(t, {
+    controllerOnly: true,
+    chart: { installation: (installation) => installation },
+    executionCluster: { namespaces: tenantNamespaces, allows: tenantGrants(currentTenantRules) },
+  });
+  await f.run();
+  assert.deepEqual(await f.events(), ["scale-api", "scale-worker", "migration"]);
+  // Each component asked for its own new rules in the bound tenant Namespace.
+  assert.deepEqual(
+    f.accessReviews
+      .filter((review) => review.namespace === "oce-tenant")
+      .map(rule)
+      .sort(),
+    [
+      "apps list deployments",
+      "core get events",
+      "core get pods",
+      "core get pods",
+      "core get pods/log",
+      "core get pods/proxy",
+      "core list events",
+      "core list pods",
+      "core patch pods",
+    ],
+  );
+  assert.ok(f.executionReads.includes("/api/v1/namespaces/kube-system"));
+});
+
+// An execution authorizer that cannot evaluate the reviews leaves the check incomplete:
+// the helper says which kubeconfig and access the Pod needed, and still stops first.
+test("an unevaluated two-cluster tenant grant review stops the startup preflight as incomplete", async (t) => {
+  if (!realHelm) {
+    t.skip("helm is unavailable to render the real chart");
+    return;
+  }
+  const f = await fixture(t, {
+    controllerOnly: true,
+    chart: { installation: (installation) => installation },
+    executionCluster: {
+      namespaces: tenantNamespaces,
+      allows: () => ({ allowed: false, evaluationError: "webhook authorizer unavailable" }),
+    },
+  });
+  await assert.rejects(f.run(), (error) => {
+    for (const component of ["api", "worker"]) {
+      assert.match(
+        error.stderr,
+        new RegExp(
+          `the ${component} startup preflight stopped: Kubernetes Compute startup preflight could not complete: The execution cluster tenant grant review failed: could not evaluate .* in Namespace oce-unbound: webhook authorizer unavailable No OCC writer was stopped; the old release keeps serving\\. The Pod used its execution cluster kubeconfig, which must list Namespaces and create SelfSubjectAccessReviews there`,
+        ),
+      );
+    }
+    assert.doesNotMatch(error.stderr, /refused the candidate release|openclaw-execution chart/);
+    return true;
+  });
+  const state = await f.state();
+  assert.equal(state.version, 1);
+  assert.deepEqual(await f.events(), []);
+  assert.deepEqual(state.preflight.pods, {});
+  assert.deepEqual(state.preflight.networkpolicies, {});
+});
+
+// With runtime logs off, the release's tenant API role carries no log or Event reads, so
+// the preflight asks only for the rules that release needs.
+test("a two-cluster upgrade with runtime logs off needs no log grants in the execution chart", async (t) => {
+  if (!realHelm) {
+    t.skip("helm is unavailable to render the real chart");
+    return;
+  }
+  const f = await fixture(t, {
+    controllerOnly: true,
+    chart: {
+      installation: (installation) => installation,
+      values: (values) => ({ ...values, agentRuntimeLogs: { enabled: false } }),
+    },
+    executionCluster: {
+      namespaces: tenantNamespaces,
+      allows: tenantGrants([...releaseTenantRules, "core patch pods"]),
+    },
+  });
+  await f.run();
+  assert.deepEqual(await f.events(), ["scale-api", "scale-worker", "migration"]);
+  assert.deepEqual(
+    f.accessReviews
+      .filter((review) => review.namespace === "oce-tenant")
+      .map(rule)
+      .sort(),
+    [
+      "apps list deployments",
+      "core get pods",
+      "core get pods",
+      "core get pods/proxy",
+      "core list pods",
+      "core patch pods",
+    ],
+  );
 });
 
 // The helper waits for every preflight Pod and saves its status and log before it

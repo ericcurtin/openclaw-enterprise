@@ -1,7 +1,7 @@
 ---
 created: 2026-08-25
 updated: "2026-10-05"
-last_updated_session: "01a0f9e4-a0bf-76f1-acdb-e6b55ada490a"
+last_updated_session: "authoring-run/54e33467-f3d2-4f4e-afad-952157ec12f0"
 ---
 
 # Production Startup Flow
@@ -122,12 +122,11 @@ and the later dependency, collector, Slack proxy, and Envoy policies allow
 UDP/TCP ports `53` and `5353` to the configured DNS peer; see the
 [Helm DNS contract](../reference/settings/production.md#required-production-controller-environment).
 
-`helm upgrade --install --wait --timeout 5m` renders the chart with native
-values. If `database.caSecretName` is set, the Pod mounts that CA Secret
-read-only into both containers before they connect. The initialization hook first
-runs migrations with the dedicated migrator credential, then runs bootstrap with
-the lower-privilege application credential, Better Auth settings, first
-administrator email, Installation name, and protected output paths.
+The Helm initialization hook preserves the full release name and shortens its
+suffix to Kubernetes' 63-character limit. Both containers mount
+`database.caSecretName` read-only when configured. Migration uses the migrator
+credential; bootstrap uses the lower-privilege application credential, Better Auth
+settings, administrator email, Installation name, and protected output paths.
 
 `scripts/migrate-production.mjs:1`, `scripts/migration-history.mjs:migrateWithHistory`
 
@@ -324,6 +323,7 @@ model calls remain unproven until the tenant deployment and TUI procedures run.
 
 ## Changelog
 
+- 2026-10-05 12:10: Bound initialization hook names for valid long Helm releases. (authoring-run/54e33467-f3d2-4f4e-afad-952157ec12f0 - 4cda6515736280ca39f0fbe92cff78194b2c3638)
 - 2026-10-05 06:59: Preserve bootstrap Pod namespace strings. (01a0f9e4-a0bf-76f1-acdb-e6b55ada490a - 66a4a07028fd0a08c29ea80e8f95cadc48a74932)
 
 - 2026-10-05: Name Preset file failures `PRESET_FILE_INVALID`.

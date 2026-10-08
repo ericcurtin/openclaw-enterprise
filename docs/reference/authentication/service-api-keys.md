@@ -232,10 +232,15 @@ finish. An unknown or removed key returns `404`. Revoking an issuer’s key does
 not revoke other keys issued through it or delete a principal or its bindings.
 
 HTTP issuance and revocation emit [audit events](../../guides/topics/audit-log.md)
-with administrator and non-secret IDs. If issuance audit persistence fails, OCC
-returns `503` without disclosing the key and attempts to remove it; this cleanup
-is best effort. A failed revocation audit returns `503` but does not restore the
-deleted key.
+with the caller, the principal ID, and the key's ID (`serviceKeyId`) and name
+(`serviceKeyName`). Every API route's audit event (change, audited read, or
+denial) for a request made with a service key, including these, names that key
+in `actorServiceKeyId`, so you can tell which of a principal's keys acted.
+Events OCC writes for the work itself, such as `openclaw.agents.provision` and
+worker `reconcile` events, name only the principal. If issuance audit
+persistence fails, OCC returns `503` without disclosing the key and attempts to
+remove it; this cleanup is best effort. A failed revocation audit returns `503`
+but does not restore the deleted key.
 
 ## Service-key failures
 

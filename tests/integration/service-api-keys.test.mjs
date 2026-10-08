@@ -174,6 +174,82 @@ test("service API keys authenticate scoped automation without replacing sessions
     },
   );
 
+  await t.test(
+    "audit rows name the service key that acted, apart from its principal's other keys",
+    async () => {
+      const second = await issue();
+      assert.equal(second.status, 201);
+      const configurationIds = [];
+      for (const key of [issued.data, second.data]) {
+        const created = await request("POST", `/namespaces/${namespaceId}/configurations`, {
+          headers: { "x-api-key": key.key },
+          body: { kind: "agent", values: { model: "gpt-test" } },
+        });
+        assert.equal(created.status, 201);
+        configurationIds.push(created.data.id);
+        const mutation = auditSink.events.find(
+          (event) =>
+            event.action === "openclaw.configurations.create" &&
+            event.resource.id === created.data.id,
+        );
+        assert.equal(mutation.actorId, principal.id);
+        assert.equal(mutation.details?.actorServiceKeyId, key.id);
+      }
+      // A denial names the key too; the key's Role reads Presets but cannot create them.
+      const deniedBefore = auditSink.events.length;
+      assert.equal(
+        (
+          await request("POST", `/namespaces/${namespaceId}/presets`, {
+            headers: { "x-api-key": second.data.key },
+            body: { name: "denied-preset", template: { agent: { name: "Denied" } } },
+          })
+        ).status,
+        403,
+      );
+      const denial = auditSink.events
+        .slice(deniedBefore)
+        .find((event) => event.kind === "authorization_denial");
+      assert.equal(denial.actorId, principal.id);
+      assert.equal(denial.details?.actorServiceKeyId, second.data.id);
+      // The acting key joins the denial's IAM evidence; it does not replace it.
+      assert.equal(denial.details.iamEvidence.identityId, principal.id);
+      // Session requests carry no key; key management names the key acted on and its name.
+      for (const id of configurationIds) {
+        const deleted = await fetch(`${origin}/namespaces/${namespaceId}/configurations/${id}`, {
+          method: "DELETE",
+          headers: { cookie: session.cookie, origin: authOptions.baseURL },
+        });
+        assert.equal(deleted.status, 204);
+      }
+      assert.equal(
+        (await request("DELETE", `/api/auth/service-keys/${second.data.id}`)).status,
+        200,
+      );
+      for (const action of ["create", "revoke"]) {
+        const managed = auditSink.events.find(
+          (event) =>
+            event.action === `openclaw.auth.service-keys.${action}` &&
+            event.details.serviceKeyId === second.data.id,
+        );
+        assert.equal(managed.actorId, seed.principal.id);
+        assert.equal(managed.details.serviceKeyName, "tenant-automation");
+        assert.equal(Object.hasOwn(managed.details, "actorServiceKeyId"), false);
+      }
+      const sessionDeletes = auditSink.events.filter(
+        (event) =>
+          event.action === "openclaw.configurations.delete" &&
+          configurationIds.includes(event.resource.id),
+      );
+      assert.equal(sessionDeletes.length, 2);
+      for (const event of sessionDeletes) {
+        assert.equal(event.details?.actorServiceKeyId, undefined);
+      }
+      const recorded = JSON.stringify(auditSink.events);
+      assert.equal(recorded.includes(issued.data.key), false);
+      assert.equal(recorded.includes(second.data.key), false);
+    },
+  );
+
   await t.test("occ CLI exercises Configuration CRUD and Agent stop/delete", async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "openclaw-occ-cli-"));
     t.after(() => rm(directory, { recursive: true, force: true }));
@@ -823,12 +899,13 @@ test("service API keys authenticate scoped automation without replacing sessions
       }
       // Audits attribute issuance/revocation to the service actor, not the human
       // who originally issued its key, and never contain credential material.
-      for (const [action, key] of [
-        ["create", child.data],
-        ["create", replacement.data],
-        ["revoke", created.data],
-        ["revoke", child.data],
-        ["revoke", replacement.data],
+      // Each also names the key that acted (`actorServiceKeyId`) apart from the key acted on.
+      for (const [action, key, actorKey] of [
+        ["create", child.data, created.data],
+        ["create", replacement.data, created.data],
+        ["revoke", created.data, replacement.data],
+        ["revoke", child.data, replacement.data],
+        ["revoke", replacement.data, replacement.data],
       ]) {
         assert.ok(
           auditSink.events.some(
@@ -836,8 +913,11 @@ test("service API keys authenticate scoped automation without replacing sessions
               event.action === `openclaw.auth.service-keys.${action}` &&
               event.actorId === installationPrincipal.id &&
               event.details.serviceKeyId === key.id &&
+              event.details.serviceKeyName === key.name &&
+              event.details.actorServiceKeyId === actorKey.id &&
               event.details.servicePrincipalId === key.servicePrincipalId,
           ),
+          `${action} ${key.name}`,
         );
         assert.equal(JSON.stringify(auditSink.events).includes(key.key), false);
       }

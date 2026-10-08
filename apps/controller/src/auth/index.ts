@@ -866,6 +866,7 @@ export class ControllerAdmissionVerifier implements AdmissionVerifier {
         },
         decisionId: `adm_${randomUUID()}`,
         method: "api_key",
+        serviceKeyId: key.id,
       };
     }
 

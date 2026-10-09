@@ -256,6 +256,42 @@ test("sandbox ingress uses a separate listener outside OCE cookie scope", toolin
     render({ ...sandboxValues, "gatewayRouting.sandbox.listenerPort": "10443" }),
     /distinct from private Envoy HTTPS/,
   );
+  // Dedicated Agent hostnames are agent-<32 hex>.<domain>, so the domain stops at 253 - 39.
+  const longestLabel = "a".repeat(63);
+  const longestDomain = [longestLabel, longestLabel, "a".repeat(22), longestLabel].join(".");
+  const overlongDomain = [longestLabel, longestLabel, "a".repeat(23), longestLabel].join(".");
+  const hostnameLimitDomain = [longestLabel, longestLabel, longestLabel, "a".repeat(61)].join(".");
+  assert.equal(longestDomain.length, 214);
+  assert.equal(overlongDomain.length, 215);
+  assert.equal(hostnameLimitDomain.length, 253);
+  assert.equal(`agent-${"0".repeat(32)}.${longestDomain}`.length, 253);
+  const longest = await resources(
+    (await render({ ...sandboxValues, "gatewayRouting.sandbox.domain": longestDomain })).stdout,
+  );
+  assert.equal(
+    longest
+      .find((item) => item.kind === "Gateway")
+      .spec.listeners.find((item) => item.name === "sandbox").hostname,
+    `*.${longestDomain}`,
+  );
+  for (const domain of [
+    "a..b.com",
+    "example.com-",
+    "example.-com",
+    `${"a".repeat(64)}.test`,
+    "localhost",
+  ]) {
+    await assert.rejects(
+      render({ ...sandboxValues, "gatewayRouting.sandbox.domain": domain }),
+      /must be a DNS hostname/,
+    );
+  }
+  for (const domain of [overlongDomain, hostnameLimitDomain]) {
+    await assert.rejects(
+      render({ ...sandboxValues, "gatewayRouting.sandbox.domain": domain }),
+      /must not exceed 214 characters, leaving room for the agent-<32 hex>\. prefix/,
+    );
+  }
   await assert.rejects(
     render({
       ...sandboxValues,
@@ -2829,6 +2865,47 @@ test(
   },
 );
 
+test("the chart refuses administrator emails the bootstrap Job refuses", tooling, async () => {
+  const message = /bootstrap\.adminEmail must contain a valid administrator email/;
+  for (const email of [
+    "",
+    " ",
+    "not-an-email",
+    "a@b",
+    "a@b.",
+    "a@.com",
+    "a@b c.com",
+    "a@b\u00A0c.com",
+    "a@b\u000Bc.com",
+  ]) {
+    await assert.rejects(
+      render({}, { strings: { "bootstrap.adminEmail": email } }),
+      ({ code, stderr }) => code !== 0 && message.test(stderr),
+      JSON.stringify(email),
+    );
+  }
+  for (const email of [
+    "admin@example.invalid",
+    " Admin@Example.COM ",
+    "a@b.com ",
+    "\nadmin@example.com",
+    "\uFEFFadmin@example.com",
+    "\u0085a@b.com",
+  ]) {
+    const { stdout } = await render({}, { strings: { "bootstrap.adminEmail": email } });
+    const objects = await resources(stdout);
+    const job = objects.find(
+      (object) =>
+        object.kind === "Job" &&
+        object.metadata.labels?.["app.kubernetes.io/component"] === "initialization",
+    );
+    const value = job.spec.template.spec.containers
+      .find((container) => container.name === "bootstrap")
+      .env.find((entry) => entry.name === "OCC_BOOTSTRAP_ADMIN_EMAIL").value;
+    assert.equal(value, email);
+  }
+});
+
 test(
   "the real Helm renderer rejects mutable images, broad dependencies, and shared credentials",
   tooling,
@@ -3544,6 +3621,30 @@ test(
     });
   },
 );
+
+test("Helm rejects worker timings the worker process rejects", tooling, async () => {
+  for (const [key, value] of [
+    ["worker.pollIntervalMs", "0"],
+    ["worker.pollIntervalMs", "abc"],
+    ["worker.leaseDurationMs", "1.5"],
+    ["worker.maxAttempts", "-1"],
+    ["worker.convergenceTimeoutMs", "9007199254740993"],
+  ]) {
+    await assert.rejects(render({ [key]: value }), /must be a positive safe integer/);
+  }
+  const rendered = await render({ "worker.pollIntervalMs": "010" });
+  assert.match(rendered.stdout, /name: OCC_WORKER_POLL_INTERVAL_MS\n\s+value: "010"/);
+});
+
+test("Helm renders a values-file worker timeout of 1800000 as digits", tooling, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "occ-worker-timing-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const valuesFile = join(directory, "worker.yaml");
+  await writeFile(valuesFile, "worker:\n  convergenceTimeoutMs: 1800000\n", { mode: 0o600 });
+  const rendered = await render({}, { valuesFiles: [valuesFile] });
+  assert.match(rendered.stdout, /name: OCC_WORKER_CONVERGENCE_TIMEOUT_MS\n\s+value: "1800000"/);
+  assert.doesNotMatch(rendered.stdout, /OCC_WORKER_CONVERGENCE_TIMEOUT_MS\n\s+value: "1\.8e\+06"/);
+});
 
 test("Helm rejects obvious malformed quantity syntax", tooling, async () => {
   const collector = {

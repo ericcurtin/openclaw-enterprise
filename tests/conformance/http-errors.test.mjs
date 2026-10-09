@@ -20,6 +20,7 @@ import {
   ChannelDirectoryError,
   ConfigurationHarnessError,
   CredentialGatewayNotConfiguredError,
+  CredentialWithdrawalInProgressError,
   DeletionRetryOwnedError,
   DependencyUnavailableError,
   DeviceAuthorizationStartError,
@@ -164,6 +165,16 @@ const cases = [
       status: 409,
       code: "CREDENTIAL_GATEWAY_NOT_CONFIGURED",
       message: new CredentialGatewayNotConfiguredError().message,
+    },
+  ],
+  [
+    "a source delete blocked only by withdrawal work names the wait and Agent deletion",
+    new CredentialWithdrawalInProgressError(),
+    {
+      status: 409,
+      code: "CREDENTIAL_WITHDRAWAL_IN_PROGRESS",
+      message:
+        "A credential withdrawal is still queued or running for an Agent revision that held the source. Wait for it to finish (it retries for up to about an hour), or delete that revision's Agent, then retry.",
     },
   ],
   [

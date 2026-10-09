@@ -94,8 +94,10 @@ import {
 import {
   ActivationFailedError,
   ActivationPendingError,
+  agentEntryMessage,
   ComputeGatewaySettingError,
   ConfigurationHarnessError,
+  CredentialWithdrawalRefusedError,
   DependencyUnavailableError,
   ResourceConflictError,
   RuntimeCredentialsForbiddenByClusterError,
@@ -639,7 +641,7 @@ const UNREACHABLE_SOCKET_CODES = new Set([
   "UND_ERR_SOCKET",
 ]);
 
-function unreachableSocketFailure(error: unknown): boolean {
+export function unreachableSocketFailure(error: unknown): boolean {
   return unreachableSocketCause(error) !== undefined;
 }
 
@@ -1087,6 +1089,101 @@ function harnessWorkspaceCategories(oauth: boolean) {
     ? HARNESS_WORKSPACE_CATEGORIES
     : [...HARNESS_WORKSPACE_CATEGORIES, HARNESS_CODEX_SESSIONS_CATEGORY];
 }
+
+/**
+ * Init script that makes each Harness claim subdirectory a uid-1000 0700
+ * directory. The 2026-09-28 release had no Harness init, so the kubelet created
+ * `workspace` and `generated-images` for their subPath mounts: root-owned and
+ * group- and world-writable, which uid 1000 cannot chmod (EPERM, finding 752).
+ * The claim root is writable without a sticky bit, so such a directory is
+ * renamed aside, recreated by uid 1000, and its entries are renamed back. Every
+ * step is a rename on one filesystem, and a retried init resumes an interrupted
+ * move. An entry already present in the new directory stays aside, and is logged.
+ * A directory the tenant made read-only (chmod 0555) moves too (finding 884).
+ * The move assumes no other Pod writes the claim (dedicated Harnesses with node
+ * enrollment roll with Recreate).
+ */
+export function harnessWorkspacePreparationScript(paths: readonly string[]): string {
+  return `{
+  const fs = require("node:fs");
+  const uid = process.getuid();
+  const move = (from, to) => {
+    // Moving a directory to a new parent needs write on the directory itself, so an owned
+    // directory the tenant made read-only gets u+w for the rename and its mode back after
+    // (an init stopped in between leaves it owner-writable).
+    const stat = fs.lstatSync(from);
+    const locked = stat.isDirectory() && stat.uid === uid && (stat.mode & 0o200) === 0;
+    if (locked) fs.chmodSync(from, (stat.mode & 0o7777) | 0o200);
+    try {
+      fs.renameSync(from, to);
+    } catch (error) {
+      error.message += "; uid " + uid + " cannot move " + from + (stat.uid === uid
+        ? " (owned by uid " + uid + "): make its parent directory writable by uid " + uid
+        : " (owner uid " + stat.uid + "): chown it to uid " + uid) + " on the node";
+      if (locked) {
+        try {
+          fs.chmodSync(from, stat.mode & 0o7777);
+        } catch {}
+      }
+      throw error;
+    }
+    if (locked) fs.chmodSync(to, stat.mode & 0o7777);
+  };
+  for (const path of ${JSON.stringify(paths)}) {
+    const aside = path.replace(/\\/([^/]+)$/u, "/.$1.kubelet-created");
+    if (
+      fs.lstatSync(aside, { throwIfNoEntry: false }) === undefined &&
+      fs.lstatSync(path, { throwIfNoEntry: false })?.isDirectory()
+    ) {
+      try {
+        fs.chmodSync(path, 0o700);
+      } catch (error) {
+        if (error.code !== "EPERM") throw error;
+        move(path, aside);
+      }
+    }
+    fs.mkdirSync(path, { recursive: true, mode: 0o700 });
+    if (fs.lstatSync(aside, { throwIfNoEntry: false }) !== undefined) {
+      const kept = [];
+      for (const entry of fs.readdirSync(aside)) {
+        if (fs.lstatSync(path + "/" + entry, { throwIfNoEntry: false }) === undefined) {
+          move(aside + "/" + entry, path + "/" + entry);
+        } else {
+          kept.push(entry);
+        }
+      }
+      if (kept.length === 0) {
+        fs.rmdirSync(aside);
+      } else {
+        console.error("kept in " + aside + ", already in " + path + ": " +
+          JSON.stringify(kept.slice(0, 20)) + (kept.length > 20 ? " and " + (kept.length - 20) + " more" : ""));
+      }
+    }
+    fs.chmodSync(path, 0o700);
+  }
+}`;
+}
+/**
+ * Init script that removes a Harness claim subdirectory. `rmSync` cannot empty a
+ * directory the tenant made read-only, so owned directories get u+rwx first
+ * (finding 884). It never follows a symbolic link.
+ */
+export function harnessStateRemovalScript(path: string): string {
+  return `{
+  const fs = require("node:fs");
+  const pending = [${JSON.stringify(path)}];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    const stat = fs.lstatSync(directory, { throwIfNoEntry: false });
+    if (!stat?.isDirectory()) continue;
+    if (stat.uid === process.getuid() && (stat.mode & 0o700) !== 0o700) {
+      fs.chmodSync(directory, (stat.mode & 0o7777) | 0o700);
+    }
+    for (const entry of fs.readdirSync(directory)) pending.push(directory + "/" + entry);
+  }
+  fs.rmSync(${JSON.stringify(path)}, { recursive: true, force: true });
+}`;
+}
 const GATEWAY_SESSION_DIRECTORY = "/home/node/.openclaw/agents/main/sessions";
 const RESOURCE_REQUIREMENTS_SCHEMA = Object.freeze({
   type: "object",
@@ -1401,6 +1498,26 @@ function validateDnsHostname(value: string, description: string): void {
     !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/.test(value)
   ) {
     throw new ConfigurationFailure(`${description} must be a DNS hostname without a port or path.`);
+  }
+}
+
+// Dedicated Agent sandbox routes use agent-<32 hex>.<domain>; the 39-character prefix must
+// still fit the Gateway API Hostname limit of 253, so the domain itself stops at 214.
+const SANDBOX_DOMAIN_MAX_LENGTH = 253 - "agent-.".length - 32;
+
+function validateSandboxDomain(value: string): void {
+  validateDnsHostname(value, "Sandbox domain");
+  // Like the chart, require two labels: browsers and Node refuse a wildcard certificate
+  // directly under a single label (*.localhost), so such a domain could never serve previews.
+  if (!value.includes(".")) {
+    throw new ConfigurationFailure(
+      "Sandbox domain must have at least two DNS labels, such as previews.example.com.",
+    );
+  }
+  if (value.length > SANDBOX_DOMAIN_MAX_LENGTH) {
+    throw new ConfigurationFailure(
+      `Sandbox domain must not exceed ${SANDBOX_DOMAIN_MAX_LENGTH} characters, leaving room for the agent-<32 hex>. prefix of dedicated Agent hostnames.`,
+    );
   }
 }
 
@@ -1944,74 +2061,126 @@ function nativeRuntimeSnapshot(revision: AgentRevision): NativeRuntimeSnapshot |
 
 // Every topology here (embedded OpenClaw, dedicated OpenClaw or Codex) runs the pinned OpenClaw
 // Gateway on the admitted document. Its config validation rejects these roster shapes and the
-// Gateway then exits at startup (EX_CONFIG) instead of serving, so refuse them here. It drops
-// only an empty agents.list beside an implicit empty roster. A refusal, not a rewrite: OCC
-// skips this on status reads.
+// Gateway then exits at startup (EX_CONFIG) instead of serving, so refuse them here. The
+// Gateway drops only an empty agents.list beside an implicit empty roster, so that one passes.
+// A refusal, not a rewrite: OCC skips this on status reads.
 function requireOpenClawRoster(configuration: OpenClawConfigurationDocument): void {
+  // Each refusal names the setting and the rule it breaks. Keys come from the caller's own
+  // Configuration; agentEntryMessage quotes and bounds them.
   const agents = asRecord(configuration.agents);
+  if (configuration.agents !== undefined && agents === undefined) {
+    throw new ConfigurationHarnessError("The OpenClaw Gateway requires agents to be an object.");
+  }
   const roster = asRecord(agents?.entries);
-  // OpenClaw's schema: entries is a record of objects whose keys stay unique after its
-  // normalizeAgentId (lowercase; a key starting with _ also drops trailing dashes).
-  const ids = Object.keys(roster ?? {});
-  if (
-    (configuration.agents !== undefined && agents === undefined) ||
-    (agents?.entries !== undefined && roster === undefined) ||
-    Object.values(roster ?? {}).some((entry) => asRecord(entry) === undefined) ||
-    ids.some((id) => !/^[a-z0-9_][a-z0-9_-]{0,63}$/i.test(id)) ||
-    new Set(
-      ids.map((id) =>
-        id.startsWith("_") ? id.toLowerCase().replace(/-+$/, "") : id.toLowerCase(),
-      ),
-    ).size !== ids.length
-  ) {
+  if (agents?.entries !== undefined && roster === undefined) {
     throw new ConfigurationHarnessError(
-      "The OpenClaw Gateway requires agents and agents.entries to be objects, and each entry to be an object keyed by an Agent ID of up to 64 letters, digits, _ or -, not starting with -, that stays unique once OpenClaw normalizes it.",
+      "The OpenClaw Gateway requires agents.entries to be an object keyed by Agent ID.",
     );
   }
-  const rosterSize = ids.length;
+  // OpenClaw's schema: entries is a record of objects whose keys stay unique after its
+  // normalizeAgentId (lowercase; a key starting with _ also drops trailing dashes).
+  const entries = Object.entries(roster ?? {});
+  const normalized = new Map<string, string>();
+  for (const [id, entry] of entries) {
+    if (asRecord(entry) === undefined) {
+      throw new ConfigurationHarnessError(
+        agentEntryMessage(id, (path) => `The OpenClaw Gateway requires ${path} to be an object.`),
+      );
+    }
+    if (!/^[a-z0-9_][a-z0-9_-]{0,63}$/i.test(id)) {
+      throw new ConfigurationHarnessError(
+        agentEntryMessage(
+          id,
+          (path) =>
+            `The OpenClaw Gateway rejects the Agent ID in ${path}: use up to 64 letters, digits, _ or -, not starting with -.`,
+        ),
+      );
+    }
+    // A valid ID is plain and at most 64 characters, so both names fit the message cap.
+    const key = id.startsWith("_") ? id.toLowerCase().replace(/-+$/, "") : id.toLowerCase();
+    const first = normalized.get(key);
+    if (first !== undefined) {
+      throw new ConfigurationHarnessError(
+        `The OpenClaw Gateway normalizes agents.entries.${first} and agents.entries.${id} to the same Agent ID: rename one.`,
+      );
+    }
+    normalized.set(key, id);
+  }
+  const rosterSize = entries.length;
   const explicit = agents?.ownership === "explicit";
   if (
-    (agents?.list !== undefined &&
-      !(Array.isArray(agents.list) && agents.list.length === 0 && rosterSize === 0 && !explicit)) ||
-    Object.values(roster ?? {}).some((entry) => asRecord(entry)?.default !== undefined) ||
-    (agents?.ownership !== undefined && !explicit) ||
-    (rosterSize > 1 && !explicit) ||
-    (explicit && rosterSize === 0)
+    agents?.list !== undefined &&
+    !(Array.isArray(agents.list) && agents.list.length === 0 && rosterSize === 0 && !explicit)
   ) {
     throw new ConfigurationHarnessError(
-      'The OpenClaw Gateway rejects agents.list, agents.entries default markers, an agents.ownership other than "explicit", a multi-Agent roster without it, and an explicit one without entries.',
+      "The OpenClaw Gateway rejects agents.list: remove it and configure each Agent under agents.entries, keyed by its Agent ID.",
+    );
+  }
+  const marked = entries.find(([, entry]) => asRecord(entry)?.default !== undefined);
+  if (marked !== undefined) {
+    throw new ConfigurationHarnessError(
+      agentEntryMessage(
+        marked[0],
+        (path) => `The OpenClaw Gateway rejects ${path}.default: remove it.`,
+      ),
+    );
+  }
+  if (agents?.ownership !== undefined && !explicit) {
+    throw new ConfigurationHarnessError(
+      'The OpenClaw Gateway accepts only "explicit" for agents.ownership: set it to "explicit", or remove it if agents.entries has at most one entry.',
+    );
+  }
+  if (rosterSize > 1 && !explicit) {
+    throw new ConfigurationHarnessError(
+      'The OpenClaw Gateway needs agents.ownership "explicit" for more than one agents.entries entry: set it, or keep one entry.',
+    );
+  }
+  if (explicit && rosterSize === 0) {
+    throw new ConfigurationHarnessError(
+      'The OpenClaw Gateway needs at least one agents.entries entry when agents.ownership is "explicit": add one, or remove agents.ownership.',
     );
   }
 }
 
 // OpenClaw's default Agent (the sole entry, or a named session store or system owner) keeps
 // its own workspace, while the Gateway, file transfer and workspace files address main. A
-// refusal, not a rewrite: OCC skips this on status reads.
+// refusal, not a rewrite: OCC skips this on status reads. Each refusal names the setting and
+// the rule it breaks, as requireOpenClawRoster's do. It runs after requireOpenClawRoster, so
+// agents and agents.entries are objects when present, and an explicit roster has at least one
+// entry.
 function requireNativeMainAgentDefault(configuration: OpenClawConfigurationDocument): void {
   const agents = asRecord(configuration.agents);
-  const roster = asRecord(agents?.entries);
-  const explicit = agents?.ownership === "explicit";
   const defaults = asRecord(agents?.defaults);
   // OpenClaw matches normalized ids case-insensitively, as the OpenShell workspace pin does.
   const isMain = (id: unknown) => typeof id === "string" && id.trim().toLowerCase() === "main";
-  const owners = [
-    asRecord(defaults?.sessionStore)?.agentId,
-    asRecord(defaults?.systemAgent)?.agentId,
-  ];
-  const entries = Object.entries(roster ?? {});
-  // OpenClaw reads an empty roster as `{ main: {} }` unless ownership is explicit.
-  const implicitMain = roster !== undefined && entries.length === 0 && !explicit;
-  if (
-    owners.some((owner) => owner !== undefined && !isMain(owner)) ||
-    // An explicit roster without entries has no Agent, so it fails like an empty one.
-    ((agents?.entries !== undefined || explicit) &&
-      !implicitMain &&
-      // Other spellings normalize to ids OpenClaw may match first, so keys must be canonical.
-      (entries.some(([id]) => !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(id)) ||
-        !entries.some(([id]) => isMain(id))))
-  ) {
+  for (const owner of ["sessionStore", "systemAgent"] as const) {
+    const agentId = asRecord(defaults?.[owner])?.agentId;
+    if (agentId !== undefined && !isMain(agentId)) {
+      throw new ConfigurationHarnessError(
+        `Dedicated OpenClaw serves the main Agent: set agents.defaults.${owner}.agentId to main, or remove it.`,
+      );
+    }
+  }
+  const entries = Object.entries(asRecord(agents?.entries) ?? {});
+  // OpenClaw reads a missing or empty roster as `{ main: {} }` unless ownership is explicit,
+  // which requireOpenClawRoster refuses.
+  if (entries.length === 0) {
+    return;
+  }
+  // Other spellings normalize to ids OpenClaw may match first, so keys must be canonical.
+  const spelled = entries.find(([id]) => !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(id));
+  if (spelled !== undefined) {
     throw new ConfigurationHarnessError(
-      "Dedicated OpenClaw serves the main Agent: agents.entries needs canonical keys including main, and only main may be the default, session store, or system Agent.",
+      agentEntryMessage(
+        spelled[0],
+        (path) =>
+          `Dedicated OpenClaw rejects the Agent ID in ${path}: use up to 64 letters, digits, _ or -, starting with a letter or digit.`,
+      ),
+    );
+  }
+  if (!entries.some(([id]) => isMain(id))) {
+    throw new ConfigurationHarnessError(
+      "Dedicated OpenClaw serves the main Agent: add agents.entries.main, or rename an entry to main.",
     );
   }
 }
@@ -2561,7 +2730,7 @@ export class KubernetesComputeDriver implements ComputeDriver {
       );
       validatePort(routing.envoyHttpsTargetPort ?? 10443, "Envoy HTTPS target port");
       if (routing.sandbox !== undefined) {
-        validateDnsHostname(required(routing.sandbox.domain, "Sandbox domain"), "Sandbox domain");
+        validateSandboxDomain(required(routing.sandbox.domain, "Sandbox domain"));
         validatePort(routing.sandbox.publicPort ?? 443, "Public sandbox port");
         validatePort(options.network.gatewayPort + 1, "Gateway sandbox port");
         if (options.runtime === undefined) {
@@ -5665,13 +5834,39 @@ export class KubernetesComputeDriver implements ComputeDriver {
   /**
    * Revokes one credential source from the revision's paired Sandbox. The Sandbox identity is
    * derived exactly as provisioning created it; a missing Namespace or Sandbox has nothing left
-   * to revoke.
+   * to revoke. A configuration that cannot reach the Sandbox, or an object this Driver does
+   * not own, is a CredentialWithdrawalRefusedError: retrying cannot change it.
    */
   async withdrawCredentialSource(
     revision: Readonly<AgentRevision>,
     source: Readonly<CredentialSource>,
     signal: AbortSignal,
     options: { readonly recheck?: boolean } = {},
+  ): Promise<CredentialAttachmentStatus> {
+    try {
+      return await this.withdrawSandboxCredentialSource(revision, source, signal, options);
+    } catch (error) {
+      if (error instanceof ConfigurationFailure || error instanceof ConfigurationHarnessError) {
+        throw new CredentialWithdrawalRefusedError(
+          "CREDENTIAL_WITHDRAWAL_MISCONFIGURED",
+          error.message,
+        );
+      }
+      if (error instanceof OwnershipFailure) {
+        throw new CredentialWithdrawalRefusedError(
+          "CREDENTIAL_WITHDRAWAL_OWNERSHIP_CONFLICT",
+          error.message,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async withdrawSandboxCredentialSource(
+    revision: Readonly<AgentRevision>,
+    source: Readonly<CredentialSource>,
+    signal: AbortSignal,
+    options: { readonly recheck?: boolean },
   ): Promise<CredentialAttachmentStatus> {
     if (
       revision.compute.id !== this.id ||
@@ -12576,21 +12771,19 @@ chmodSync(${JSON.stringify(nodeStatePath)}, 0o700);`;
         name: HARNESS_WORKSPACE_VOLUME,
         mountPath: "/harness-workspace-state",
       });
-      (initialization.args as string[])[0] += `
-for (const path of ${JSON.stringify(
+      (initialization.args as string[])[0] += `\n${harnessWorkspacePreparationScript(
         harnessWorkspaceCategories(oauth).map(([subPath]) => `/harness-workspace-state/${subPath}`),
-      )}) {
-  mkdirSync(path, { recursive: true, mode: 0o700 });
-  chmodSync(path, 0o700);
-}`;
+      )}`;
       if (oauth) {
         // An OAuth home starts without earlier history, as a new OAuth source does.
-        (initialization.args as string[])[0] += `
-require("node:fs").rmSync("/harness-workspace-state/codex-sessions", { recursive: true, force: true });`;
+        (initialization.args as string[])[0] += `\n${harnessStateRemovalScript(
+          "/harness-workspace-state/codex-sessions",
+        )}`;
       } else {
         // A revision without OAuth must not leave a personal login refreshing on the volume.
-        (initialization.args as string[])[0] += `
-require("node:fs").rmSync("/harness-workspace-state/codex-home", { recursive: true, force: true });`;
+        (initialization.args as string[])[0] += `\n${harnessStateRemovalScript(
+          "/harness-workspace-state/codex-home",
+        )}`;
       }
     }
     if (dedicated && role === "gateway") {

@@ -165,7 +165,8 @@ ChatGPT Backend admin credential path:
 
 Managed issuance is separate from the default `codex_pat` path. The rendered
 Backend and ServiceAccount Driver wiring does not prove that live
-service-account creation works.
+service-account creation works. Optional `credentialTtlSeconds` must be an
+integer from 1 through 2592000, the lifetime the API accepts; omit it to use 2592000.
 
 To show Installation administrators an external **Observability** console link,
 set `controlPlane.observabilityUrl`. The renderer writes it as

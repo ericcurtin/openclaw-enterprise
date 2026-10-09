@@ -692,6 +692,11 @@
                     "type": "string"
                   },
                   {
+                    "const": "CREDENTIAL_WITHDRAWAL_IN_PROGRESS",
+                    "description": "Only credential withdrawal work still queued or running for an Agent revision that held the source keeps it from being deleted.",
+                    "type": "string"
+                  },
+                  {
                     "const": "SERVICE_ACCOUNT_DRIVER_NOT_CONFIGURED",
                     "description": "The Installation has no ChatGPT Backend, so service-account credentials cannot be issued, used for Harness authentication, or revoked to delete their account.",
                     "type": "string"

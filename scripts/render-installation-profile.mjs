@@ -12,7 +12,22 @@ const profilesDir = resolve(repoRoot, "deploy/profiles");
 const allowedProfiles = new Set(["openclaw", "codex"]);
 const helmReleaseName = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
 const digestImage = /^[^@\s]+@sha256:[a-f0-9]{64}$/;
-const proxyUrl = /^https?:\/\/(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}:[1-9][0-9]{0,4}$/;
+// The chart and Node's URL parser both refuse an octet above 255 and a port above 65535.
+// The shape check alone still matches 192.0.2.999 and port 99999.
+function isLiteralIpv4ProxyUrl(value) {
+  const match =
+    /^https?:\/\/((?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}):([1-9][0-9]{0,4})$/.exec(
+      value,
+    );
+  if (!match) {
+    return false;
+  }
+  if (match[1].split(".").some((octet) => Number(octet) > 255)) {
+    return false;
+  }
+  const port = Number(match[2]);
+  return Number.isInteger(port) && port <= 65535;
+}
 const dnsHostname =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
@@ -263,6 +278,11 @@ function observabilityDestination(value) {
   );
 }
 
+// The chart refuses ".", "..", and any database.caKey that is not a basename.
+function simpleBasename(value) {
+  return value !== "." && value !== ".." && /^[A-Za-z0-9._-]+$/.test(value);
+}
+
 function optionalString(source, path, diagnostics, { pattern, validate, description } = {}) {
   const value = source[path.at(-1)];
   if (value === undefined) {
@@ -293,13 +313,17 @@ function asBoolean(source, path, diagnostics, fallback = false) {
   return value;
 }
 
-function optionalPositiveInteger(source, path, diagnostics) {
+function optionalPositiveInteger(source, path, diagnostics, { max } = {}) {
   const value = source[path.at(-1)];
   if (value === undefined) {
     return undefined;
   }
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    diagnostics.errors.push(`${path.join(".")} must be a positive integer when supplied.`);
+  if (!Number.isSafeInteger(value) || value < 1 || (max !== undefined && value > max)) {
+    diagnostics.errors.push(
+      max === undefined
+        ? `${path.join(".")} must be a positive integer when supplied.`
+        : `${path.join(".")} must be an integer from 1 through ${max} when supplied.`,
+    );
     return undefined;
   }
   return value;
@@ -346,15 +370,21 @@ function stringArray(
   return value;
 }
 
+// parseCidr accepts only "0" or a decimal prefix with no leading zero. Number("08") is 8,
+// which would admit a prefix the API and the chart both refuse.
+function decimalPrefix(rawPrefix) {
+  if (!/^(0|[1-9][0-9]*)$/.test(rawPrefix ?? "")) {
+    return Number.NaN;
+  }
+  return Number(rawPrefix);
+}
+
 function isIpv4Cidr(value, requiredPrefix) {
   const [address, rawPrefix, extra] = value.split("/");
   if (extra !== undefined || rawPrefix === undefined || isIP(address) !== 4) {
     return false;
   }
-  if (!/^[0-9]+$/.test(rawPrefix)) {
-    return false;
-  }
-  const prefix = Number(rawPrefix);
+  const prefix = decimalPrefix(rawPrefix);
   if (!Number.isSafeInteger(prefix) || prefix < 1 || prefix > 32) {
     return false;
   }
@@ -458,14 +488,49 @@ const githubTeam = /^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9][a-z0-9_-]{0,99}$/;
 const trustedProxyPresets = ["ingress-nginx", "aws", "generic"];
 const passwordSignInPolicies = ["all", "recovery-only"];
 
+// Ported from the API's trusted-proxy parser (apps/controller/src/auth/client-address.ts
+// ipv6Groups and parseCidr), which the chart mirrors. Expands an address isIP accepted.
+function ipv6Groups(address) {
+  const hex = address.replace(/\d+\.\d+\.\d+\.\d+$/, (tail) => {
+    const octets = tail.split(".").map(Number);
+    return `${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`;
+  });
+  const [head, tail] = hex.split("::");
+  const left = head === "" ? [] : head.split(":");
+  const right = tail === undefined || tail === "" ? [] : tail.split(":");
+  const zeros = tail === undefined ? [] : Array(8 - left.length - right.length).fill("0");
+  return [...left, ...zeros, ...right].map((group) => parseInt(group, 16));
+}
+
+// A trusted proxy CIDR as the API and the chart accept it. The chart refuses zone IDs,
+// which isIP accepts. An IPv4-mapped address (::ffff:0:0/96) is an IPv4 address to the API,
+// so its prefix is 1 through 32. Any other IPv6 range that contains all of ::ffff:0:0/96
+// would trust every IPv4 peer, because BlockList matches IPv4 peers against it.
 function isCidr(value) {
   const [address, rawPrefix, extra] = value.split("/");
   const family = isIP(address ?? "");
-  if (extra !== undefined || family === 0 || !/^[0-9]+$/.test(rawPrefix ?? "")) {
+  if (extra !== undefined || family === 0 || address.includes("%")) {
     return false;
   }
-  const prefix = Number(rawPrefix);
-  return prefix >= 1 && prefix <= (family === 4 ? 32 : 128);
+  const prefix = decimalPrefix(rawPrefix);
+  if (!Number.isSafeInteger(prefix) || prefix < 1 || prefix > (family === 4 ? 32 : 128)) {
+    return false;
+  }
+  if (family === 4) {
+    return true;
+  }
+  const groups = ipv6Groups(address);
+  if (groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff) {
+    return prefix <= 32;
+  }
+  const coversIpv4 =
+    prefix <= 96 &&
+    groups.slice(0, 6).every((group, index) => {
+      const shift = 16 - Math.min(16, Math.max(0, prefix - index * 16));
+      const mappedGroup = index === 5 ? 0xffff : 0;
+      return group >> shift === mappedGroup >> shift;
+    });
+  return !coversIpv4;
 }
 
 function signInProvider(source, name, diagnostics) {
@@ -634,7 +699,8 @@ function renderTrustedProxy(source, diagnostics) {
   });
   const cidrs = stringArray(source, [...path, "cidrs"], diagnostics, {
     validate: isCidr,
-    description: "an IPv4 or IPv6 CIDR with a nonzero prefix",
+    description:
+      "an IPv4 or IPv6 CIDR with a nonzero prefix, no zone ID, a prefix of 1 through 32 for an IPv4-mapped address, and not covering every IPv4 address",
   });
   const clientAddressHeader = optionalString(
     source,
@@ -1025,8 +1091,10 @@ function buildRendered(profile, parsed, diagnostics) {
               diagnostics,
             ),
             caKey:
-              optionalString(databaseCa, ["controlPlane", "databaseCa", "key"], diagnostics) ??
-              "ca.pem",
+              optionalString(databaseCa, ["controlPlane", "databaseCa", "key"], diagnostics, {
+                validate: simpleBasename,
+                description: "a simple basename",
+              }) ?? "ca.pem",
             caMountPath:
               optionalString(
                 databaseCa,
@@ -1045,7 +1113,7 @@ function buildRendered(profile, parsed, diagnostics) {
               ["channels", "directoryProxyUrl"],
               diagnostics,
               {
-                pattern: proxyUrl,
+                validate: isLiteralIpv4ProxyUrl,
                 description: "an HTTP(S) literal IPv4 endpoint with an explicit port",
               },
             ),
@@ -1265,7 +1333,7 @@ function buildRendered(profile, parsed, diagnostics) {
                 : {
                     channels: {
                       proxyUrl: asString(channels, ["channels", "runtimeProxyUrl"], diagnostics, {
-                        pattern: proxyUrl,
+                        validate: isLiteralIpv4ProxyUrl,
                         description: "an HTTP(S) literal IPv4 endpoint with an explicit port",
                       }),
                     },
@@ -1322,6 +1390,8 @@ function buildRendered(profile, parsed, diagnostics) {
               managedServiceAccounts,
               ["codex", "managedServiceAccounts", "credentialTtlSeconds"],
               diagnostics,
+              // packages/occ validateBackendDefinitions refuses a larger lifetime.
+              { max: 2_592_000 },
             ) ?? 2_592_000,
         },
         drivers: {

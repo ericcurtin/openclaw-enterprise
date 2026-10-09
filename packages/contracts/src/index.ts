@@ -1878,7 +1878,9 @@ export interface ComputeDriver extends Driver {
    * Revokes `source` from the revision's paired Sandbox through the selected Credential
    * Gateway. Returns `revoked` only after the gateway confirms revocation, and `absent` when
    * the revision has no Sandbox or attachment left to revoke. Required for withdrawal.
-   * `options.recheck` is passed through to the gateway's withdrawal context.
+   * `options.recheck` is passed through to the gateway's withdrawal context. Throws OCC's
+   * CredentialWithdrawalRefusedError when retrying cannot help: a configuration that cannot
+   * reach the revision's Sandbox, or an object the Driver does not own.
    */
   withdrawCredentialSource?(
     revision: Readonly<AgentRevision>,

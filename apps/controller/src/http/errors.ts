@@ -12,6 +12,7 @@ import {
   ConfigurationHarnessError,
   CredentialGatewayNotConfiguredError,
   CredentialSourceDriverError,
+  CredentialWithdrawalInProgressError,
   DependencyUnavailableError,
   DeviceAuthorizationStartError,
   IAMAccessBindingRoleError,
@@ -649,6 +650,10 @@ export function requestFailure(error: unknown): RequestFailure {
   }
   if (error instanceof CredentialGatewayNotConfiguredError) {
     return failure(409, "CREDENTIAL_GATEWAY_NOT_CONFIGURED", error.message);
+  }
+  if (error instanceof CredentialWithdrawalInProgressError) {
+    // A fixed message naming the way out; raised only after delete on the source and its lookup.
+    return failure(409, "CREDENTIAL_WITHDRAWAL_IN_PROGRESS", error.message);
   }
   if (error instanceof ServiceAccountDriverNotConfiguredError) {
     // A fixed message naming the fix; raised only after the account's grant and lookup.

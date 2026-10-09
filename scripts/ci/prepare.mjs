@@ -942,79 +942,94 @@ async function buildRuntimeImages(
           .slice(0, 17)
       : state.prefix;
   const tagBase = `localhost/${ownedName("openclaw-ci-image", label, { maxLength: 48 })}`;
+  const openclawSource = runtime ? process.env.OCC_K3D_OPENCLAW_SOURCE : undefined;
   if (controller) {
     assertNodeBaseImage(nodeBaseImage);
+  }
+  if (openclawSource !== undefined) {
+    if (!isAbsolute(openclawSource) || !(await stat(join(openclawSource, "Dockerfile"))).isFile()) {
+      throw new Error("OCC_K3D_OPENCLAW_SOURCE must select an absolute OpenClaw source checkout");
+    }
+    if (!/^[a-f0-9]{40,64}$/u.test(process.env.OCC_K3D_OPENCLAW_COMMIT ?? "")) {
+      throw new Error("OCC_K3D_OPENCLAW_COMMIT must identify the selected OpenClaw source");
+    }
+  }
+  const builds = [];
+  if (controller) {
     const tag = `${tagBase}/controller:local`;
-    const resource = addResource(state, "image-tag", { name: tag, owner: state.prefix });
-    resources.push(resource);
-    await writeState(statePath, state);
-    await build("controller", [
-      ...imageBuildArgs(state, "controller", localStore, cacheWarm),
-      ...progress,
-      "--pull=false",
-      "--target",
-      "runtime",
-      "--build-arg",
-      `NODE_BASE_IMAGE=${nodeBaseImage}`,
-      "-t",
+    builds.push({
+      role: "controller",
       tag,
-      ".",
-    ]);
-    await markResourceReady(statePath, state, resource);
-    env.OCC_TEST_PRODUCTION_IMAGE = tag;
-    env.OCC_TEST_PRODUCTION_CONTROLLER_IMAGE = tag;
+      args: [
+        ...imageBuildArgs(state, "controller", localStore, cacheWarm),
+        ...progress,
+        "--pull=false",
+        "--target",
+        "runtime",
+        "--build-arg",
+        `NODE_BASE_IMAGE=${nodeBaseImage}`,
+        "-t",
+        tag,
+        ".",
+      ],
+      env: { OCC_TEST_PRODUCTION_IMAGE: tag, OCC_TEST_PRODUCTION_CONTROLLER_IMAGE: tag },
+    });
   }
   if (runtime) {
-    const openclawSource = process.env.OCC_K3D_OPENCLAW_SOURCE;
-    if (openclawSource !== undefined) {
-      if (
-        !isAbsolute(openclawSource) ||
-        !(await stat(join(openclawSource, "Dockerfile"))).isFile()
-      ) {
-        throw new Error("OCC_K3D_OPENCLAW_SOURCE must select an absolute OpenClaw source checkout");
-      }
-      if (!/^[a-f0-9]{40,64}$/u.test(process.env.OCC_K3D_OPENCLAW_COMMIT ?? "")) {
-        throw new Error("OCC_K3D_OPENCLAW_COMMIT must identify the selected OpenClaw source");
-      }
-    }
     const tag = `${tagBase}/runtime:local`;
-    const resource = addResource(state, "image-tag", { name: tag, owner: state.prefix });
-    resources.push(resource);
-    await writeState(statePath, state);
-    await build(
-      "runtime",
-      openclawSource === undefined
-        ? [
-            ...imageBuildArgs(state, "runtime", localStore, cacheWarm),
-            ...progress,
-            "--pull=false",
-            "-f",
-            runtimeDockerfile,
-            "-t",
-            tag,
-            repositoryRoot,
-          ]
-        : [
-            "build",
-            ...(localStore && basename(process.env.OCC_DOCKER_BIN ?? "docker") !== "podman"
-              ? ["--builder", "default", "--load"]
-              : []),
-            "--build-arg",
-            "OPENCLAW_DOCKER_BUILD_SKIP_DTS=1",
-            "-t",
-            tag,
-            openclawSource,
-          ],
-    );
-    await markResourceReady(statePath, state, resource);
-    env.OCC_TEST_RUNTIME_IMAGE = tag;
-    env.OCC_DOCKER_RUNTIME_IMAGE = tag;
-    env.OCC_DOCKER_GATEWAY_IMAGE = tag;
-    env.OCC_DOCKER_AGENT_IMAGE = tag;
-    env.OCC_TEST_KUBERNETES_RUNTIME_IMAGE = tag;
-    if (openclawSource !== undefined) {
-      env.OCC_K3D_OPENCLAW_COMMIT = process.env.OCC_K3D_OPENCLAW_COMMIT;
-    }
+    builds.push({
+      role: "runtime",
+      tag,
+      args:
+        openclawSource === undefined
+          ? [
+              ...imageBuildArgs(state, "runtime", localStore, cacheWarm),
+              ...progress,
+              "--pull=false",
+              "-f",
+              runtimeDockerfile,
+              "-t",
+              tag,
+              repositoryRoot,
+            ]
+          : [
+              "build",
+              ...(localStore && basename(process.env.OCC_DOCKER_BIN ?? "docker") !== "podman"
+                ? ["--builder", "default", "--load"]
+                : []),
+              "--build-arg",
+              "OPENCLAW_DOCKER_BUILD_SKIP_DTS=1",
+              "-t",
+              tag,
+              openclawSource,
+            ],
+      env: {
+        OCC_TEST_RUNTIME_IMAGE: tag,
+        OCC_DOCKER_RUNTIME_IMAGE: tag,
+        OCC_DOCKER_GATEWAY_IMAGE: tag,
+        OCC_DOCKER_AGENT_IMAGE: tag,
+        OCC_TEST_KUBERNETES_RUNTIME_IMAGE: tag,
+        ...(openclawSource === undefined
+          ? {}
+          : { OCC_K3D_OPENCLAW_COMMIT: process.env.OCC_K3D_OPENCLAW_COMMIT }),
+      },
+    });
+  }
+  // Record every tag before any build starts. The builds are independent, so
+  // they run together and take as long as the slower one instead of their sum.
+  for (const entry of builds) {
+    entry.resource = addResource(state, "image-tag", { name: entry.tag, owner: state.prefix });
+    resources.push(entry.resource);
+  }
+  await writeState(statePath, state);
+  await prepareTogether(
+    builds.map((entry) => async () => {
+      await build(entry.role, entry.args);
+      await markResourceReady(statePath, state, entry.resource);
+    }),
+  );
+  for (const entry of builds) {
+    Object.assign(env, entry.env);
   }
   return { env, resourceIds: resources.map((resource) => resource.id) };
 }
@@ -1114,6 +1129,8 @@ async function ensureK3dCluster(statePath, state) {
       `127.0.0.1:${apiPort}`,
       "--kubeconfig-update-default=false",
       "--kubeconfig-switch-context=false",
+      "--lb-config-override",
+      `settings.workerConnections=${k3dLoadBalancerWorkerConnections}`,
       // Keep failed fixture containers for diagnostics; registered cleanup
       // owns their deletion after collection, including partial creation.
       ...(crossNodePluginStatus ? ["--no-rollback"] : []),
@@ -1198,6 +1215,14 @@ async function ensureK3dCluster(statePath, state) {
   await markResourceReady(statePath, state, resource);
   return resource;
 }
+
+// k3d's serverlb (nginx) in front of the API server allows 1024 connections per
+// worker, and each proxied API connection counts twice. The connections appear to
+// land on one worker: drops started once the serverlb held about 1,024. The k3d
+// Fixture and Configuration lane peaked at 1,050-1,080 on the 32vcpu runner
+// (530-760 on ubuntu-22.04), and kubectl reported "Unable to connect to the
+// server: EOF" (finding 682). With this limit it peaks at about 2,000.
+const k3dLoadBalancerWorkerConnections = 8192;
 
 // Hosted CI creates a cluster, node image pull included, in 26-48 s (284 runs,
 // 2026-10-08: p50 27 s, p99 44 s). A create that never returns once held a lane

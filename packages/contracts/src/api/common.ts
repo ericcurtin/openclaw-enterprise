@@ -839,6 +839,7 @@ export const ERROR_CODES = Object.freeze([
   "INTERNAL_ERROR",
   "DEPENDENCY_UNAVAILABLE",
   "CREDENTIAL_GATEWAY_NOT_CONFIGURED",
+  "CREDENTIAL_WITHDRAWAL_IN_PROGRESS",
   "SERVICE_ACCOUNT_DRIVER_NOT_CONFIGURED",
   "REPOSITORY_OPTIONS_UNAVAILABLE",
   "MODEL_DISCOVERY_CREDENTIALS_REJECTED",
@@ -913,6 +914,10 @@ export const ErrorResponse = Type.Object(
           Type.Literal("CREDENTIAL_GATEWAY_NOT_CONFIGURED", {
             description:
               "The Installation selects no Credential Gateway, so credential sources cannot be registered.",
+          }),
+          Type.Literal("CREDENTIAL_WITHDRAWAL_IN_PROGRESS", {
+            description:
+              "Only credential withdrawal work still queued or running for an Agent revision that held the source keeps it from being deleted.",
           }),
           Type.Literal("SERVICE_ACCOUNT_DRIVER_NOT_CONFIGURED", {
             description:

@@ -1192,3 +1192,110 @@ test("preflight rejects external sign-in and trusted proxy inputs Helm would rej
     /controlPlane.trustedProxy.cidrs\[0\] must be/,
   );
 });
+
+test("preflight rejects CIDR prefixes with a leading zero", () => {
+  const controlPlane = baseInput().controlPlane;
+  assertPreflightFailure(
+    "openclaw",
+    baseInput({
+      controlPlane: { ...controlPlane, databaseCidrs: ["192.0.2.10/032"] },
+    }),
+    /controlPlane\.databaseCidrs\[0\] must be an IPv4 \/32 CIDR/,
+  );
+  assertPreflightFailure(
+    "openclaw",
+    baseInput({
+      controlPlane: { ...controlPlane, gatewayTrustedProxyCidrs: ["192.0.2.12/08"] },
+    }),
+    /controlPlane\.gatewayTrustedProxyCidrs\[0\] must be an IPv4 CIDR/,
+  );
+  assertPreflightFailure(
+    "openclaw",
+    baseInput({
+      controlPlane: {
+        ...controlPlane,
+        trustedProxy: { preset: "ingress-nginx", cidrs: ["2001:db8::/032"] },
+      },
+    }),
+    /controlPlane\.trustedProxy\.cidrs\[0\] must be an IPv4 or IPv6 CIDR/,
+  );
+  const accepted = render(
+    "openclaw",
+    baseInput({
+      controlPlane: { ...controlPlane, gatewayTrustedProxyCidrs: ["192.0.2.12/8"] },
+    }),
+  );
+  assert.match(accepted.installation, /192\.0\.2\.12\/8/);
+});
+
+test("preflight rejects channel proxy URLs with an invalid octet or port", () => {
+  const message = /must be an HTTP\(S\) literal IPv4 endpoint with an explicit port/;
+  assertPreflightFailure(
+    "openclaw",
+    baseInput({ channels: { directoryProxyUrl: "http://192.0.2.999:8080" } }),
+    message,
+  );
+  assertPreflightFailure(
+    "openclaw",
+    baseInput({ channels: { runtimeProxyUrl: "http://192.0.2.10:99999" } }),
+    message,
+  );
+  const accepted = render(
+    "openclaw",
+    baseInput({
+      channels: {
+        directoryProxyUrl: "http://192.0.2.10:8080",
+        runtimeProxyUrl: "http://192.0.2.10:8080",
+      },
+    }),
+  );
+  assert.match(accepted.values, /channelDirectoryProxyUrl: http:\/\/192\.0\.2\.10:8080/);
+  assert.match(accepted.installation, /proxyUrl: http:\/\/192\.0\.2\.10:8080/);
+});
+
+test("profiles refuse database CA keys the chart refuses", () => {
+  const withCa = (key) =>
+    baseInput({
+      controlPlane: {
+        ...baseInput().controlPlane,
+        databaseCa: { secretName: "occ-db-ca", ...(key === undefined ? {} : { key }) },
+      },
+    });
+  const accepted = render("openclaw", withCa("db_ca.pem"));
+  assert.equal(accepted.summary.ok, true, accepted.preflight.errors.join("\n"));
+  assert.match(accepted.values, /caKey: db_ca.pem/);
+  const omitted = render("openclaw", withCa(undefined));
+  assert.equal(omitted.summary.ok, true, omitted.preflight.errors.join("\n"));
+  assert.match(omitted.values, /caKey: ca.pem/);
+  for (const key of [".", "..", "ca/pem", "ca pem"]) {
+    assertPreflightFailure(
+      "openclaw",
+      withCa(key),
+      /controlPlane.databaseCa.key must be a simple basename/,
+    );
+  }
+});
+
+test("profiles refuse ChatGPT credential lifetimes the API refuses", () => {
+  const accounts = {
+    workspaceId: "11111111-1111-4111-8111-111111111111",
+    adminSecretName: "occ-chatgpt-admin",
+    adminSecretKey: "admin-key",
+    providerCidr: "192.0.2.21/32",
+  };
+  const accepted = render(
+    "codex",
+    managedCodexInput({
+      codex: { managedServiceAccounts: { ...accounts, credentialTtlSeconds: 2_592_000 } },
+    }),
+  );
+  assert.equal(accepted.summary.ok, true, accepted.preflight.errors.join("\n"));
+  assert.match(accepted.installation, /credentialTtlSeconds: 2592000/);
+  assertPreflightFailure(
+    "codex",
+    managedCodexInput({
+      codex: { managedServiceAccounts: { ...accounts, credentialTtlSeconds: 2_592_001 } },
+    }),
+    /codex.managedServiceAccounts.credentialTtlSeconds must be an integer from 1 through 2592000/,
+  );
+});

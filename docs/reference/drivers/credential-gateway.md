@@ -62,7 +62,10 @@ The contract has no optional methods. `SecretDriver.withValue` is the
 passes to `registerSource` and `updateSource`. Withdrawal also needs two optional
 methods on its collaborators: Compute's `withdrawCredentialSource`, which the
 worker calls, and the Sandbox Driver's `harnessResource`, which returns the exact
-Sandbox a revision runs in without side effects.
+Sandbox a revision runs in without side effects. Compute throws
+`CredentialWithdrawalRefusedError` when its configuration cannot reach that
+Sandbox or it finds an object it does not own; the worker then fails the
+withdrawal without retrying.
 
 ## IAM
 

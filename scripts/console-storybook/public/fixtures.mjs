@@ -410,6 +410,9 @@ export function installFixture(scenario, evidence) {
       ),
     );
   }
+  if (scenario.presetAgent) {
+    Object.assign(preset.template.agent, structuredClone(scenario.presetAgent));
+  }
   if (scenario.presetWorkspaceFiles) {
     preset.template.agent.initialWorkspaceFiles = structuredClone(scenario.presetWorkspaceFiles);
   }
@@ -1087,6 +1090,18 @@ export function installFixture(scenario, evidence) {
           const revisionId = suffix.split("/")[2];
           if (url.searchParams.get("download") === "true") {
             // Downloads are a text/plain attachment, not a JSON envelope.
+            if (scenario.runtimeLogDownloadNoPod) {
+              return new Response(
+                `# agent=${id} revision=${revisionId} source=${url.searchParams.get("source")} observedAt=2026-09-27T11:41:10.000Z withheld=0\n`,
+                {
+                  status: 200,
+                  headers: {
+                    "content-type": "text/plain; charset=utf-8",
+                    "content-disposition": `attachment; filename="${id}-${revisionId}-${url.searchParams.get("source")}-no-pod.log"`,
+                  },
+                },
+              );
+            }
             return new Response(
               [
                 "2026-09-27T11:40:01.120Z info wrapper runtime.startup_phase container=gateway phase=config outcome=ok ms=12",

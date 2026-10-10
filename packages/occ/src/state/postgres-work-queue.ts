@@ -12,6 +12,7 @@ import {
   type ControllerWorkAttempt,
   type ControllerWorkKind,
   type ControllerWorkState,
+  type DeferredWork,
   type EnqueueWork,
   type PermanentFailure,
   type RetryableFailure,
@@ -497,9 +498,10 @@ const FAIL_EXHAUSTED_NAMESPACES_SQL = `
  * transitioned rows get a row; it is appended to the evidence SELECT's WHERE clause. A failure
  * that ends the work item (`failed_permanent`) also carries `final: true`, so it differs from a
  * retry with the same reason code.
- * `reasonCode` is a raw SQL expression: pass parameters or constants, never input.
+ * `reasonCode` and `details` are raw SQL expressions: pass parameters or constants, never input.
+ * `details` (a jsonb expression) adds fields to the evidence details.
  */
-const insertEvidenceCteSql = (filter = "", reasonCode = "$4::text") => `
+const insertEvidenceCteSql = (filter = "", reasonCode = "$4::text", details = "'{}'::jsonb") => `
   evidence_targets AS (
     SELECT transitioned.*,
       CASE WHEN ${repositoryCleanupSql("transitioned")} THEN
@@ -538,6 +540,7 @@ const insertEvidenceCteSql = (filter = "", reasonCode = "$4::text") => `
         'workId', transitioned.idempotency_key)
         || CASE WHEN transitioned.state = 'failed_permanent'
              THEN jsonb_build_object('final', true) ELSE '{}'::jsonb END
+        || ${details}
     FROM evidence_targets AS transitioned
     WHERE true ${filter}
     RETURNING id
@@ -551,10 +554,13 @@ const INSERT_EVIDENCE_SQL = `${INSERT_EVIDENCE_CTE_SQL}
  * same revision work item adds no row. Retries, failures, and completions are always recorded.
  * The lookup matches the `audit_events_work_attempt_idx` partial index, which covers revision
  * work only; other callers that know a deferral repeats one already recorded pass `$9` false.
+ * `$11` true records a repeat too, so its time shows the work is still retrying; `$10` names the
+ * refusal a refused-candidate stop waits to publish.
  */
-const INSERT_DEFER_EVIDENCE_SQL = `${insertEvidenceCteSql(`
+const INSERT_DEFER_EVIDENCE_SQL = `${insertEvidenceCteSql(
+  `
       AND $9::boolean
-      AND NOT EXISTS (
+      AND ($11::boolean OR NOT EXISTS (
         SELECT 1 FROM (
           SELECT prior.outcome, prior.details->>'reasonCode' AS reason_code
           FROM occ.audit_events AS prior
@@ -568,7 +574,10 @@ const INSERT_DEFER_EVIDENCE_SQL = `${insertEvidenceCteSql(`
           LIMIT 1
         ) AS latest
         WHERE latest.outcome = $3::text AND latest.reason_code = $4::text
-      )`)}
+      ))`,
+  "$4::text",
+  "CASE WHEN $10::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('refusal', $10::text) END",
+)}
   SELECT transitioned.* FROM transitioned`;
 const SETTLE_PROVISIONING_FAILURE_SQL = `
   settled_provisioning_failures AS (
@@ -943,11 +952,16 @@ export class PostgresWorkQueue {
     return found.rows[0] === undefined ? undefined : asWork(found.rows[0]);
   }
 
-  async findWorkAttempt(idempotencyKey: string): Promise<ControllerWorkAttempt | undefined> {
+  /** The latest evidence bound to this work item, or the latest with `code` when given. */
+  async findWorkAttempt(
+    idempotencyKey: string,
+    code?: string,
+  ): Promise<ControllerWorkAttempt | undefined> {
     // A revision can also have maintenance and cleanup work. Only evidence bound
     // to this exact work item can explain its progress; unbound history is unknown.
     const found = await this.client.query(
-      `SELECT event.occurred_at, event.details->>'reasonCode' AS reason_code
+      `SELECT event.occurred_at, event.details->>'reasonCode' AS reason_code,
+         event.details->>'refusal' AS refusal
        FROM occ.controller_work AS work
        JOIN occ.audit_events AS event
          ON event.namespace_id = work.namespace_id AND event.actor_id = work.actor_id
@@ -955,14 +969,23 @@ export class PostgresWorkQueue {
          AND event.kind = 'mutation' AND event.action = 'reconcile'
          AND event.details->>'workId' = work.idempotency_key
          AND event.occurred_at >= work.created_at
+         AND ($2::text IS NULL OR event.details->>'reasonCode' = $2::text)
        WHERE work.idempotency_key = $1
        ORDER BY event.occurred_at DESC, event.id DESC LIMIT 1`,
-      [nonempty(idempotencyKey, "Controller work idempotency key")],
+      [
+        nonempty(idempotencyKey, "Controller work idempotency key"),
+        code === undefined ? null : nonempty(code, "Controller work attempt code"),
+      ],
     );
-    const row = found.rows[0] as { occurred_at: Date | string; reason_code: string } | undefined;
+    const row = found.rows[0] as
+      { occurred_at: Date | string; reason_code: string; refusal: string | null } | undefined;
     return row === undefined
       ? undefined
-      : Object.freeze({ at: asDate(row.occurred_at), code: row.reason_code });
+      : Object.freeze({
+          at: asDate(row.occurred_at),
+          code: row.reason_code,
+          ...(row.refusal === null ? {} : { refusal: row.refusal }),
+        });
   }
 
   async complete(claim: WorkClaim, result: WorkResult = {}): Promise<void> {
@@ -1024,17 +1047,26 @@ export class PostgresWorkQueue {
   /**
    * `recordEvidence: false` is for a caller that knows this deferral repeats the waiting state it
    * already recorded for the same work item (the evidence lookup covers revision work only).
+   * `repeatEvidence: true` records a deferral even when it repeats the latest evidence, for a
+   * wait whose deferrals are minutes apart and whose readers need to see it is still retrying.
    */
   async defer(
     claim: WorkClaim,
-    pending: RetryableFailure,
-    options: { readonly delayMs?: number; readonly recordEvidence?: boolean } = {},
+    pending: DeferredWork,
+    options: {
+      readonly delayMs?: number;
+      readonly recordEvidence?: boolean;
+      readonly repeatEvidence?: boolean;
+    } = {},
   ): Promise<void> {
     validateClaim(claim);
     if (options.delayMs !== undefined && !isPositiveSafeInteger(options.delayMs)) {
       throw new ScopeViolationError("The deferred Work delay is invalid.");
     }
-    if (options.recordEvidence !== undefined && typeof options.recordEvidence !== "boolean") {
+    if (
+      (options.recordEvidence !== undefined && typeof options.recordEvidence !== "boolean") ||
+      (options.repeatEvidence !== undefined && typeof options.repeatEvidence !== "boolean")
+    ) {
       throw new ScopeViolationError("The deferred Work evidence option is invalid.");
     }
     const deferred = await this.client.query(
@@ -1067,6 +1099,8 @@ export class PostgresWorkQueue {
         this.nextRandom(),
         options.delayMs ?? null,
         options.recordEvidence ?? true,
+        pending.refusal === undefined ? null : safeFailureCode(pending.refusal),
+        options.repeatEvidence ?? false,
       ],
     );
     if (deferred.rows.length === 0) {

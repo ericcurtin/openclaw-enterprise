@@ -803,6 +803,9 @@ test(
     );
 
     // A replay is a new request with its own retries; with the gateway back it revokes the source.
+    // The replay's series is due at once, so the worker stops first: a running worker could claim
+    // it before it is read here.
+    await fixture.stop();
     gateway.down = false;
     const replayed = await fixture.controller.withdrawAgentCredentialSource(
       fixture.actor.id,
@@ -811,6 +814,7 @@ test(
     assert.equal(replayed.withdrawalInProgress, true);
     const replay = await queuedWithdrawal(fixture, active);
     assert.ok(!replay.idempotencyKey.startsWith(first.idempotencyKey));
+    await startWithGateway(fixture, compute);
     await fixture.work(replay, "succeeded");
     const revoked = await read();
     assert.equal(revoked.state, "revoked");

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createControlledClock } from "../fixtures/repository-credentials/clock.mjs";
 import test, { after } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { SandboxRevisionUnsupportedError } from "../../packages/occ/src/index.ts";
 import { requiresPostgres } from "../helpers/postgres-backend-state.mjs";
 import { waitFor } from "../helpers/wait-for.mjs";
 import { createWorkerRevisionFixtures } from "../helpers/postgres-worker-revision-fixture.mjs";
@@ -191,8 +192,9 @@ revisionTest(
   { timeout: 30_000 },
 );
 
-function countingExclusiveCompute(fixture, { ready, onPrepare } = {}) {
+function countingExclusiveCompute(fixture, { ready, onPrepare, runtimeFailure } = {}) {
   const running = new Set();
+  const agents = new Map();
   const prepared = [];
   const stops = new Map();
   const compute = {
@@ -201,13 +203,18 @@ function countingExclusiveCompute(fixture, { ready, onPrepare } = {}) {
     async prepareRevision(revision) {
       const overlap = [...running].filter((id) => id !== revision.id);
       running.add(revision.id);
+      agents.set(revision.id, revision.agentId);
       prepared.push(revision.id);
       await onPrepare?.(revision, overlap);
-      // The candidate cannot become ready while any predecessor still runs.
-      const exclusive = [...running].every((id) => id === revision.id);
+      // The candidate cannot become ready while any predecessor of its Agent still runs.
+      const exclusive = [...running].every(
+        (id) => id === revision.id || agents.get(id) !== revision.agentId,
+      );
+      const failure = runtimeFailure?.(revision);
       return {
         ...(await fixture.compute.prepareRevision(revision)),
-        ready: exclusive && (ready?.(revision) ?? true),
+        ready: exclusive && failure === undefined && (ready?.(revision) ?? true),
+        ...(failure === undefined ? {} : { runtimeFailure: failure }),
       };
     },
     async stopRevision(revision) {
@@ -271,6 +278,354 @@ revisionTest(
     assert.deepEqual([...driver.running], [recovery.id]);
   },
   { timeout: 60_000 },
+);
+
+// Finding 990: exclusive replacement stops the active revision before its candidate's first
+// pass. On Kubernetes the candidate then took over the Agent's Gateway, so when a later pass
+// refused it because its actor lost `deploy`, its Pods kept answering chat with a deployment
+// OCC had rejected while the recorded active revision had no workload. A refused candidate is
+// stopped before its failure is published. A runtime that failed by itself (here a held model
+// probe) keeps its Pods for diagnosis on its version's Logs tab. Either way the pointer still
+// names the stopped predecessor: OCC never rolls back, and recovery is a new revision.
+// "unsupported" is a refusal thrown by the pass itself rather than decided by its observation.
+const refusals = { revoked: "AUTHORIZATION_DENIED", unsupported: "SANDBOX_HARNESS_UNSUPPORTED" };
+for (const { failure, stopFailures = 0, convergenceTimeoutMs, maxAttempts } of [
+  { failure: "revoked" },
+  // A failed stop must not publish the refusal with the candidate still running: the work
+  // waits, repeats the refusal and the stop, and the refusal keeps its code.
+  { failure: "revoked", stopFailures: 1 },
+  { failure: "unsupported", stopFailures: 1 },
+  // A stop outage outlasts the attempt budget (here 2) and the convergence deadline: ending the
+  // work then would leave the refused candidate serving with nothing left to stop it.
+  { failure: "revoked", stopFailures: 3, convergenceTimeoutMs: 2_000, maxAttempts: 2 },
+  { failure: "held" },
+]) {
+  const refused = failure !== "held";
+  test(
+    `a ${failure} exclusive candidate ${refused ? "is stopped" : "stays for diagnosis"} when its deployment fails${stopFailures === 0 ? "" : ` after ${stopFailures} failed stops`}`,
+    { ...requiresPostgres, timeout: 60_000 },
+    async (context) => {
+      const fixture = await setup(context, maxAttempts === undefined ? {} : { maxAttempts });
+      const owner = await fixture.agent(`exclusive-failed-${failure}`, {
+        executionMode: "dedicated",
+      });
+      let candidateId;
+      let candidatePasses = 0;
+      const driver = countingExclusiveCompute(fixture, {
+        // The candidate's first pass starts its runtime but is not ready yet.
+        ready: (revision) => revision.id !== candidateId,
+        runtimeFailure: (revision) =>
+          failure === "held" && revision.id === candidateId && candidatePasses > 1
+            ? {
+                component: "agent",
+                check: "model-probe",
+                checkedAt: "2026-10-10T02:24:00.000Z",
+                code: "MODEL_PROBE_FAILED",
+                cause: { kind: "PROBE_STATUS", detail: "format" },
+              }
+            : undefined,
+        async onPrepare(revision) {
+          if (revision.id !== candidateId) {
+            return;
+          }
+          candidatePasses += 1;
+          if (failure === "revoked" && candidatePasses === 1) {
+            // Revoke deploy authority after the runtime started, as removing the actor's grants
+            // did on oce-dogfood-b; the worker's recheck on the next pass denies it.
+            await fixture.observerPool.query(
+              `INSERT INTO occ.iam_restrictions
+                 (id, namespace_id, action, resource_kind, resource_id, effect)
+               VALUES ($1, $2, 'deploy', 'agent', $3, 'deny')`,
+              [`restriction-${randomUUID()}`, fixture.namespace.id, owner.id],
+            );
+          }
+          if (failure === "unsupported" && candidatePasses > 1) {
+            throw new SandboxRevisionUnsupportedError("SANDBOX_HARNESS_UNSUPPORTED", "test");
+          }
+        },
+      });
+      const events = [];
+      let failedStops = 0;
+      await fixture.start(
+        {
+          ...driver.compute,
+          async stopRevision(revision) {
+            if (revision.id === candidateId && failedStops < stopFailures) {
+              failedStops += 1;
+              throw new Error("Kubernetes API temporarily unavailable");
+            }
+            return driver.compute.stopRevision(revision);
+          },
+        },
+        {
+          emit: (event) => events.push(event),
+          ...(convergenceTimeoutMs === undefined ? {} : { convergenceTimeoutMs }),
+        },
+      );
+      const first = await fixture.revision(owner, 1);
+      await fixture.work(first, "succeeded");
+      const deployed = Date.now();
+      const replacement = await fixture.revision(owner, 2);
+      candidateId = replacement.id;
+      await fixture.work(replacement, "failed_permanent", 30_000);
+      assert.equal(failedStops, stopFailures);
+      if (convergenceTimeoutMs !== undefined) {
+        assert.ok(Date.now() - deployed > convergenceTimeoutMs, "the stop outlasted the deadline");
+      }
+      const result = await fixture.workResult(replacement);
+      assert.equal(result.rows[0].reason_code, refusals[failure] ?? "RUNTIME_MODEL_PROBE_FAILED");
+      // A thrown pass forgets the sweep record, so the retry repeats the idempotent stop.
+      const predecessorStops = failure === "unsupported" ? 2 : 1;
+      assert.equal(driver.count(first), predecessorStops, "replacement stopped the predecessor");
+      if (refused) {
+        assert.equal(driver.count(replacement), 1, "the refused candidate is stopped once");
+        assert.deepEqual([...driver.running], [], "nothing serves the Agent");
+        const waited = events.filter(
+          ({ event, workId, refusal }) =>
+            event === "worker.completed" &&
+            workId === replacement.idempotencyKey &&
+            refusal === refusals[failure],
+        );
+        assert.deepEqual(
+          waited.map(({ outcome, code }) => [outcome, code]),
+          Array.from({ length: stopFailures }, () => ["pending", "REFUSED_CANDIDATE_STOP_PENDING"]),
+        );
+      } else {
+        assert.equal(driver.count(replacement), 0, "the failed runtime stays for diagnosis");
+        assert.deepEqual([...driver.running], [replacement.id]);
+      }
+      const active = await fixture.activePointer(owner);
+      assert.equal(active.rows[0].active_revision_id, first.id);
+    },
+  );
+}
+
+/**
+ * Starts the refused-candidate scenario: an exclusive Agent whose first revision activated and
+ * whose replacement's first pass started its runtime, after which `refuse` makes later passes
+ * refuse it. `stopRevision(revision)` returns undefined to use the counting driver's stop or a
+ * promise that replaces it, for example a failing stop.
+ */
+async function startRefusedCandidate(
+  fixture,
+  label,
+  { refuse = "revoked", stopRevision = () => undefined, emit, ready } = {},
+) {
+  const owner = await fixture.agent(label, { executionMode: "dedicated" });
+  let candidateId;
+  let candidatePasses = 0;
+  const driver = countingExclusiveCompute(fixture, {
+    ready: (revision) => revision.id !== candidateId && (ready?.(revision) ?? true),
+    async onPrepare(revision) {
+      if (revision.id !== candidateId) {
+        return;
+      }
+      candidatePasses += 1;
+      if (refuse === "revoked" && candidatePasses === 1) {
+        // The actor loses deploy authority after the runtime started; the next pass denies it.
+        await fixture.observerPool.query(
+          `INSERT INTO occ.iam_restrictions
+             (id, namespace_id, action, resource_kind, resource_id, effect)
+           VALUES ($1, $2, 'deploy', 'agent', $3, 'deny')`,
+          [`restriction-${randomUUID()}`, fixture.namespace.id, owner.id],
+        );
+      }
+      if (refuse === "unsupported" && candidatePasses > 1) {
+        // A refusal decided by the pass after the newer-revision check.
+        throw new SandboxRevisionUnsupportedError("SANDBOX_HARNESS_UNSUPPORTED", "test");
+      }
+    },
+  });
+  await fixture.start(
+    {
+      ...driver.compute,
+      async stopRevision(revision) {
+        return (
+          (revision.id === candidateId ? stopRevision(revision) : undefined) ??
+          driver.compute.stopRevision(revision)
+        );
+      },
+    },
+    { emit },
+  );
+  const first = await fixture.revision(owner, 1);
+  await fixture.work(first, "succeeded");
+  const replacement = await fixture.revision(owner, 2);
+  candidateId = replacement.id;
+  return { owner, first, replacement, driver };
+}
+
+/** Passes that could not stop the refused candidate: their log names the refusal. */
+function refusedStopWaits(events, candidate) {
+  return events.filter(
+    ({ event, workId, outcome, refusal }) =>
+      event === "worker.completed" &&
+      workId === candidate.idempotencyKey &&
+      outcome === "pending" &&
+      refusal !== undefined,
+  );
+}
+
+// Finding 1003: while the refused candidate's stop keeps failing, deployment status named a
+// generic dependency failure and its last attempt time never moved. It now names the refusal the
+// deployment will record, which its reader may already see as the failed deployment's `error`,
+// and every waiting pass moves `lastAttempt.at`.
+revisionTest(
+  "a refused candidate whose stop keeps failing shows the refusal in deployment status",
+  async (fixture) => {
+    const events = [];
+    let stopping = false;
+    const { owner, replacement, driver } = await startRefusedCandidate(fixture, "refused-status", {
+      emit: (event) => events.push(event),
+      stopRevision: () =>
+        stopping ? undefined : Promise.reject(new Error("Kubernetes API temporarily unavailable")),
+    });
+    await waitFor("the refused stop to fail", async () =>
+      refusedStopWaits(events, replacement).length > 0 ? true : undefined,
+    );
+    const waiting = await fixture.deploymentStatus(owner, replacement);
+    assert.ok(["queued", "running"].includes(waiting.status), waiting.status);
+    assert.equal(waiting.error, null);
+    assert.equal(waiting.progress.lastAttempt.code, "REFUSED_CANDIDATE_STOP_PENDING");
+    assert.equal(
+      waiting.progress.lastAttempt.message,
+      "Deployment refused (AUTHORIZATION_DENIED); stopping the refused version before recording the failure. The controller will retry.",
+    );
+    // A pass that starts after this read records a newer attempt, though its result repeats.
+    const seen = refusedStopWaits(events, replacement).length;
+    await waitFor("another failed refused stop", async () =>
+      refusedStopWaits(events, replacement).length > seen ? true : undefined,
+    );
+    const later = await fixture.deploymentStatus(owner, replacement);
+    assert.equal(later.progress.lastAttempt.code, "REFUSED_CANDIDATE_STOP_PENDING");
+    assert.ok(
+      Date.parse(later.progress.lastAttempt.at) > Date.parse(waiting.progress.lastAttempt.at),
+      "the last attempt time moves while the stop is retried",
+    );
+    stopping = true;
+    await fixture.work(replacement, "failed_permanent", 30_000);
+    const failed = await fixture.deploymentStatus(owner, replacement);
+    assert.equal(failed.error.code, "AUTHORIZATION_DENIED");
+    assert.deepEqual([...driver.running], [], "the refused candidate was stopped");
+  },
+  { timeout: 60_000 },
+);
+
+// Finding 1002: the worker is serial, and a refused candidate's stop can block it for minutes
+// (Kubernetes waits for its Pods to terminate). Rechecked every 0.5-5 s, such a stop took every
+// other turn from every other Agent. Each failed stop now doubles its recheck and waits at least
+// four times as long as the stop took, so another Agent's deployment runs its readiness passes
+// between the stops.
+revisionTest(
+  "a slow failing refused stop backs off so another Agent's deployment keeps its cadence",
+  async (fixture) => {
+    const events = [];
+    const stopStarts = [];
+    const otherPasses = [];
+    let otherId;
+    const { replacement } = await startRefusedCandidate(fixture, "refused-slow", {
+      emit: (event) => events.push(event),
+      // The other Agent's deployment needs ten readiness passes.
+      ready: (revision) => {
+        if (revision.id !== otherId) {
+          return true;
+        }
+        otherPasses.push(Date.now());
+        return otherPasses.length >= 10;
+      },
+      async stopRevision() {
+        // Stands in for a Pod-termination wait that ends in an error.
+        stopStarts.push(Date.now());
+        await delay(1_000);
+        throw new Error("Pods did not terminate before the deadline");
+      },
+    });
+    // Let the backoff grow past four times the stop's duration (4, 4, 4, 4 and then 8 s).
+    await waitFor(
+      "five failed refused stops",
+      async () => (refusedStopWaits(events, replacement).length >= 5 ? true : undefined),
+      45_000,
+    );
+    const other = await fixture.agent("refused-slow-other", { executionMode: "dedicated" });
+    const otherRevision = await fixture.revision(other, 1);
+    otherId = otherRevision.id;
+    await fixture.work(otherRevision, "succeeded", 45_000);
+    // Without the backoff a stop ran between every two of the other Agent's passes (nine).
+    const interleaved = stopStarts.filter(
+      (at) => at > otherPasses[0] && at < otherPasses.at(-1),
+    ).length;
+    assert.ok(interleaved <= 2, `${interleaved} refused stops ran during the other deployment`);
+    // Each 1 s stop is followed by at least 4 s in which other work can run.
+    const gaps = stopStarts.slice(1).map((at, index) => at - stopStarts[index]);
+    assert.ok(
+      gaps.every((gap) => gap >= 4_900),
+      `refused stops started ${gaps.join(", ")} ms apart`,
+    );
+  },
+  { timeout: 120_000 },
+);
+
+// Finding 1004: a refusal decided after the check for a newer revision (here a Sandbox that
+// cannot run the revision; also lost repository authority or a Secret problem) waits on its
+// stop like any refusal. Once a newer revision was admitted, its next pass finished as
+// REVISION_SUPERSEDED without the stop, leaving the refused candidate to the newer deployment's
+// sweep, which gives up at its own deadline. The superseded pass now finishes the stop first.
+test(
+  "a refused candidate superseded while its stop fails is stopped before it completes",
+  { ...requiresPostgres, timeout: 120_000 },
+  async (context) => {
+    // The newer revision's own sweep fails on the same stop and retries until it succeeds.
+    const fixture = await setup(context, { maxAttempts: 20 });
+    const events = [];
+    let stopping = false;
+    const { owner, replacement, driver } = await startRefusedCandidate(
+      fixture,
+      "refused-superseded",
+      {
+        refuse: "unsupported",
+        emit: (event) => events.push(event),
+        stopRevision: () =>
+          stopping
+            ? undefined
+            : Promise.reject(new Error("Kubernetes API temporarily unavailable")),
+      },
+    );
+    await waitFor("the refused stop to fail", async () =>
+      refusedStopWaits(events, replacement).length > 0 ? true : undefined,
+    );
+    const newer = await fixture.revision(owner, 3);
+    const admitted = events.length;
+    // A pass already running at admission may finish after it, so the second pass after the
+    // admission is the first that surely saw the newer revision. Both keep waiting on the stop.
+    const passes = () =>
+      events
+        .slice(admitted)
+        .filter(
+          ({ event, workId }) =>
+            event === "worker.completed" && workId === replacement.idempotencyKey,
+        );
+    await waitFor("two candidate passes after the newer admission, or its end", async () =>
+      passes().length >= 2 || passes().some(({ outcome }) => outcome !== "pending")
+        ? true
+        : undefined,
+    );
+    assert.deepEqual(
+      passes().map(({ outcome, code, refusal }) => [outcome, code, refusal]),
+      passes().map(() => [
+        "pending",
+        "REFUSED_CANDIDATE_STOP_PENDING",
+        "SANDBOX_HARNESS_UNSUPPORTED",
+      ]),
+    );
+    assert.ok(driver.running.has(replacement.id), "the stop has not succeeded yet");
+    stopping = true;
+    await fixture.work(replacement, "succeeded", 30_000);
+    const result = await fixture.workResult(replacement);
+    assert.equal(result.rows[0].reason_code, "REVISION_SUPERSEDED");
+    assert.ok(!driver.running.has(replacement.id), "the refused candidate was stopped");
+    // Its sweep retried on the queue's growing backoff while the stop failed.
+    await fixture.work(newer, "succeeded", 75_000);
+  },
 );
 
 test(

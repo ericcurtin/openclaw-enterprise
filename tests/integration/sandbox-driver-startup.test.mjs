@@ -1,18 +1,25 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { join } from "node:path";
 import test from "node:test";
 import pg from "pg";
-import { OpenShellGateway } from "../../apps/controller/src/backends/openshell.ts";
+import {
+  OpenShellGateway,
+  createOpenShellBackend,
+} from "../../apps/controller/src/backends/openshell.ts";
 import { OpenShellCredentialGatewayDriver } from "../../apps/controller/src/drivers/credential-gateway/openshell.ts";
 import { createKubernetesComputeDriver } from "../../apps/controller/src/drivers/compute/kubernetes/index.ts";
+import { OpenShellCredentialRefreshDriver } from "../../apps/controller/src/drivers/credential-refresh/openshell.ts";
 import { RUNTIME_WRAPPER_COMMAND } from "../../apps/controller/src/drivers/compute/kubernetes/runtime-entrypoints.ts";
 import { nodeProgramArguments } from "../../apps/controller/src/drivers/compute/node-program.ts";
 import { OpenShellSandboxDriver } from "../../apps/controller/src/drivers/sandbox/openshell.ts";
 import {
+  normalizeServiceUrl,
   OpenShellProviderAlreadyExistsError,
   OpenShellRequestReplayRefusedError,
   OpenShellSandboxAlreadyExistsError,
 } from "../../apps/controller/src/drivers/sandbox/openshell-gateway-client.ts";
+import { serviceTarget } from "../../apps/controller/src/drivers/sandbox/openshell-service-transport.ts";
 import { createControllerWorker } from "../../apps/controller/src/worker.ts";
 import {
   CredentialSourceRevisionError,
@@ -405,6 +412,69 @@ test("startup composes both OpenShell members from one Backend", async (t) => {
     sandbox: createdDriver.sandboxDriver.id,
     credential_gateway: createdDriver.credentialGatewayDriver.id,
   });
+});
+
+test("startup pairs the Credential Refresh Driver with its gateway on one OpenShell Backend", async (t) => {
+  const refreshing = () => {
+    const configuration = sandboxInstallation();
+    configuration.backend[0].drivers.credential_refresh = "openshell-refresh";
+    configuration.drivers.credential_refresh = { id: "openshell-refresh", configuration: {} };
+    configuration.drivers.credential_gateway.configuration.toolBinaries = ["/usr/bin/curl"];
+    return configuration;
+  };
+  const createdDriver = await loadInstallationFile(t, refreshing());
+  assert.ok(createdDriver.credentialRefreshDriver instanceof OpenShellCredentialRefreshDriver);
+  assert.deepEqual(createdDriver.installation.backend[0].drivers, {
+    sandbox: "openshell-sandbox",
+    credential_gateway: "openshell-credentials",
+    credential_refresh: "openshell-refresh",
+  });
+  // The gateway offers refresh types only when its Backend can mint their tokens.
+  const signal = AbortSignal.timeout(2_000);
+  const offered = await createdDriver.credentialGatewayDriver.listSourceTypes({ signal });
+  assert.deepEqual(
+    offered.filter(({ rotation }) => rotation === "refresh").map(({ type }) => type),
+    ["oauth2-client-credentials", "oauth2-refresh-token"],
+  );
+  // The issuer replaces a refresh token on use, so an update must not re-send the recorded one.
+  assert.deepEqual(
+    offered.flatMap(({ type, secrets }) =>
+      secrets
+        .filter(({ issuerRotated }) => issuerRotated === true)
+        .map(({ name }) => `${type}.${name}`),
+    ),
+    ["oauth2-refresh-token.refresh_token"],
+  );
+  const withoutRefresh = sandboxInstallation();
+  withoutRefresh.drivers.credential_gateway.configuration.toolBinaries = ["/usr/bin/curl"];
+  const staticOnly = await loadInstallationFile(t, withoutRefresh);
+  assert.deepEqual(
+    (await staticOnly.credentialGatewayDriver.listSourceTypes({ signal })).map(({ type }) => type),
+    ["openai", "bearer-token"],
+  );
+
+  // Refresh state lives on the gateway's provider records, so the roles cannot be split.
+  const unselected = refreshing();
+  delete unselected.drivers.credential_refresh;
+  await assert.rejects(
+    loadInstallationFile(t, unselected),
+    /drivers\.credential_refresh must match the selected drivers\.credential_refresh\.id/,
+  );
+  const undeclared = refreshing();
+  delete undeclared.backend[0].drivers.credential_refresh;
+  await assert.rejects(
+    loadInstallationFile(t, undeclared),
+    /drivers\.credential_refresh must match the selected drivers\.credential_refresh\.id/,
+  );
+  const withoutGateway = refreshing();
+  delete withoutGateway.drivers.credential_gateway;
+  await assert.rejects(
+    loadInstallationFile(t, withoutGateway),
+    /drivers\.credential_refresh requires drivers\.credential_gateway/,
+  );
+  const configured = refreshing();
+  configured.drivers.credential_refresh.configuration = { interval: 60 };
+  await assert.rejects(loadInstallationFile(t, configured), /configuration/);
 });
 
 test("startup rejects an OpenShell Backend whose members are not both selected", async (t) => {
@@ -2417,4 +2487,162 @@ test("OpenShell observes the Codex Harness through its exact bearer-passthrough 
     /managed workspace mode is not implemented; cannot observe a Harness/,
   );
   assert.deepEqual(observed, []);
+});
+
+test("OpenShell startup admits exactly the endpoints both consumers can parse and dial", async (t) => {
+  // Each consumer parses the endpoint once per gateway call: the gRPC path through its
+  // service URL normalization, the service transport through its connect target.
+  const consumers = {
+    grpc: (endpoint) => normalizeServiceUrl("http://service.example.test/", endpoint),
+    service: (endpoint) =>
+      serviceTarget({ endpoint, requestTimeoutMs: 1000 }, "http://service.example.test/"),
+  };
+  const throws = (parse, endpoint) => {
+    try {
+      parse(endpoint);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  // [form, admitted]: one row per shape, each spelled bare, http:// and https:// where it applies.
+  const rows = [
+    ["gateway.example.test:8080", true],
+    ["gateway.example.test:1", true],
+    ["gateway.example.test:65535", true],
+    ["gateway.example.test:080", true],
+    ["127.0.0.1:8080", true],
+    ["[::1]:8080", true],
+    ["gateway.example.test:0", false],
+    ["gateway.example.test:00", false],
+    ["gateway.example.test:65536", false],
+    ["gateway.example.test:99999", false],
+    ["1.2.3.999:8080", false],
+    ["gate%way.example.test:8080", false],
+    ["[::1]:0", false],
+    ["[::1]:65536", false],
+    ["gateway.example.test?x:8080", false],
+    ["user@gateway.example.test:8080", false],
+    // An empty userinfo hides a colon before the host.
+    [":@gateway.example.test:8080", false],
+    ["http://gateway.example.test", true],
+    ["http://gateway.example.test:8080", true],
+    ["http://[::1]:8080", true],
+    ["http://gateway.example.test:0", false],
+    ["http://gateway.example.test:65536", false],
+    ["http://1.2.3.999:8080", false],
+    ["http://gate%way.example.test:8080", false],
+    // An origin carries no path.
+    ["http://gateway.example.test:8080/grpc", false],
+    ["https://gateway.example.test", true],
+    ["https://gateway.example.test:8443", true],
+    ["https://[::1]:8443", true],
+    ["https://gateway.example.test:0", false],
+    ["https://gateway.example.test:65536", false],
+    ["https://1.2.3.999:8443", false],
+  ];
+  for (const [endpoint, admitted] of rows) {
+    const configuration = sandboxInstallation();
+    configuration.backend[0].configuration = { endpoint, insecureTransport: "network-policy" };
+    const failing = Object.entries(consumers)
+      .filter(([, parse]) => throws(parse, endpoint))
+      .map(([name]) => name);
+    if (admitted) {
+      await loadInstallationFile(t, configuration);
+      assert.deepEqual(failing, [], `${endpoint}: admitted but a consumer throws`);
+    } else {
+      await assert.rejects(
+        loadInstallationFile(t, configuration),
+        /configuration\.endpoint must be host:port or an http or https origin, with a port from 1 to 65535/,
+        endpoint,
+      );
+    }
+    // Startup never admits what either consumer would throw on at first use.
+    if (failing.length > 0) {
+      assert.equal(admitted, false, `${endpoint}: ${failing.join(", ")} throws`);
+    }
+  }
+});
+
+test("OpenShell startup admits bracketed IPv6 endpoints the native gRPC consumer can reach", async (t) => {
+  const grpc = controllerRequire("@grpc/grpc-js");
+  const loader = controllerRequire("@grpc/proto-loader");
+  const proto = await loader.load(
+    join(import.meta.dirname, "../fixtures/openshell-v0.1.3-pre.2-wire.proto"),
+    { keepCase: true, enums: String },
+  );
+  const OpenShell = grpc.loadPackageDefinition(proto).openshell.v1.OpenShell;
+  const server = new grpc.Server();
+  let healthCalls = 0;
+  server.addService(OpenShell.service, {
+    Health(_call, callback) {
+      healthCalls += 1;
+      callback(null, { status: "SERVICE_STATUS_HEALTHY" });
+    },
+  });
+  // A real IPv6 listener and the native SDK establish address compatibility, not live OpenShell.
+  const port = await new Promise((resolve, reject) =>
+    server.bindAsync("[::1]:0", grpc.ServerCredentials.createInsecure(), (error, value) =>
+      error ? reject(error) : resolve(value),
+    ),
+  );
+  t.after(() => new Promise((resolve) => server.tryShutdown(resolve)));
+  for (const endpoint of [`[::1]:${port}`, `http://[::1]:${port}`]) {
+    const configuration = sandboxInstallation();
+    configuration.backend[0].configuration = { endpoint, insecureTransport: "network-policy" };
+    const runtime = await loadInstallationFile(t, configuration);
+    const backend = createOpenShellBackend(runtime.installation.backend[0]);
+    try {
+      await backend.client.clientForNamespace("ipv6-tenant").health(AbortSignal.timeout(2000));
+    } finally {
+      backend.client.close();
+    }
+  }
+  assert.equal(healthCalls, 2);
+  for (const endpoint of [
+    "[::1]:0",
+    "[::1]:65536",
+    "[::1]:999999",
+    "[not-an-ip]:8080",
+    "[127.0.0.1]:8080",
+    "[::1:8080",
+    "::1]:8080",
+    "[::1]:8080/",
+    "[::1]:8080?query",
+  ]) {
+    const configuration = sandboxInstallation();
+    configuration.backend[0].configuration = { endpoint, insecureTransport: "network-policy" };
+    await assert.rejects(
+      loadInstallationFile(t, configuration),
+      /configuration.endpoint must be host:port or an http or https origin/,
+      endpoint,
+    );
+  }
+  // Node's isIP accepts a zoned literal, but WHATWG URL (the http:// form and the service
+  // transport) refuses it, so both forms refuse a zone ID with one reason.
+  for (const endpoint of [
+    "[fe80::1%eth0]:8080",
+    "http://[fe80::1%eth0]:8080",
+    "http://[fe80::1%25eth0]:8080",
+    "https://[fe80::1%eth0]:8443",
+    "[::1%]:8080",
+  ]) {
+    const configuration = sandboxInstallation();
+    configuration.backend[0].configuration = { endpoint, insecureTransport: "network-policy" };
+    await assert.rejects(
+      loadInstallationFile(t, configuration),
+      /configuration\.endpoint must not include an IPv6 zone ID/,
+      endpoint,
+    );
+  }
+  for (const endpoint of [
+    "gateway.example.test:8080",
+    "127.0.0.1:8080",
+    "http://gateway.example.test",
+    "http://127.0.0.1:80",
+  ]) {
+    const configuration = sandboxInstallation();
+    configuration.backend[0].configuration = { endpoint, insecureTransport: "network-policy" };
+    await loadInstallationFile(t, configuration);
+  }
 });

@@ -8,7 +8,13 @@ import {
   type Preset,
 } from "@openclaw-enterprise/contracts";
 import type { BundledPresetVersion } from "@openclaw-enterprise/occ";
-import { closed, type ConfigurationRecord, nonempty, object } from "./startup-file.ts";
+import {
+  closed,
+  type ConfigurationRecord,
+  nonempty,
+  object,
+  withoutByteOrderMark,
+} from "./startup-file.ts";
 
 /** A bundled default skipped because a `presets.files` entry uses its name. */
 export interface ShadowedDefaultPreset {
@@ -50,7 +56,7 @@ async function loadPresetDefinition(
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(contents);
+    parsed = JSON.parse(withoutByteOrderMark(contents));
   } catch {
     throw new Error(`Preset file ${path} must contain valid JSON.`);
   }

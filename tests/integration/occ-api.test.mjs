@@ -7372,7 +7372,11 @@ test("Slack environment credentials need OCC bindings unless the Compute Driver 
     },
   });
   // Deploy an Agent whose Slack tokens are environment SecretRefs with no OCC Secret binding.
-  const deployUnbound = async (computeDriver, botTokenId = "SLACK_BOT_TOKEN") => {
+  const deployUnbound = async (
+    computeDriver,
+    botTokenId = "SLACK_BOT_TOKEN",
+    denyDeploy = false,
+  ) => {
     const controller = await configuredController({ computeDriver });
     await bootstrap(controller);
     const namespace = await createNamespace(controller, "slack-environment");
@@ -7394,6 +7398,16 @@ test("Slack environment credentials need OCC bindings unless the Compute Driver 
       },
     });
     assert.equal(agent.status, 201, JSON.stringify(agent.body));
+    if (denyDeploy) {
+      controller.fixture.state.restrictions.push({
+        id: "deny-ssh-deploy",
+        namespaceId: namespace.id,
+        resourceKind: "agent",
+        resourceId: agent.data.id,
+        action: "deploy",
+        effect: "deny",
+      });
+    }
     return controller.request("POST", `/namespaces/${namespace.id}/agents/${agent.data.id}/deploy`);
   };
 
@@ -7401,6 +7415,12 @@ test("Slack environment credentials need OCC bindings unless the Compute Driver 
   // holds them, so deployment proceeds without a binding or a Slack call.
   const ssh = await deployUnbound(createSshComputeDriver());
   assert.equal(ssh.status, 202, JSON.stringify(ssh.body));
+  assert.equal(slackCalls, 0);
+
+  // The exemption skips credential validation, not authorization: a requester without deploy on
+  // the Agent is refused before any revision reaches the SSH Driver and its host credentials.
+  const denied = await deployUnbound(createSshComputeDriver(), "SLACK_BOT_TOKEN", true);
+  assert.equal(denied.status, 403, JSON.stringify(denied.body));
   assert.equal(slackCalls, 0);
 
   // Any other Compute Driver still needs a Secret binding: the exemption is not a blanket bypass.

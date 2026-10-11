@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -111,6 +111,18 @@ test("credential source boundary rejects new raw capabilities in the real source
     });
   }
 
+  await t.test("a symlinked credential source fails closed", async () => {
+    const path = join(root, "drivers/repo/credentials/linked.ts");
+    await symlink("sessions.ts", path);
+    try {
+      await assert.rejects(verify(root), {
+        message: `Credential source must not be a symlink: ${path}`,
+      });
+    } finally {
+      await rm(path);
+    }
+  });
+
   const cases = [
     [
       "shared client metadata cannot acquire network authority",
@@ -129,6 +141,12 @@ test("credential source boundary rejects new raw capabilities in the real source
       'import { request } from "node:https";',
       /unreviewed runtime import from node:https/,
       "drivers/repo/github/credentials/client/hook-dispatch.ts",
+    ],
+    [
+      "client code cannot load a service owner",
+      'import { bearerDigest } from "../../../credentials/sessions.ts";',
+      /client runtime cannot load service owner drivers\/repo\/credentials\/sessions.ts/,
+      "drivers/repo/github/credentials/client/router.ts",
     ],
     [
       "configuration composition cannot open files outside the protected reader",
@@ -290,6 +308,12 @@ test("credential source boundary rejects new raw capabilities in the real source
       /raw sender drivers\/repo\/credentials\/transport\/upstream.ts/,
     ],
     [
+      "a reviewed sender consumer cannot re-export the sender",
+      'export { createUpstreamSender } from "./upstream.ts";',
+      /raw sender drivers\/repo\/credentials\/transport\/upstream.ts is not reviewed for drivers\/repo\/credentials\/transport\/agent.ts/,
+      "drivers/repo/credentials/transport/agent.ts",
+    ],
+    [
       "raw provider helper through emitted extension",
       'import { sendProviderRequest } from "../github/credentials/provider-transport/request.js";',
       /raw sender drivers\/repo\/github\/credentials\/provider-transport\/request.ts/,
@@ -330,6 +354,14 @@ test("credential source boundary rejects new raw capabilities in the real source
     [
       "the encoder exception cannot re-export client code",
       'export { encodeRepositoryCredentialSessionFiles } from "./credentials/client/config.ts";',
+      /service code cannot load client command owner/,
+      "drivers/repo/github/driver.ts",
+    ],
+    // The encoder must come first: the exception checks names[0], so this order is what
+    // guards its single-name rule.
+    [
+      "the encoder exception cannot carry other client bindings",
+      'import { encodeRepositoryCredentialSessionFiles as encode, readClientConfiguration as readClient } from "./credentials/client/config.ts";',
       /service code cannot load client command owner/,
       "drivers/repo/github/driver.ts",
     ],

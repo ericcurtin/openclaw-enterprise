@@ -64,6 +64,15 @@ const agentNativeAdminValues = {
   "agentNativeAdmin.domain": "agents.example.invalid",
   "agentNativeAdmin.sharedCookieDomain": "example.invalid",
 };
+// The sandbox listener's wildcard TLS Secret, on top of gateway routing.
+const sandboxValues = {
+  ...agentNativeAdminValues,
+  "gatewayRouting.sandbox.enabled": "true",
+  "gatewayRouting.sandbox.domain": "previews.example.test",
+  "gatewayRouting.sandbox.tlsSecretName": "preview-wildcard",
+  "gatewayRouting.sandbox.ingressPeers[0].namespaceSelector.matchLabels.kubernetes\\.io/metadata\\.name":
+    "public-ingress",
+};
 const githubLoginValues = {
   "auth.github.enabled": "true",
   "auth.recoveryUserId": "Xk3u9pQ2rT7vW1yZ",
@@ -225,14 +234,6 @@ test(
 );
 
 test("sandbox ingress uses a separate listener outside OCE cookie scope", tooling, async () => {
-  const sandboxValues = {
-    ...agentNativeAdminValues,
-    "gatewayRouting.sandbox.enabled": "true",
-    "gatewayRouting.sandbox.domain": "previews.example.test",
-    "gatewayRouting.sandbox.tlsSecretName": "preview-wildcard",
-    "gatewayRouting.sandbox.ingressPeers[0].namespaceSelector.matchLabels.kubernetes\\.io/metadata\\.name":
-      "public-ingress",
-  };
   const rendered = await resources((await render(sandboxValues)).stdout);
   const gateway = rendered.find((item) => item.kind === "Gateway");
   const listener = gateway.spec.listeners.find((item) => item.name === "sandbox");
@@ -522,8 +523,34 @@ test(
     );
     await assert.rejects(
       render({ ...execution, "executionCluster.apiKubeconfigSecretName": "occ-auth" }),
-      /dedicated Secrets/,
+      /executionCluster\.apiKubeconfigSecretName must name a dedicated Secret; occ-auth is also auth\.secretName/,
     );
+    // Optional credential Secrets count once enabled (findings 1046, 1048): the ChatGPT admin,
+    // sign-in, database CA and sandbox TLS Secrets, and the Gateway Secrets cert-manager writes.
+    const gatewayRoot = `occ-gateway-${createHash("sha256").update("openclaw-system/oce-agent-gateways").digest("hex").slice(0, 12)}-root`;
+    for (const [values, secret, role] of [
+      [chatgptValues, "occ-chatgpt-admin", "backend.chatgpt.secretName"],
+      [githubLoginValues, "occ-github-login", "auth.github.secretName"],
+      [gatewayRoutingValues, "oce-agent-gateways-tls", "gatewayRouting.tlsSecretName"],
+      [gatewayRoutingValues, gatewayRoot, "the generated Gateway root CA"],
+      [databaseCaValues, "occ-rds-ca", "database.caSecretName"],
+      [sandboxValues, "preview-wildcard", "gatewayRouting.sandbox.tlsSecretName"],
+    ]) {
+      for (const key of ["apiKubeconfigSecretName", "workerKubeconfigSecretName"]) {
+        await assert.rejects(
+          render({ ...execution, ...values, [`executionCluster.${key}`]: secret }),
+          ({ code, stderr }) =>
+            code !== 0 &&
+            stderr.includes(
+              `executionCluster.${key} must name a dedicated Secret; ${secret} is also ${role}`,
+            ),
+          `${key} = ${secret}`,
+        );
+      }
+      // Until that feature is enabled, its Secret name is free.
+      await render({ ...execution, "executionCluster.apiKubeconfigSecretName": secret });
+      await render({ ...execution, ...values });
+    }
     const objects = await resources((await render(execution)).stdout);
     for (const component of ["api", "worker"]) {
       const pod = objects.find(
@@ -3426,6 +3453,296 @@ test("the chart refuses bootstrap claim names the volume helper refuses", toolin
   ).persistentVolumeClaim.claimName;
   assert.equal(claim, longest);
   assert.equal(longest.length, 253);
+});
+
+test(
+  "the chart refuses a gateway API key Secret that holds other credentials",
+  tooling,
+  async () => {
+    // Envoy Gateway's apiKeyAuth accepts every entry of the gateway API key Secret as a
+    // client key, so a shared Secret would make the ChatGPT admin key, a CA certificate or a
+    // TLS key a valid x-api-key.
+    for (const [values, shared, refusal] of [
+      [
+        chatgptValues,
+        { "gatewayRouting.apiKeySecretName": "occ-chatgpt-admin" },
+        /gatewayRouting\.apiKeySecretName must name a dedicated Secret; occ-chatgpt-admin is also backend\.chatgpt\.secretName/,
+      ],
+      [
+        chatgptValues,
+        { "backend.chatgpt.secretName": "occ-gateway-api-key" },
+        /gatewayRouting\.apiKeySecretName must name a dedicated Secret; occ-gateway-api-key is also backend\.chatgpt\.secretName/,
+      ],
+      [
+        databaseCaValues,
+        { "database.caSecretName": "occ-gateway-api-key" },
+        /gatewayRouting\.apiKeySecretName must name a dedicated Secret; occ-gateway-api-key is also database\.caSecretName/,
+      ],
+      [
+        sandboxValues,
+        { "gatewayRouting.sandbox.tlsSecretName": "occ-gateway-api-key" },
+        /gatewayRouting\.apiKeySecretName must name a dedicated Secret; occ-gateway-api-key is also gatewayRouting\.sandbox\.tlsSecretName/,
+      ],
+    ]) {
+      await assert.rejects(
+        render({ ...gatewayRoutingValues, ...values, ...shared }),
+        ({ code, stderr }) => code !== 0 && refusal.test(stderr),
+        JSON.stringify(shared),
+      );
+      // The same values with distinct names render.
+      await render({ ...gatewayRoutingValues, ...values });
+    }
+    // Without the ChatGPT Backend the chart does not reserve that name.
+    await render({
+      ...gatewayRoutingValues,
+      "gatewayRouting.apiKeySecretName": "occ-chatgpt-admin",
+    });
+  },
+);
+
+test(
+  "the chart refuses sign-in Secrets that share a Gateway certificate Secret",
+  tooling,
+  async () => {
+    // cert-manager writes the generated Gateway TLS and root CA Secrets and would overwrite a
+    // sign-in Secret sharing either name (finding 1046).
+    const gatewayRoot = `occ-gateway-${createHash("sha256").update("openclaw-system/oce-agent-gateways").digest("hex").slice(0, 12)}-root`;
+    const externalCa = {
+      ...externalGatewayRoutingValues,
+      "gatewayRouting.issuerRef.kind": "ClusterIssuer",
+      "gatewayRouting.issuerRef.group": "cert-manager.io",
+      "gatewayRouting.caSecretName": "occ-private-ca",
+      "gatewayRouting.caSecretKey": "ca.crt",
+    };
+    for (const [routing, secret, role] of [
+      [gatewayRoutingValues, "oce-agent-gateways-tls", "gatewayRouting.tlsSecretName"],
+      [gatewayRoutingValues, gatewayRoot, "the generated Gateway root CA"],
+      [externalCa, "occ-private-ca", "gatewayRouting.caSecretName"],
+    ]) {
+      await assert.rejects(
+        render({ ...routing, ...githubLoginValues, "auth.github.secretName": secret }),
+        ({ code, stderr }) =>
+          code !== 0 &&
+          stderr.includes(
+            `auth.github.secretName must name a dedicated Secret; ${secret} is also ${role}`,
+          ),
+        secret,
+      );
+      // Without gateway routing those names are free.
+      await render({ ...githubLoginValues, "auth.github.secretName": secret });
+    }
+    await render({ ...externalCa, ...githubLoginValues });
+  },
+);
+
+test(
+  "the chart refuses log collector Secrets shared with any credential Secret",
+  tooling,
+  async () => {
+    // Finding 1054: the collector's Secrets join the dedicated-Secret table, so cert-manager
+    // cannot overwrite a collector config named like a Gateway certificate Secret.
+    const gatewayRoot = `occ-gateway-${createHash("sha256").update("openclaw-system/oce-agent-gateways").digest("hex").slice(0, 12)}-root`;
+    const externalCa = {
+      ...externalGatewayRoutingValues,
+      "gatewayRouting.issuerRef.kind": "ClusterIssuer",
+      "gatewayRouting.issuerRef.group": "cert-manager.io",
+      "gatewayRouting.caSecretName": "occ-private-ca",
+      "gatewayRouting.caSecretKey": "ca.crt",
+    };
+    for (const [feature, secret, role] of [
+      [{}, "occ-installation-startup", "installation.secretName"],
+      [{}, "occ-database", "database.secretName"],
+      [{}, "occ-auth", "auth.secretName"],
+      [gatewayRoutingValues, "oce-agent-gateways-tls", "gatewayRouting.tlsSecretName"],
+      [gatewayRoutingValues, gatewayRoot, "the generated Gateway root CA"],
+      [externalCa, "occ-private-ca", "gatewayRouting.caSecretName"],
+      [databaseCaValues, "occ-rds-ca", "database.caSecretName"],
+      [sandboxValues, "preview-wildcard", "gatewayRouting.sandbox.tlsSecretName"],
+      [chatgptValues, "occ-chatgpt-admin", "backend.chatgpt.secretName"],
+    ]) {
+      for (const key of ["configSecretName", "envSecretName"]) {
+        await assert.rejects(
+          render({
+            ...productionCollectorValues,
+            ...feature,
+            [`logging.collector.${key}`]: secret,
+          }),
+          ({ code, stderr }) =>
+            code !== 0 &&
+            stderr.includes(
+              `logging.collector.${key} must name a dedicated Secret; ${secret} is also ${role}`,
+            ),
+          `${key} = ${secret}`,
+        );
+      }
+    }
+    await assert.rejects(
+      render({
+        ...productionCollectorValues,
+        "logging.collector.envSecretName": "occ-otel-collector-config",
+      }),
+      /logging\.collector\.envSecretName must name a dedicated Secret; occ-otel-collector-config is also logging\.collector\.configSecretName/,
+    );
+    // A disabled feature's Secret name is free, as preflight treats the ChatGPT admin Secret.
+    await render({
+      ...productionCollectorValues,
+      "logging.collector.configSecretName": "occ-chatgpt-admin",
+    });
+  },
+);
+
+test("the chart requires installation and database Secret names", tooling, async () => {
+  // Finding 1055: an empty name rendered `secretName: ""` instead of failing at template time.
+  for (const [key, message] of [
+    ["installation.secretName", "installation startup"],
+    ["database.secretName", "database URL"],
+  ]) {
+    // `null` removes the key, which must fail the same way as an empty name.
+    for (const value of ["", "null"]) {
+      await assert.rejects(
+        render({ [key]: value }),
+        ({ code, stderr }) =>
+          code !== 0 && stderr.includes(`${key} must name the operator-created ${message} Secret`),
+        `${key}=${value}`,
+      );
+    }
+  }
+});
+
+test(
+  "the chart refuses credential Secrets shared with the database CA or sandbox TLS Secret",
+  tooling,
+  async () => {
+    // Finding 1048: the dedicated-Secret rule covers every Secret an enabled feature reads.
+    const sandbox = {
+      ...gatewayRoutingValues,
+      ...Object.fromEntries(
+        Object.entries(sandboxValues).filter(([key]) => key.startsWith("gatewayRouting.sandbox.")),
+      ),
+    };
+    for (const [base, setting, secret, other] of [
+      [
+        { ...databaseCaValues, ...githubLoginValues },
+        "auth.github.secretName",
+        "occ-rds-ca",
+        "database.caSecretName",
+      ],
+      [
+        { ...databaseCaValues, ...repositoryCredentialValues },
+        "repositoryCredentials.appKeySecretName",
+        "occ-rds-ca",
+        "database.caSecretName",
+      ],
+      [databaseCaValues, "database.caSecretName", "occ-database", "database.secretName"],
+      [
+        { ...sandbox, ...githubLoginValues },
+        "auth.github.secretName",
+        "preview-wildcard",
+        "gatewayRouting.sandbox.tlsSecretName",
+      ],
+      [
+        { ...sandbox, ...repositoryCredentialValues },
+        "repositoryCredentials.tlsSecretName",
+        "preview-wildcard",
+        "gatewayRouting.sandbox.tlsSecretName",
+      ],
+      [
+        sandbox,
+        "gatewayRouting.sandbox.tlsSecretName",
+        "oce-agent-gateways-tls",
+        "gatewayRouting.tlsSecretName",
+      ],
+    ]) {
+      await assert.rejects(
+        render({ ...base, [setting]: secret }),
+        ({ code, stderr }) =>
+          code !== 0 &&
+          stderr.includes(`${setting} must name a dedicated Secret; ${secret} is also ${other}`),
+        `${setting} = ${secret}`,
+      );
+      // The same values with distinct names render.
+      await render(base);
+    }
+  },
+);
+
+test("the chart lets the public CA settings share one trust bundle Secret", tooling, async () => {
+  // Finding 1059: each CA setting mounts only its selected key of public trust data, so one
+  // trust bundle Secret may serve all of them. Private and cert-manager Secrets stay dedicated.
+  const base = {
+    ...externalGatewayRoutingValues,
+    "gatewayRouting.issuerRef.kind": "ClusterIssuer",
+    "gatewayRouting.issuerRef.group": "cert-manager.io",
+    "gatewayRouting.caSecretName": "occ-private-ca",
+    "gatewayRouting.caSecretKey": "ca.crt",
+    ...databaseCaValues,
+    ...repositoryCredentialValues,
+  };
+  const settings = [
+    "database.caSecretName",
+    "gatewayRouting.caSecretName",
+    "repositoryCredentials.publicCaSecretName",
+  ];
+  for (const [index, first] of settings.entries()) {
+    for (const second of settings.slice(index + 1)) {
+      await render({ ...base, [first]: "occ-trust-bundle", [second]: "occ-trust-bundle" });
+    }
+  }
+  const shared = Object.fromEntries(settings.map((setting) => [setting, "occ-trust-bundle"]));
+  const objects = await resources((await render({ ...base, ...shared })).stdout);
+  const api = objects.find(
+    (item) => item.kind === "Deployment" && item.metadata.name === "openclaw-enterprise-api",
+  ).spec.template.spec;
+  assert.deepEqual(
+    api.volumes
+      .filter((volume) => volume.secret?.secretName === "occ-trust-bundle")
+      .map((volume) => [volume.name, volume.secret.items.map(({ key }) => key)])
+      .sort(),
+    [
+      ["database-ca", ["ca.pem"]],
+      ["gateway-ca", ["ca.crt"]],
+      ["repository-public-ca", ["ca.crt"]],
+    ],
+  );
+  // The bundle still may not hold a credential or a Secret cert-manager writes.
+  for (const [setting, secret, message] of [
+    ["database.caSecretName", "occ-database", "database.caSecretName / database.secretName"],
+    [
+      "repositoryCredentials.tlsSecretName",
+      "occ-trust-bundle",
+      "repositoryCredentials.tlsSecretName / database.caSecretName",
+    ],
+    [
+      "gatewayRouting.apiKeySecretName",
+      "occ-trust-bundle",
+      "gatewayRouting.apiKeySecretName / database.caSecretName",
+    ],
+    [
+      "gatewayRouting.tlsSecretName",
+      "occ-trust-bundle",
+      "database.caSecretName / gatewayRouting.tlsSecretName",
+    ],
+  ]) {
+    const [refused, holder] = message.split(" / ");
+    await assert.rejects(
+      render({ ...base, ...shared, [setting]: secret }),
+      ({ code, stderr }) =>
+        code !== 0 &&
+        stderr.includes(`${refused} must name a dedicated Secret; ${secret} is also ${holder}`),
+      `${setting} = ${secret}`,
+    );
+  }
+  // An external issuer creates no root CA Secret, so its generated name is free.
+  const gatewayRoot = `occ-gateway-${createHash("sha256").update("openclaw-system/oce-agent-gateways").digest("hex").slice(0, 12)}-root`;
+  await render({ ...base, ...githubLoginValues, "auth.github.secretName": gatewayRoot });
+  await assert.rejects(
+    render({
+      ...gatewayRoutingValues,
+      ...githubLoginValues,
+      "auth.github.secretName": gatewayRoot,
+    }),
+    /auth\.github\.secretName must name a dedicated Secret; \S+ is also the generated Gateway root CA/,
+  );
 });
 
 test(

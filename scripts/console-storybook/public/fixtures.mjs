@@ -242,6 +242,10 @@ export function installFixture(scenario, evidence) {
       ? { repositoryBindings: structuredClone(scenario.repositoryBindings) }
       : {}),
   };
+  for (const [name, content] of Object.entries(scenario.workspaceFiles ?? {})) {
+    files.set(`${agent.id}/${name}`, content);
+  }
+
   agents.set(agent.id, agent);
   credentials.set(agent.id, { transportConfigured: scenario.transport !== false });
   function snapshot(owner, id, revision) {
@@ -409,6 +413,49 @@ export function installFixture(scenario, evidence) {
             : standardCodexPreset,
       ),
     );
+  }
+  if (scenario.modelFallbackSelection) {
+    const ids = ["primary-model", "fallback-one", "fallback-two"];
+    preset.name = "Models with ordered fallbacks";
+    delete preset.template.variables;
+    preset.template.agent.executionMode = "embedded";
+    preset.template.agent.name = "Model selection example";
+    preset.template.configuration.values = {
+      agents: {
+        defaults: {
+          model: {
+            primary: `openai/${ids[0]}`,
+            fallbacks: ids.slice(1).map((id) => `openai/${id}`),
+          },
+          models: Object.fromEntries(
+            ids.map((id) => [
+              `openai/${id}`,
+              {
+                agentRuntime: { id: "openclaw" },
+                alias: `Saved ${id}`,
+                params: { temperature: 0.3 },
+              },
+            ]),
+          ),
+        },
+      },
+      models: {
+        providers: {
+          openai: {
+            baseUrl: "https://models.example.test/v1",
+            api: "openai-responses",
+            models: ids.map((id) => ({
+              id,
+              name: id,
+              contextWindow: 128000,
+              maxTokens: 8192,
+              reasoning: true,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            })),
+          },
+        },
+      },
+    };
   }
   if (scenario.presetAgent) {
     Object.assign(preset.template.agent, structuredClone(scenario.presetAgent));

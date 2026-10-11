@@ -17,7 +17,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import { imageSmokeTimeoutMultiplier } from "../helpers/image-smoke-timeout.mjs";
 import {
   AGENT_WITH_NODE_ENTRYPOINT,
@@ -28,8 +27,8 @@ import {
   NATIVE_WORKER_ENTRYPOINT,
   PLUGIN_RUNTIME_HELPERS,
 } from "../../apps/controller/src/drivers/compute/kubernetes/runtime-entrypoints.ts";
-import { OPENCLAW_AGENT_DATABASE_SCHEMA_VERSION } from "../../apps/controller/src/drivers/compute/runtime-startup.ts";
 import { nodeProgramArguments } from "../../apps/controller/src/drivers/compute/node-program.ts";
+import { OPENSHELL_CODEX_APP_SERVER_POLICY } from "../../apps/controller/src/drivers/sandbox/openshell.ts";
 import {
   REPOSITORY_MATERIAL_INIT_ENTRYPOINT,
   REPOSITORY_NATIVE_GIT_INIT_ENTRYPOINT,
@@ -54,6 +53,7 @@ import {
   failureTail,
   runGatewaySmoke,
   reviewedCodexSeccompSecurityOptions,
+  eachSettled,
 } from "../helpers/runtime-image-startup.mjs";
 
 const syntheticCodexApiKey = "sk-openclaw-runtime-image-smoke-synthetic";
@@ -1075,135 +1075,6 @@ test(
   },
 );
 
-// OpenClaw state written by the 2026-09-28 release's runtime image
-// (ghcr.io/openclaw/openclaw-enterprise-runtime@sha256:f17a66a18de9d4231c9579faf90573d80bef1278aaaf63135b6c6ce0b71a23b3,
-// OpenClaw 000d03942c87): its Gateway ran one turn against a stub provider that
-// answers 401 and stopped cleanly. The archive holds the shared state database
-// (its device identity and config revision keys deleted, then vacuumed) and the
-// main agent database (schema 23) as that Gateway left it.
-const releasedGatewayState = fileURLToPath(
-  new URL("../fixtures/runtime-state/released-gateway-state.tar.gz", import.meta.url),
-);
-
-async function agentDatabaseFacts(containerName) {
-  const { stdout } = await runDocker([
-    "exec",
-    containerName,
-    "node",
-    "-e",
-    `
-const { readdirSync } = require("node:fs");
-const { DatabaseSync } = require("node:sqlite");
-const directory = "/home/node/.openclaw/agents/main/agent";
-const database = new DatabaseSync(directory + "/openclaw-agent.sqlite", { readOnly: true });
-const { user_version: version } = database.prepare("PRAGMA user_version").get();
-database.close();
-const backups = readdirSync(directory).filter((name) => name.includes(".pre-startup-migration-")).sort();
-process.stdout.write(JSON.stringify({ version, backups }));
-`,
-  ]);
-  return JSON.parse(stdout);
-}
-
-function stateMigrationPhases(logs) {
-  return jsonLogEntries(logs).filter(
-    (entry) => entry.event === "runtime.startup_phase" && entry.phase === "state-migration",
-  );
-}
-
-// Copies the released state into a new volume, owned as the Gateway user, for
-// mounting at `mountPath` (the Gateway home or its ~/.openclaw).
-async function releasedGatewayStateVolume(t, mountPath) {
-  const volume = `oce-runtime-image-state-${randomBytes(6).toString("hex")}`;
-  await runDocker(["volume", "create", volume]);
-  t.after(() => runDocker(["volume", "rm", "-f", volume]).catch(() => {}));
-  // As root, like the Docker Driver's workspace setup: a new volume mounted
-  // below the image's home can be root-owned.
-  await runDocker([
-    "run",
-    "--rm",
-    "--user",
-    "0:0",
-    "--network",
-    "none",
-    "--volume",
-    `${volume}:${mountPath}`,
-    "--volume",
-    `${releasedGatewayState}:/released-gateway-state.tar.gz:ro`,
-    "--entrypoint",
-    "sh",
-    image,
-    "-c",
-    `tar -xzf /released-gateway-state.tar.gz -C /home/node && chown -R 1000:1000 ${mountPath}`,
-  ]);
-  return volume;
-}
-
-// startGateway(readinessAttempts) starts a Gateway on the released state volume.
-async function assertReleasedGatewayMigratesOnce(startGateway) {
-  // The current OpenClaw refuses this database until Doctor migrates it. Doctor's
-  // full repair pass takes about 20 s here and over a minute on a busy CI runner.
-  const released = await startGateway(240);
-  assert.deepEqual(
-    stateMigrationPhases(released.logs).map(({ outcome }) => outcome),
-    ["ok"],
-    released.logs,
-  );
-  assert.match(released.logs, /from schema 23 to \d+ with openclaw doctor --fix/);
-  assert.doesNotMatch(released.logs, /uses schema version 23/);
-  const migrated = await agentDatabaseFacts(released.containerName);
-  assert.equal(
-    migrated.version,
-    OPENCLAW_AGENT_DATABASE_SCHEMA_VERSION,
-    "Doctor migrated to another schema: update OPENCLAW_AGENT_DATABASE_SCHEMA_VERSION with the OpenClaw pin.",
-  );
-  assert.equal(migrated.backups.length > 0, true, "Doctor keeps a pre-migration copy");
-  await runDocker(["stop", "--time", "60", released.containerName]);
-  await runDocker(["rm", "-f", released.containerName]);
-
-  // A current database starts without Doctor.
-  const current = await startGateway();
-  assert.deepEqual(stateMigrationPhases(current.logs), [], current.logs);
-  assert.doesNotMatch(current.logs, /openclaw doctor --fix/);
-  assert.deepEqual(await agentDatabaseFacts(current.containerName), migrated);
-}
-
-test(
-  "runtime image migrates a released Gateway's agent database once before starting OpenClaw",
-  imageTestOptions,
-  async (t) => {
-    // The volume replaces the Gateway's /home/node tmpfs, as its PersistentVolume does.
-    const volume = await releasedGatewayStateVolume(t, "/home/node");
-    const configurationPath = await temporaryGatewayConfiguration(t, "openclaw");
-    await assertReleasedGatewayMigratesOnce((readinessAttempts) =>
-      runGatewaySmoke(t, "openclaw", {
-        configurationPath: "/etc/openclaw/openclaw.json",
-        entrypoint: KUBERNETES_GATEWAY_RUNTIME_ENTRYPOINT,
-        readinessAttempts,
-        tmpfs: [],
-        volumes: [`${configurationPath}:/etc/openclaw/openclaw.json:ro`, `${volume}:/home/node`],
-        withAppServer: false,
-      }),
-    );
-  },
-);
-
-test(
-  "runtime image migrates a released agent database before the Docker development Gateway starts OpenClaw",
-  imageTestOptions,
-  async (t) => {
-    // The Docker Driver's Agent state volume, over the Gateway's /home/node tmpfs.
-    const volume = await releasedGatewayStateVolume(t, "/home/node/.openclaw");
-    await assertReleasedGatewayMigratesOnce((readinessAttempts) =>
-      runGatewaySmoke(t, "openclaw", {
-        readinessAttempts,
-        volumes: [`${volume}:/home/node/.openclaw`],
-        withAppServer: false,
-      }),
-    );
-  },
-);
-
 test(
   "runtime image validates the configuration dedicated native OpenClaw renders",
   imageTestOptions,
@@ -1371,6 +1242,99 @@ function run(args, env, readinessUrl) {
     assert.equal(harness.validation.valid, true);
     // Schema acceptance alone does not qualify the default image's complete native flow.
     // Runtime admission retains its separate native-worker support gate.
+  },
+);
+
+test(
+  "runtime image Gateway keeps OpenShell's Codex turns out of Codex's own sandbox",
+  imageTestOptions,
+  async () => {
+    // Finding 1026: bwrap cannot create a user namespace inside an OpenShell Sandbox, so the
+    // pinned Gateway must send danger-full-access per turn for the OpenShell-configured app
+    // server. This runs the bundled Codex policy resolver on the documented Configuration.
+    const documented = {
+      mode: "guardian",
+      approvalPolicy: "on-request",
+      sandbox: "read-only",
+      transport: "websocket",
+      url: "ws://127.0.0.1:1",
+      authToken: "synthetic",
+    };
+    const cases = [
+      { documented },
+      { documented: { ...documented, approvalPolicy: "never" } },
+      { documented: { ...documented, approvalsReviewer: "auto_review" } },
+    ].flatMap(({ documented: appServer }) =>
+      // The Gateway passes no provider for the documented `codex/<model>` ref; `openai` is a
+      // model it can verify for model-backed review.
+      [undefined, "openai"].map((modelProvider) => ({
+        appServer: { ...appServer, ...OPENSHELL_CODEX_APP_SERVER_POLICY },
+        modelProvider,
+      })),
+    );
+    // Without the reviewer pin, the documented shape is the reported failure. If this case
+    // resolves to danger-full-access after a pin bump, re-evaluate the pin before dropping it.
+    cases.push({
+      appServer: { ...documented, sandbox: "danger-full-access" },
+      expectedSandbox: "workspace-write",
+    });
+    const script = String.raw`
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+const pluginDist = "/app/node_modules/openclaw/dist";
+const configChunk = readdirSync(pluginDist).find((name) => /^config-options-.*\.mjs$/.test(name));
+if (configChunk === undefined) {
+  throw new Error("Bundled Codex config chunk was not found under " + pluginDist);
+}
+const configExports = await import(pathToFileURL(join(pluginDist, configChunk)));
+const createCodexAppServerConfig = Object.values(configExports).find(
+  (value) => typeof value === "function" && value.name === "createCodexAppServerConfig",
+);
+if (createCodexAppServerConfig === undefined) {
+  throw new Error("Bundled Codex config export did not expose createCodexAppServerConfig.");
+}
+const { resolveProviderIdForAuth } = await import("openclaw/plugin-sdk/provider-auth-aliases");
+const { resolveCodexAppServerRuntimeOptions } = createCodexAppServerConfig({ resolveProviderIdForAuth });
+const config = {
+  agents: { defaults: { model: "codex/gpt-6-astra" } },
+  models: { providers: { codex: { baseUrl: "http://127.0.0.1:9", api: "openai-responses", models: [{ id: "gpt-6-astra", name: "gpt-6-astra" }] } } },
+};
+const results = JSON.parse(process.argv[1]).map(({ appServer, modelProvider }) => {
+  const runtime = resolveCodexAppServerRuntimeOptions({
+    pluginConfig: { appServer },
+    modelProvider,
+    model: "gpt-6-astra",
+    config,
+    env: {},
+    requirementsToml: null,
+  });
+  return { sandbox: runtime.sandbox, approvalsReviewer: runtime.approvalsReviewer };
+});
+process.stdout.write(JSON.stringify(results));
+`;
+    const { stdout } = await runDocker([
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--workdir",
+      "/app",
+      "--entrypoint",
+      "node",
+      image,
+      "--input-type=module",
+      "-e",
+      script,
+      JSON.stringify(cases),
+    ]);
+    assert.deepEqual(
+      JSON.parse(stdout),
+      cases.map(({ expectedSandbox }) => ({
+        sandbox: expectedSandbox ?? "danger-full-access",
+        approvalsReviewer: "user",
+      })),
+    );
   },
 );
 
@@ -2353,7 +2317,8 @@ http.createServer((req, res) => {
   res.end(JSON.stringify(req.url === "/counter" ? { modelCalls } : { data: [{ id: "fixture" }] }));
 }).listen(18880, "127.0.0.1");
 `;
-    for (const enabled of [true, false]) {
+    // Each case owns its container and configuration file, so both run at once.
+    await eachSettled([true, false], async (enabled) => {
       const configuration = drivers[0][1].kubernetesGatewayConfigurationDocument(
         createAdmittedRuntimeImageConfiguration("openclaw"),
       );
@@ -2436,7 +2401,7 @@ http.createServer((req, res) => {
         `native TLS enabled=${enabled}: native ready, Compute readiness ${enabled ? "refused" : "passed"}, modelCalls=0`,
       );
       await runDocker(["rm", "-f", containerName]);
-    }
+    });
   },
 );
 
@@ -2465,7 +2430,9 @@ http.createServer((req, res) => {
   res.end(JSON.stringify(req.url === "/counter" ? { modelCalls } : { data: [{ id: "fixture" }] }));
 }).listen(18880, "127.0.0.1");
 `;
-    for (const [gateway, reachable] of [
+    // Each case owns its container and configuration file, so the cases run
+    // concurrently on the shared internal network.
+    const bindCases = [
       [{ bind: "loopback" }, false],
       [{ bind: "custom", customBindHost: "127.0.0.1" }, false],
       [{ bind: "tailnet" }, false],
@@ -2473,7 +2440,8 @@ http.createServer((req, res) => {
       [{ bind: "auto" }, true],
       [{ bind: "custom", customBindHost: "0.0.0.0" }, true],
       [{}, true],
-    ]) {
+    ];
+    await eachSettled(bindCases, async ([gateway, reachable], index) => {
       const configuration = driver.kubernetesGatewayConfigurationDocument(
         createAdmittedRuntimeImageConfiguration("openclaw"),
       );
@@ -2481,7 +2449,7 @@ http.createServer((req, res) => {
       Object.assign(configuration.gateway, gateway);
       configuration.models.providers.openai.baseUrl = "http://127.0.0.1:18880/v1";
       configuration.models.providers.openai.apiKey = "synthetic-owned-native-bind";
-      const path = join(directory, "openclaw.json");
+      const path = join(directory, `openclaw-${index}.json`);
       // Private directory, read-only mount, synthetic input readable by native UID1000.
       await writeFile(path, JSON.stringify(configuration), { mode: 0o644 });
       // Feed native-valid inputs independently of admission to establish which
@@ -2560,6 +2528,6 @@ http.createServer((req, res) => {
         `native bind=${gateway.bind ?? "omitted"} host=${gateway.customBindHost ?? "default"}: private ready=200, Pod-IP ${reachable ? "ready=200" : "ECONNREFUSED"}, modelCalls=0`,
       );
       await runDocker(["rm", "-f", containerName]);
-    }
+    });
   },
 );

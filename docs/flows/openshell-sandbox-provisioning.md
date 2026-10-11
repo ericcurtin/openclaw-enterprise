@@ -219,9 +219,11 @@ fails before Sandbox creation.
 The Driver mounts a revision-scoped Agent PVC subpath at
 `/sandbox/.openclaw-runtime`; persistent subpaths mount below
 `/sandbox/.openclaw-mounts`. It rewrites admitted `/home/node` paths beneath the
-runtime home. Exact mount paths such as `OPENCLAW_NODE_STATE_DIR` use a
-process-created `state` child, so atomic writes cross neither a symlink nor a
-root-owned mount. Workspace, node identity, sessions, and generated images
+runtime home, declared as `harnessHome` for native hook credentials. Codex hook
+commands trust the provider-file Gateway CA and reach the Gateway route only when
+the node does: an in-cluster routing hostname or two clusters. Exact mount paths
+such as `OPENCLAW_NODE_STATE_DIR` use a process-created `state` child, so atomic
+writes cross neither a symlink nor a root-owned mount. Workspace, node identity, sessions, and generated images
 remain separate. `/tmp` stays on the bounded ephemeral image layer.
 
 Credential attachments must use the OCC `oce-cs-` name shape and cannot repeat
@@ -355,6 +357,8 @@ networking. Native OpenClaw remains a separate verification-only path.
 [keep this for the user to add notes. do not change between edits]
 
 ## Changelog
+
+- 2026-10-10 12:40: Declare the Sandbox HOME for native hook credentials; hooks trust the file-delivered Gateway CA. (fix-1017)
 
 - 2026-10-09 19:45: Cover both runtime architectures in the development credential policy. (authoring-run/1e7118f7-bdb0-4564-894c-02f990f75e67 - bd540bcdef63cdc719e73192e4dbe99c365953c3)
 

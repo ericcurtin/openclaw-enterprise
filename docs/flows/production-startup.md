@@ -282,11 +282,11 @@ until tenant deployment/TUI procedures run.
 - `compute.preflight-warning` with code `KUBERNETES_VERSION_BELOW_MINIMUM`:
   startup continues, but upgrade to Kubernetes 1.35 or later for support.
 - `startup-error` or `worker.startup-error` with code
-  `KUBERNETES_API_UNAVAILABLE` means the Compute preflight got no answer from
-  the Kubernetes API server named by `host` and `port`. Check that
-  `cluster.cidrs` still lists that address; a restarted cluster can move it.
-- Code `PRESET_FILE_INVALID`: a bad `presets.files` list or file (missing,
-  unreadable, malformed, invalid, duplicate).
+  `KUBERNETES_API_UNAVAILABLE` means Compute cannot reach the Kubernetes API at
+  the logged `host` and `port`. Check `cluster.cidrs`; restarted clusters can move it.
+- Code `PRESET_FILE_INVALID`: an invalid `presets.files` entry or file.
+- Code `GATEWAY_STORAGE_CLASS_INVALID`: correct `runtime.gatewayStorageClassName`
+  to a Kubernetes DNS-subdomain resource name before restarting.
 - `kubectl -n openclaw-system logs job/oce-initialization -c bootstrap` is the
   first check for unsafe output storage, existing outputs, database-role
   failures, auth errors (`AUTH_SECRET_INVALID`, `AUTH_BASE_URL_INVALID`), and

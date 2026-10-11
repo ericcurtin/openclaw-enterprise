@@ -455,6 +455,10 @@
                     "label": "Breaking Changes"
                   },
                   {
+                    "page": "guides/deploy/breaking-changes-archive",
+                    "label": "Earlier Breaking Changes"
+                  },
+                  {
                     "page": "guides/deploy/split-layout-upgrade",
                     "label": "Split-Layout Upgrade"
                   },

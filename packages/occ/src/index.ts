@@ -21,6 +21,7 @@ import type {
   AgentDeploymentDiagnostics,
   AgentRuntimeDescribeOptions,
   AgentRuntimeDescription,
+  AgentRuntimeHarnessStatus,
   ComputeAgentRevisionBinding,
   AgentRevision,
   AgentRuntimeCredentialsInput,
@@ -85,9 +86,11 @@ import type {
   RevisionHarnessDescriptor,
   ResourceKind,
   ResourceRef,
+  RuntimeDiagnosticCheck,
   Role,
   SandboxDriver,
   SandboxFacet,
+  SandboxHarnessLostCode,
   Secret,
   SecretBindings,
   SecretReference,
@@ -339,6 +342,7 @@ export {
   type RuntimeLogQuery,
   type RuntimeLogViewAdmission,
   type SanitizedRuntimeLogRecord,
+  validRuntimeLogFrontierTime,
 } from "./runtime-logs/index.ts";
 export {
   PINNED_OPENCLAW_RUNTIME_SUPPORTS_NATIVE_WORKERS,
@@ -798,6 +802,37 @@ const CREDENTIAL_GATEWAY_TIMEOUT_MS = 30_000;
 const MAX_AGENT_CREDENTIAL_SOURCES = 8;
 /** Overall deadline for one runtime status or log request, Driver calls included. */
 const RUNTIME_LOG_REQUEST_TIMEOUT_MS = 10_000;
+// Bounds the Sandbox Driver's Harness record read that runs beside Compute diagnostics.
+const HARNESS_OBSERVATION_TIMEOUT_MS = 10_000;
+const HARNESS_LOST_CODES: ReadonlySet<string> = new Set<SandboxHarnessLostCode>([
+  "SANDBOX_MISSING",
+  "SANDBOX_DELETING",
+  "SANDBOX_STOPPED",
+  "SANDBOX_FAILED",
+  "HARNESS_EXITED",
+]);
+/** The Harness Sandbox record as the leading `agent` `sandbox` diagnostic check. */
+function harnessDiagnosticCheck(
+  observed: AgentRuntimeHarnessStatus,
+  checkedAt: string,
+): RuntimeDiagnosticCheck {
+  // A Harness process that exited has failed even while its provider restarts it.
+  const state =
+    observed.state === "running"
+      ? "succeeded"
+      : observed.state === "lost" || observed.code === "HARNESS_RESTARTING"
+        ? "failed"
+        : "unknown";
+  const code = observed.code ?? (observed.state === "starting" ? "STARTING" : undefined);
+  return Object.freeze({
+    component: "agent",
+    check: "sandbox",
+    state,
+    checkedAt,
+    ...(code === undefined ? {} : { code }),
+  });
+}
+
 /**
  * A Credential Gateway must finish any effect of an aborted registration within
  * CREDENTIAL_GATEWAY_TIMEOUT_MS after the abort. Until this long after `createdAt`, an absent
@@ -2697,14 +2732,42 @@ export class OpenClawController {
     ) {
       throw new DependencyUnavailableError("The deployment's Compute Driver is unavailable.");
     }
-    let diagnostics: AgentDeploymentDiagnostics;
+    // Runs beside Compute's collection; it never throws and stops when Compute fails.
+    const observation = new AbortController();
+    const harness = this.observedHarness(
+      driver,
+      binding,
+      AbortSignal.any([observation.signal, AbortSignal.timeout(HARNESS_OBSERVATION_TIMEOUT_MS)]),
+    );
+    let collected: AgentDeploymentDiagnostics;
     try {
-      diagnostics = await driver.diagnoseAgentDeployment!(binding);
+      collected = await driver.diagnoseAgentDeployment!(binding);
     } catch {
+      observation.abort();
       // Native Driver failures can contain private runtime or credential details.
       throw new DependencyUnavailableError("Runtime diagnostics are unavailable.");
     }
-    return deploymentDiagnostics(diagnostics, revision.id);
+    let diagnostics: Readonly<AgentDeploymentDiagnostics>;
+    try {
+      diagnostics = deploymentDiagnostics(collected, revision.id);
+    } catch (error) {
+      observation.abort();
+      throw error;
+    }
+    const observed = await harness;
+    if (observed === undefined) {
+      return diagnostics;
+    }
+    // A lost Sandbox explains every other agent check, so it leads and the cap never drops it.
+    return Object.freeze({
+      ...diagnostics,
+      checks: Object.freeze(
+        [harnessDiagnosticCheck(observed, this.clock().toISOString()), ...diagnostics.checks].slice(
+          0,
+          32,
+        ),
+      ),
+    });
   }
 
   /**
@@ -2728,13 +2791,14 @@ export class OpenClawController {
       "operate",
     );
     return admitRead(() =>
-      this.runtimeLogOperation(signal, async (deadline) =>
-        this.withSandboxLogSource(
-          await this.describedAgentRuntime(driver, binding, deadline),
-          driver,
-          binding.revision,
-        ),
-      ),
+      this.runtimeLogOperation(signal, async (deadline) => {
+        const [described, harness] = await Promise.all([
+          this.describedAgentRuntime(driver, binding, deadline),
+          this.observedHarness(driver, binding, deadline),
+        ]);
+        const description = this.withSandboxLogSource(described, driver, binding.revision);
+        return harness === undefined ? description : Object.freeze({ ...description, harness });
+      }),
     );
   }
 
@@ -2925,6 +2989,15 @@ export class OpenClawController {
     compute: ComputeDriver,
     revision: Readonly<AgentRevision>,
   ): SandboxDriver | undefined {
+    const sandbox = this.revisionSandboxDriver(compute, revision);
+    return typeof sandbox?.readSandboxLogs === "function" ? sandbox : undefined;
+  }
+
+  /** The selected Sandbox Driver that provisioned this revision, in a placement Compute names. */
+  private revisionSandboxDriver(
+    compute: ComputeDriver,
+    revision: Readonly<AgentRevision>,
+  ): SandboxDriver | undefined {
     if (
       revision.sandboxDriverId === undefined ||
       typeof compute.resolveSandboxNamespace !== "function" ||
@@ -2938,9 +3011,71 @@ export class OpenClawController {
     } catch {
       return undefined;
     }
-    return sandbox.id === revision.sandboxDriverId && typeof sandbox.readSandboxLogs === "function"
-      ? sandbox
-      : undefined;
+    return sandbox.id === revision.sandboxDriverId ? sandbox : undefined;
+  }
+
+  /**
+   * The dedicated Harness Sandbox as its Sandbox Driver records it, or undefined when the
+   * Driver keeps no such record. Never throws: an unreadable record is `unknown`, and Driver
+   * error text is not returned.
+   */
+  private async observedHarness(
+    compute: ComputeDriver,
+    binding: ComputeAgentRevisionBinding,
+    signal: AbortSignal,
+  ): Promise<AgentRuntimeHarnessStatus | undefined> {
+    const sandbox = this.revisionSandboxDriver(compute, binding.revision);
+    if (
+      binding.revision.harness.mode !== "dedicated" ||
+      typeof sandbox?.observeHarness !== "function"
+    ) {
+      return undefined;
+    }
+    const unavailable = Object.freeze({ state: "unknown" as const, code: "UNAVAILABLE" as const });
+    let observed: unknown;
+    try {
+      const namespace = await compute.resolveSandboxNamespace!.call(compute, binding.namespace);
+      observed = await sandbox.observeHarness(
+        Object.freeze({ namespace, revision: binding.revision, signal }),
+      );
+    } catch {
+      return unavailable;
+    }
+    const state = asRecord(observed)?.state;
+    const code = asRecord(observed)?.code;
+    if (state === "starting" && code === "HARNESS_RESTARTING") {
+      const exitCode = asRecord(observed)?.exitCode;
+      const restarts = asRecord(observed)?.restarts;
+      // Only bounded integers are reported; a malformed restart reads as a plain start.
+      if (
+        typeof exitCode === "number" &&
+        Number.isSafeInteger(exitCode) &&
+        exitCode >= -2_147_483_648 &&
+        exitCode <= 2_147_483_647 &&
+        typeof restarts === "number" &&
+        Number.isSafeInteger(restarts) &&
+        restarts >= 1 &&
+        restarts <= 4_294_967_295
+      ) {
+        return Object.freeze({ state, code, exitCode, restarts });
+      }
+    }
+    if (state === "running" || state === "starting" || state === "unknown") {
+      return Object.freeze({ state });
+    }
+    if (state === "lost" && typeof code === "string" && HARNESS_LOST_CODES.has(code)) {
+      // A stopped Agent, a retired revision, or a candidate before its Sandbox exists has
+      // no Sandbox by design (or one being removed), so only the running Agent's active
+      // revision reports its absence as lost. A stopped, failed or exited Sandbox record
+      // is OpenShell's own terminal state and is reported for any revision.
+      const expected =
+        binding.agent.desiredRuntimeState === "running" &&
+        binding.agent.activeRevisionId === binding.revision.id;
+      return expected || (code !== "SANDBOX_MISSING" && code !== "SANDBOX_DELETING")
+        ? Object.freeze({ state, code: code as SandboxHarnessLostCode })
+        : Object.freeze({ state: "unknown" as const });
+    }
+    return unavailable;
   }
 
   /** Appends the `sandbox` source when the revision's Sandbox Driver exposes its log. */

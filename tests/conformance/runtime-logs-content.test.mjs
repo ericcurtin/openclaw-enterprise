@@ -84,6 +84,22 @@ async function corpusLines(values) {
   return lines.map((raw, index) => ({ time: lineTime(index), raw }));
 }
 
+test("runtime status refuses an invalid Driver timestamp instead of normalizing it", async () => {
+  const { createRuntimeLogComputeDriver, createRuntimeLogFixture } =
+    await import("../helpers/runtime-logs.mjs");
+  const computeDriver = createRuntimeLogComputeDriver({
+    state: { observedAt: "2026-02-30" },
+  });
+  const fixture = await createRuntimeLogFixture({ computeDriver });
+  const target = await fixture.deployAgent();
+
+  const runtime = await fixture.request("GET", target.runtimePath);
+
+  assert.equal(runtime.status, 503, runtime.text);
+  assert.equal(runtime.body.error.code, "RUNTIME_LOGS_UNAVAILABLE");
+  assert.equal(runtime.text.includes("2026-03-02"), false);
+});
+
 test("runtime log route bodies never contain planted credentials, prompts or protocol output", async () => {
   const { createRuntimeLogComputeDriver, createRuntimeLogFixture } =
     await import("../helpers/runtime-logs.mjs");

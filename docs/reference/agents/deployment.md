@@ -196,16 +196,18 @@ The worker retries on the same cadence without spending its
 deadline fails the deployment with its own code.
 
 `REFUSED_CANDIDATE_STOP_PENDING` means the worker refused the candidate but could
-not yet stop its workload, for example Pods stuck terminating. The message names
-the refusal, such as `AUTHORIZATION_DENIED`, that `error` carries once the stop
-succeeds, unless a newer revision supersedes the deployment; a superseded one
-retries the stop of an earlier refusal even if that refusal has since lifted. The wait has no
-deadline or attempt limit, since the refused version could still serve. Each
-failed stop doubles the recheck, from the cadence above to 5 minutes, and waits
-at least four times the stop's duration, so other Agents' deployments keep
-running; every try moves `lastAttempt.at`. If the refusal lifts, for example when
-`deploy` is granted again, the deployment continues within its convergence
-deadline. The worker log's `worker.completed` `cause` says why the stop fails.
+not yet stop its workload, for example because Pods are stuck terminating. The
+message names the refusal, such as `AUTHORIZATION_DENIED`, which `error` carries
+once the stop succeeds. The wait has no deadline or attempt limit, since the
+refused version could still serve. Each failed stop doubles the recheck, from the
+cadence above up to 5 minutes, and waits at least four times the stop's duration,
+so other Agents' deployments keep running; every try moves `lastAttempt.at`, and
+the worker log's `worker.completed` `cause` says why the stop fails. If an
+authorization or backend refusal lifts (`deploy` granted again), the deployment
+continues, or past its convergence deadline stops the candidate and fails
+`CONVERGENCE_DEADLINE_EXCEEDED`; other refusals stand. A deployment that a
+newer revision supersedes still finishes the stop, even of a lifted refusal, and
+then ends superseded.
 
 ### Model check failure cause
 
@@ -241,12 +243,13 @@ If a revision fails before the worker sets the pointer, the pointer is
 unchanged. After a failed first deployment, the Agent has no active revision.
 With [exclusive replacement](../drivers/compute.md#production-revision-stages),
 the unchanged pointer names a predecessor that was already stopped, so nothing
-serves until a new revision activates. When the worker refuses the candidate,
-for example because its deploying actor lost `deploy` or a credential source
-was revoked, it stops the candidate's workload too, and records the refusal
-only after the stop succeeds; until then the deployment waits as
-[`REFUSED_CANDIDATE_STOP_PENDING`](#pending-deployment-progress). A candidate whose runtime
-failed by itself, such as `RUNTIME_MODEL_PROBE_FAILED` or
+serves until a new revision activates. When the worker refuses such a candidate
+or any first deployment, for example because its deploying actor lost `deploy`
+or a credential source was revoked, it stops the candidate's workload and
+records the refusal only after the stop succeeds (until then it waits as
+[`REFUSED_CANDIDATE_STOP_PENDING`](#pending-deployment-progress)). Other refused
+candidates stay until a later successful deployment, stop or delete. A candidate
+whose runtime failed by itself, such as `RUNTIME_MODEL_PROBE_FAILED` or
 `CONVERGENCE_DEADLINE_EXCEEDED`, keeps its Pods so its version's Logs tab can
 show the cause; the next deployment stops them.
 Kubernetes embedded replacement reports ready while the predecessor still

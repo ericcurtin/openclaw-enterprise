@@ -2866,6 +2866,87 @@ test("Agent deployment status polls the admitted revision work with exact read a
   assert.equal(denied.status, 403);
 });
 
+test("a refused deployment's status names its cause and remedy without naming principals", async () => {
+  // Finding 1039: these refusals used to fall through to "Deployment reconciliation failed.",
+  // so a member whose deploy permission was revoked mid-rollout saw no cause or remedy.
+  const deploymentWorks = new Map();
+  const fixture = await createInjectedFixture({ deploymentWorks });
+  const controller = {
+    request: (method, path, options) => injectedRequest(fixture.app, method, path, options),
+  };
+  await bootstrap(controller);
+  const namespace = await createNamespace(controller, "deployment-refusals");
+  const agent = await createAgent(controller, namespace.id, "refused-agent");
+  await fixture.controller.handleNamespaceLifecycle(fixture.principal.id, namespace.id, "ready");
+  await bindHarnessKey(fixture, namespace.id, agent);
+  const admitted = await controller.request(
+    "POST",
+    `/namespaces/${namespace.id}/agents/${agent.id}/deploy`,
+  );
+  assert.equal(admitted.status, 202, JSON.stringify(admitted.body));
+  const workKey = `agent_revision:${admitted.data.id}:reconcile`;
+  const path = `/namespaces/${namespace.id}/agents/${agent.id}/deployments/${admitted.data.id}`;
+  const messages = {
+    AUTHORIZATION_DENIED:
+      "The account that requested this deployment, or the Agent's own identity, no longer has a permission the revision needs: deploy on the Agent, read on its Configuration, or use of a Secret, credential source or ServiceAccount it binds. Ask an admin to grant the access, then deploy again.",
+    ACTOR_REVOKED:
+      "The account that requested this deployment is no longer an active account in the Installation. Deploy again from an account with deploy access to the Agent.",
+    HARNESS_AUTH_REQUIRED:
+      "This revision has no Harness authentication method. Set one on the Agent, then deploy again.",
+    BACKEND_UNAVAILABLE:
+      "The Backend this revision was admitted with is no longer configured on the Installation. Ask an admin to restore it, or move the Agent to a configured Backend, then deploy again.",
+    HARNESS_AUTH_SOURCE_CHANGED:
+      "The ServiceAccount this revision authenticates with is missing, has no access token, or its credential changed since admission. Bind an available ServiceAccount, or deploy again to admit a revision with its current credential.",
+    SECRET_BINDING_UNAVAILABLE:
+      "A Secret this revision binds is missing or no longer belongs to the selected Secret Driver. Bind available Secrets, then deploy again.",
+    NAMESPACE_NOT_READY:
+      "The Agent's Namespace was not ready when the controller ran this deployment, for example while it is being deleted. Deploy again once the Namespace is ready.",
+    WORKSPACE_SETUP_UNSUPPORTED:
+      "The Agent was created with initial workspace files, which the Installation's Compute Driver cannot set up. Ask an admin to select a Compute Driver that supports them, then deploy again, or create the Agent without initial workspace files.",
+    REPOSITORY_REVISION_STOPPED:
+      "Deployment ended because the Agent was stopped or its Namespace is no longer ready.",
+    REPOSITORY_REVISION_SUPERSEDED: "Deployment was superseded by a newer revision.",
+    // Finding 1045: repository credential refusals name cause and remedy, never the repository.
+    REPOSITORY_RUNTIME_UNSUPPORTED:
+      "The Installation's Compute Driver can no longer deliver repository credentials to this revision. Repository access needs an embedded OpenClaw or dedicated Codex runtime with no Sandbox Driver, on a Compute Driver configured for repository credentials. Ask an admin to restore that setup, or remove the Agent's repository access, then deploy again.",
+    REPOSITORY_BINDING_UNAVAILABLE:
+      "A repository this revision binds, or its access level, is no longer approved for the Agent's Namespace. Choose approved repository access on the Agent, or ask an admin to approve it again, then deploy again.",
+    REPOSITORY_BINDING_CHANGED:
+      "The approval behind a repository this revision binds changed since admission, for example the access levels or push rules approved for the Agent's Namespace. Deploy again to admit a revision with the current approval.",
+    REPOSITORY_DRIVER_MISMATCH:
+      "The Installation no longer selects the repository credential Driver this revision was admitted with. Deploy again to admit a revision for the selected Driver, choosing approved repository access first if the deploy is refused. If the Installation has none, remove the Agent's repository access or ask an admin to select one.",
+    REPOSITORY_CREDENTIAL_DEADLINE_EXCEEDED:
+      "This revision's repository access deadline, fixed when the revision was admitted, has passed. Deploy again to admit a revision with a new deadline.",
+    DEPENDENCY_UNAVAILABLE:
+      "A dependency the controller needs stayed unavailable through every attempt. Deploy again; if it keeps failing, ask an admin to check the controller worker log.",
+    LEASE_EXPIRED:
+      "The controller worker stopped or lost its claim during this deployment's last attempt. Deploy again.",
+    // Internal inconsistencies keep the generic text.
+    INVALID_REVISION_OWNER: "Deployment reconciliation failed.",
+  };
+  for (const [reasonCode, message] of Object.entries(messages)) {
+    deploymentWorks.set(workKey, {
+      idempotencyKey: workKey,
+      namespaceId: namespace.id,
+      agentId: agent.id,
+      revisionId: admitted.data.id,
+      actorId: fixture.principal.id,
+      state: "failed_permanent",
+      availableAt: new Date(0),
+      attemptCount: 1,
+      completedAt: new Date("2026-10-10T18:03:32.000Z"),
+      reasonCode,
+      createdAt: new Date(0),
+      updatedAt: new Date("2026-10-10T18:03:32.000Z"),
+    });
+    const status = await controller.request("GET", path);
+    assert.equal(status.status, 200, JSON.stringify(status.body));
+    assert.equal(status.data.status, "failed", reasonCode);
+    assert.deepEqual(status.data.error, { code: reasonCode, message }, reasonCode);
+    assert.equal(JSON.stringify(status.body).includes(fixture.principal.id), false, reasonCode);
+  }
+});
+
 test("a deletion retry by another delete holder names the initiator condition and audits it", async () => {
   const deploymentWorks = new Map();
   const fixture = await createInjectedFixture({ deploymentWorks, recordOperations: true });

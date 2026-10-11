@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { verifyRepositoryCredentialBoundary } from "../../scripts/verify-repository-credentials-boundary.mjs";
+import { parsers } from "prettier/plugins/typescript";
+import { verifyRepositoryCredentialBoundary as verify } from "../../scripts/verify-repository-credentials-boundary.mjs";
 
 const sourceRoot = fileURLToPath(new URL("../../apps/controller/src/", import.meta.url));
+const entrypoints = ["repository-credentials.ts", "repository-credentials.mjs"];
 
 async function appendSource(root, file, source, check) {
   const path = join(root, file);
@@ -14,31 +16,39 @@ async function appendSource(root, file, source, check) {
     if (error.code !== "ENOENT") {
       throw error;
     }
-    return undefined;
   });
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${previous ?? ""}\n${source}\n`);
   try {
     await check();
   } finally {
-    if (previous === undefined) {
-      await rm(path);
-    } else {
-      await writeFile(path, previous);
-    }
+    await (previous === undefined ? rm(path) : writeFile(path, previous));
   }
 }
 
 test("credential source boundary rejects new raw capabilities in the real source tree", async (t) => {
+  // Each check re-parses every credential source, but a case changes one file. The verifier
+  // never mutates the AST, so this test reuses the real parser's output by source text.
+  const parse = parsers.typescript.parse.bind(parsers.typescript);
+  const parsed = new Map();
+  t.mock.method(parsers.typescript, "parse", (text, ...options) => {
+    if (options.length) {
+      return parse(text, ...options);
+    }
+    if (!parsed.has(text)) {
+      parsed.set(text, parse(text));
+    }
+    return parsed.get(text);
+  });
   const temporary = await mkdtemp(join(tmpdir(), "repository-credentials-boundary-"));
   const root = join(temporary, "src");
   t.after(() => rm(temporary, { recursive: true, force: true }));
   await cp(sourceRoot, root, { recursive: true });
-  assert.ok((await verifyRepositoryCredentialBoundary(root)) > 0);
+  assert.ok((await verify(root)) > 0);
 
-  await t.test("type-only imports and ordinary object methods remain valid", () =>
-    appendSource(
-      root,
+  for (const [label, file, source] of [
+    [
+      "type-only imports and ordinary object methods remain valid",
       "drivers/repo/credentials/boundary-types.ts",
       `import type * as Http from "node:http";
        import type { RequestOptions } from "node:https";
@@ -47,51 +57,41 @@ test("credential source boundary rejects new raw capabilities in the real source
        type Fetch = typeof fetch;
        const client = { fetch() { return 1; }, WebSocket: 2 };
        client.fetch(); void client.WebSocket;`,
-      () => verifyRepositoryCredentialBoundary(root),
-    ),
-  );
-  await t.test("the outgoing header owner can validate names and values", () =>
-    appendSource(
-      root,
+    ],
+    [
+      "the outgoing header owner can validate names and values",
       "drivers/repo/credentials/transport/request-headers.ts",
       `import { validateHeaderName as checkName, validateHeaderValue as checkValue } from "node:http";
        checkName("accept"); checkValue("accept", "application/json");`,
-      () => verifyRepositoryCredentialBoundary(root),
-    ),
-  );
-
-  await t.test("the platform Driver can render portable session files", () =>
-    appendSource(
-      root,
+    ],
+    [
+      "the platform Driver can render portable session files",
       "drivers/repo/github/driver.ts",
       'import { encodeRepositoryCredentialSessionFiles as encodeFiles } from "./credentials/client/config.js"; void encodeFiles;',
-      () => verifyRepositoryCredentialBoundary(root),
-    ),
-  );
-  await t.test("the bootstrap can load only the emitted process main", () =>
-    appendSource(
-      root,
+    ],
+    [
+      "the bootstrap can load only the emitted process main",
       "repository-credentials.mjs",
       'import { main as emittedMain } from "../dist/repository-credentials.js"; void emittedMain;',
-      () => verifyRepositoryCredentialBoundary(root),
-    ),
-  );
+    ],
+  ]) {
+    await t.test(label, () => appendSource(root, file, source, () => verify(root)));
+  }
 
   for (const file of [
     "composition/repository-credentials",
     "drivers/repo/credentials",
     "drivers/repo/github",
     "backends/repository-credentials",
-    "repository-credentials.ts",
-    "repository-credentials.mjs",
+    ...entrypoints,
   ]) {
     await t.test(`missing ${file} fails closed`, async () => {
       const path = join(root, file);
       const saved = join(temporary, "missing-source");
       await rename(path, saved);
       try {
-        await assert.rejects(verifyRepositoryCredentialBoundary(root), (error) => {
-          if (file === "repository-credentials.ts" || file === "repository-credentials.mjs") {
+        await assert.rejects(verify(root), (error) => {
+          if (entrypoints.includes(file)) {
             assert.match(
               error.message,
               /^Repository credential boundary requires security review:\n/,
@@ -484,7 +484,7 @@ test("credential source boundary rejects new raw capabilities in the real source
   ] of cases) {
     await t.test(label, () =>
       appendSource(root, file, source, () =>
-        assert.rejects(verifyRepositoryCredentialBoundary(root), (error) => {
+        assert.rejects(verify(root), (error) => {
           assert.match(error.message, /Repository credential boundary requires security review/);
           assert.ok(error.message.includes(`${file}:`), error.message);
           assert.match(error.message, expected);

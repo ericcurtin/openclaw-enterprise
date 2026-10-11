@@ -4391,11 +4391,26 @@ test("live workspace drafts survive navigation, stay Agent-scoped, and clear on 
       await writeFile(join(root, owner.id, name), `# Saved ${name}\n`);
     }
   }
+  // Textareas show CRLF as LF; an untouched read must not enable Save or write.
+  const original = "# Saved AGENTS.md\r\n# Windows instructions\r\n";
+  await writeFile(join(root, agent.id, "AGENTS.md"), original);
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   const url = detailUrl(fixture, namespace.id, agent.id, active.revision.id, "workspace");
   await login(page, fixture, url);
+  await waitForWorkspaceEditors(page, ["AGENTS.md", "USER.md"]);
   const file = page.getByLabel("AGENTS.md", { exact: true });
+  assert.equal(await file.inputValue(), original.replaceAll("\r\n", "\n"));
+  assert.equal(
+    await page.getByRole("button", { name: "Save AGENTS.md", exact: true }).isEnabled(),
+    false,
+  );
+  assert.equal(
+    await page.getByRole("button", { name: "Save USER.md", exact: true }).isEnabled(),
+    false,
+  );
+  assert.equal(await readFile(join(root, agent.id, "AGENTS.md"), "utf8"), original);
+  assert.deepEqual(nonAuthWriteRequests(requests), []);
   await file.fill("# Unsaved instructions\n");
   await page.getByLabel("USER.md", { exact: true }).fill("");
   await page.getByRole("button", { name: "Configuration", exact: true }).click();

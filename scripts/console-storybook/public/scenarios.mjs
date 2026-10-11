@@ -1920,6 +1920,25 @@ export const scenarios = {
     description:
       "A rejected save retains its Configuration. Reload clears stale choices; retry requires a current repository and access level. Starting a new draft explicitly leaves repository-scoped recovery.",
   },
+  createModelFallbackSelection: {
+    group: "Pages/Create Agent",
+    name: "Choose an existing fallback as primary",
+    path: create,
+    modelFallbackSelection: true,
+    actions: [
+      { selector: "#agent-preset", value: "pre_00000000-0000-4000-8000-000000000001" },
+      click("Use Preset"),
+      { selector: "#agent-model", value: "fallback-one" },
+      { selector: ".launch-advanced summary", click: true },
+    ],
+    description:
+      "Changing the primary removes the unused old model and preserves the ordered fallback references, their model metadata and the existing transport. Simulated UI proof; no model request is executed.",
+    steps: [
+      "Inspect Configuration JSON: primary is openai/fallback-one; the directory contains fallback-one and fallback-two.",
+      "Choose fallback-two as primary. Both referenced model entries and their saved aliases/parameters remain.",
+      "Clear the Model ID, then enter another-model. Existing fallback metadata remains while the new primary is added.",
+    ],
+  },
   createPreset: {
     group: "Pages/Create Agent",
     name: "Preset variables",
@@ -3936,6 +3955,20 @@ export const scenarios = {
     deployed: true,
     description:
       "Load, edit, save, and reload AGENTS.md, SOUL.md, IDENTITY.md, and USER.md. Changes apply to live files, not revisions.",
+  },
+  workspaceCleanCRLF: {
+    group: "Components/Workspace",
+    name: "Unchanged Windows line endings",
+    path: `${revision}&tab=workspace`,
+    deployed: true,
+    workspaceFiles: { "USER.md": "# Saved USER.md\r\n# Windows instructions\r\n" },
+    description:
+      "An untouched CRLF file shows LF and stays clean. Save enables only after an edit.",
+    steps: [
+      "Reload USER.md without editing; Save stays disabled.",
+      "Edit USER.md, then Save and Reload.",
+    ],
+    gap: "Simulated files; no live Agent gateway.",
   },
   workspaceUnavailable: {
     group: "Components/Workspace",

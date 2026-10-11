@@ -2593,6 +2593,14 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
       413: { description: "Payload Too Large", ...error },
       415: { description: "Unsupported Media Type", ...error },
     };
+    // Refuse request text that cannot be stored unchanged, as on OCC API routes.
+    const refuseUnstorableText = (request: FastifyRequest, body: unknown = request.body) => {
+      const unstorable =
+        unstorableTextFailure("params", request.params) ?? unstorableTextFailure("body", body);
+      if (unstorable !== undefined) {
+        throw unstorable;
+      }
+    };
     const accountBody = (
       createAuthAccountOperation.schema as {
         readonly body: { readonly properties: Record<string, unknown> };
@@ -2694,6 +2702,7 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
           },
         } as DocumentedFastifySchema,
         onRequest: async (request) => admit(request, operation),
+        preValidation: async (request) => refuseUnstorableText(request),
         preHandler: async (request) => resolveIdentity(request, operation),
         handler: async (request, reply) => {
           const context = contexts.get(request);
@@ -3136,13 +3145,17 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
                 },
               },
             }),
+            400: { description: "Bad Request", ...error },
             403: { description: "Forbidden", ...error },
             404: { description: "Not Found", ...error },
             409: { description: "Conflict", ...error },
           },
         },
         onRequest: async (request) => admit(request, accountReadOperation),
-        preValidation: async (request) => resolveIdentity(request, accountReadOperation),
+        preValidation: async (request) => {
+          refuseUnstorableText(request);
+          await resolveIdentity(request, accountReadOperation);
+        },
       },
       async (request, reply) => {
         const context = contexts.get(request);
@@ -3272,7 +3285,10 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
             },
           },
           onRequest: async (request) => admit(request, operation),
-          preValidation: async (request) => resolveIdentity(request, operation),
+          preValidation: async (request) => {
+            refuseUnstorableText(request);
+            await resolveIdentity(request, operation);
+          },
         },
         async (request, reply) => {
           const context = contexts.get(request);
@@ -3427,7 +3443,10 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
           },
         },
         onRequest: async (request) => admit(request, recoveryReplaceOperation),
-        preValidation: async (request) => resolveIdentity(request, recoveryReplaceOperation),
+        preValidation: async (request) => {
+          refuseUnstorableText(request);
+          await resolveIdentity(request, recoveryReplaceOperation);
+        },
       },
       async (request, reply) => {
         const context = contexts.get(request);
@@ -3533,13 +3552,17 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
                 created: { type: "boolean" },
               },
             }),
+            400: { description: "Bad Request", ...error },
             403: { description: "Forbidden", ...error },
             404: { description: "Not Found", ...error },
             409: { description: "Conflict", ...error },
           },
         },
         onRequest: async (request) => admit(request, enrolOperation),
-        preValidation: async (request) => resolveIdentity(request, enrolOperation),
+        preValidation: async (request) => {
+          refuseUnstorableText(request);
+          await resolveIdentity(request, enrolOperation);
+        },
       },
       async (request, reply) => {
         const context = contexts.get(request);
@@ -3563,7 +3586,7 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
           operationId: "signInEmail",
           summary: "Sign in with email and password",
           description:
-            "Authenticates a local account and issues a user session cookie. In the password-only profile, repeated failed attempts for one email, or from one client address behind a trusted proxy, are limited and return 429; with GitHub, Google or OIDC sign-in, every attempt counts, successful ones included. A successful sign-in also sets an HttpOnly known-device cookie; later attempts for that email from the same browser spend the browser's own budget instead of the email's. The cookie never authenticates.",
+            "Authenticates a local account and issues a user session cookie. In both profiles, repeated failed attempts for one email, or from one client address behind a trusted proxy, spend the password budget and may return 429 once it is spent. A successful sign-in also sets an HttpOnly known-device cookie; later attempts for that email from the same browser spend the browser's own budget instead of the email's. The cookie never authenticates. An email with a NUL character or an unpaired UTF-16 surrogate is refused with 400 INVALID_REQUEST and spends budget like a rejected password; the password is not checked for either.",
           tags: ["Authentication"],
           security: [],
           body: {
@@ -3681,7 +3704,18 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
           },
         },
         onRequest: async (request) => admit(request, createAuthAccountOperation),
-        preValidation: async (request) => resolveIdentity(request, createAuthAccountOperation),
+        preValidation: async (request) => {
+          // Passwords are hashed before persistence; their existing schema and hashing
+          // rules remain authoritative. Validate every other submitted field unchanged.
+          const body = request.body;
+          refuseUnstorableText(
+            request,
+            typeof body === "object" && body !== null && !Array.isArray(body)
+              ? { ...body, password: undefined }
+              : body,
+          );
+          await resolveIdentity(request, createAuthAccountOperation);
+        },
       },
       async (request, reply) => {
         const context = contexts.get(request);

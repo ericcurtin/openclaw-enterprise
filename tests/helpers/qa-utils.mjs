@@ -14,16 +14,31 @@ export function yamlDocuments(text) {
     );
 }
 
-export async function waitFor(description, observe, timeout = 300_000) {
+// `describe` reports the last state `observe` saw (kept by the caller), so a
+// timeout says what was still missing instead of only what was awaited.
+export async function waitFor(
+  description,
+  observe,
+  timeout = 300_000,
+  { describe, interval = 1000 } = {},
+) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const result = await observe();
     if (result) {
       return result;
     }
-    await delay(1000);
+    await delay(interval);
   }
-  throw new Error(`Timed out: ${description}`);
+  let detail = "";
+  if (describe) {
+    try {
+      detail = `; last observation: ${describe()}`;
+    } catch (error) {
+      detail = `; last observation unavailable (${error?.message ?? error})`;
+    }
+  }
+  throw new Error(`Timed out: ${description}${detail}`);
 }
 
 export async function unusedPort() {

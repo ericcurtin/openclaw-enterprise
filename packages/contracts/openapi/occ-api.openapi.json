@@ -897,6 +897,45 @@
           "data": {
             "additionalProperties": false,
             "properties": {
+              "harness": {
+                "additionalProperties": false,
+                "description": "A provider-owned Harness Sandbox (OpenShell) as its Sandbox Driver records it. lost means the Sandbox is not serving this revision and OCC will not restart it; deploy the Agent again to replace it. starting with HARNESS_RESTARTING means the provider is restarting a Harness process that exited.",
+                "properties": {
+                  "code": {
+                    "anyOf": [
+                      { "const": "SANDBOX_MISSING", "type": "string" },
+                      { "const": "SANDBOX_DELETING", "type": "string" },
+                      { "const": "SANDBOX_STOPPED", "type": "string" },
+                      { "const": "SANDBOX_FAILED", "type": "string" },
+                      { "const": "HARNESS_EXITED", "type": "string" },
+                      { "const": "HARNESS_RESTARTING", "type": "string" },
+                      { "const": "UNAVAILABLE", "type": "string" }
+                    ]
+                  },
+                  "exitCode": {
+                    "description": "Present only with HARNESS_RESTARTING: the Harness process's last exit code.",
+                    "maximum": 2147483647,
+                    "minimum": -2147483648,
+                    "type": "integer"
+                  },
+                  "restarts": {
+                    "description": "Present only with HARNESS_RESTARTING: the restart number in the current crash loop (1 for a first restart).",
+                    "maximum": 4294967295,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "state": {
+                    "anyOf": [
+                      { "const": "running", "type": "string" },
+                      { "const": "starting", "type": "string" },
+                      { "const": "lost", "type": "string" },
+                      { "const": "unknown", "type": "string" }
+                    ]
+                  }
+                },
+                "required": ["state"],
+                "type": "object"
+              },
               "observedAt": {
                 "format": "date-time",
                 "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$",
@@ -1704,6 +1743,63 @@
               }
             },
             "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "description": "Bad Request",
+                  "properties": {
+                    "error": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "code": { "type": "string" },
+                        "details": {
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "code": {
+                                "anyOf": [
+                                  { "const": "REQUIRED", "type": "string" },
+                                  { "const": "UNKNOWN_FIELD", "type": "string" },
+                                  { "const": "INVALID_TYPE", "type": "string" },
+                                  { "const": "INVALID_FORMAT", "type": "string" },
+                                  { "const": "INVALID_VALUE", "type": "string" },
+                                  { "const": "TOO_LONG", "type": "string" },
+                                  { "const": "TOO_DEEP", "type": "string" }
+                                ]
+                              },
+                              "path": {
+                                "maxLength": 512,
+                                "pattern": "^(?:/(?:[^~/]|~0|~1)*)*$",
+                                "type": "string"
+                              }
+                            },
+                            "required": ["path", "code"],
+                            "type": "object"
+                          },
+                          "maxItems": 32,
+                          "type": "array"
+                        },
+                        "message": { "type": "string" }
+                      },
+                      "required": ["code", "message"],
+                      "type": "object"
+                    },
+                    "meta": {
+                      "additionalProperties": false,
+                      "properties": { "requestId": { "type": "string" } },
+                      "required": ["requestId"],
+                      "type": "object"
+                    }
+                  },
+                  "required": ["error", "meta"],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -3083,6 +3179,63 @@
               }
             },
             "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "description": "Bad Request",
+                  "properties": {
+                    "error": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "code": { "type": "string" },
+                        "details": {
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "code": {
+                                "anyOf": [
+                                  { "const": "REQUIRED", "type": "string" },
+                                  { "const": "UNKNOWN_FIELD", "type": "string" },
+                                  { "const": "INVALID_TYPE", "type": "string" },
+                                  { "const": "INVALID_FORMAT", "type": "string" },
+                                  { "const": "INVALID_VALUE", "type": "string" },
+                                  { "const": "TOO_LONG", "type": "string" },
+                                  { "const": "TOO_DEEP", "type": "string" }
+                                ]
+                              },
+                              "path": {
+                                "maxLength": 512,
+                                "pattern": "^(?:/(?:[^~/]|~0|~1)*)*$",
+                                "type": "string"
+                              }
+                            },
+                            "required": ["path", "code"],
+                            "type": "object"
+                          },
+                          "maxItems": 32,
+                          "type": "array"
+                        },
+                        "message": { "type": "string" }
+                      },
+                      "required": ["code", "message"],
+                      "type": "object"
+                    },
+                    "meta": {
+                      "additionalProperties": false,
+                      "properties": { "requestId": { "type": "string" } },
+                      "required": ["requestId"],
+                      "type": "object"
+                    }
+                  },
+                  "required": ["error", "meta"],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -9894,7 +10047,7 @@
     },
     "/api/auth/sign-in/email": {
       "post": {
-        "description": "Authenticates a local account and issues a user session cookie. In the password-only profile, repeated failed attempts for one email, or from one client address behind a trusted proxy, are limited and return 429; with GitHub, Google or OIDC sign-in, every attempt counts, successful ones included. A successful sign-in also sets an HttpOnly known-device cookie; later attempts for that email from the same browser spend the browser's own budget instead of the email's. The cookie never authenticates.",
+        "description": "Authenticates a local account and issues a user session cookie. In both profiles, repeated failed attempts for one email, or from one client address behind a trusted proxy, spend the password budget and may return 429 once it is spent. A successful sign-in also sets an HttpOnly known-device cookie; later attempts for that email from the same browser spend the browser's own budget instead of the email's. The cookie never authenticates. An email with a NUL character or an unpaired UTF-16 surrogate is refused with 400 INVALID_REQUEST and spends budget like a rejected password; the password is not checked for either.",
         "operationId": "signInEmail",
         "requestBody": {
           "content": {
@@ -17965,6 +18118,45 @@
                     "data": {
                       "additionalProperties": false,
                       "properties": {
+                        "harness": {
+                          "additionalProperties": false,
+                          "description": "A provider-owned Harness Sandbox (OpenShell) as its Sandbox Driver records it. lost means the Sandbox is not serving this revision and OCC will not restart it; deploy the Agent again to replace it. starting with HARNESS_RESTARTING means the provider is restarting a Harness process that exited.",
+                          "properties": {
+                            "code": {
+                              "anyOf": [
+                                { "const": "SANDBOX_MISSING", "type": "string" },
+                                { "const": "SANDBOX_DELETING", "type": "string" },
+                                { "const": "SANDBOX_STOPPED", "type": "string" },
+                                { "const": "SANDBOX_FAILED", "type": "string" },
+                                { "const": "HARNESS_EXITED", "type": "string" },
+                                { "const": "HARNESS_RESTARTING", "type": "string" },
+                                { "const": "UNAVAILABLE", "type": "string" }
+                              ]
+                            },
+                            "exitCode": {
+                              "description": "Present only with HARNESS_RESTARTING: the Harness process's last exit code.",
+                              "maximum": 2147483647,
+                              "minimum": -2147483648,
+                              "type": "integer"
+                            },
+                            "restarts": {
+                              "description": "Present only with HARNESS_RESTARTING: the restart number in the current crash loop (1 for a first restart).",
+                              "maximum": 4294967295,
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "state": {
+                              "anyOf": [
+                                { "const": "running", "type": "string" },
+                                { "const": "starting", "type": "string" },
+                                { "const": "lost", "type": "string" },
+                                { "const": "unknown", "type": "string" }
+                              ]
+                            }
+                          },
+                          "required": ["state"],
+                          "type": "object"
+                        },
                         "observedAt": {
                           "format": "date-time",
                           "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$",

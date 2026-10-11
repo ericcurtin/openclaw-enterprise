@@ -90,6 +90,10 @@ export interface OpenShellSandboxResponse {
   readonly annotations: Readonly<Record<string, string>>;
   readonly spec?: Readonly<Record<string, unknown>>;
   readonly phase?: string | number;
+  /** The Harness main process's last exit code, kept while the gateway restarts it. */
+  readonly exitCode?: number;
+  /** The gateway's restart number in the current crash loop; absent before any restart. */
+  readonly restartCount?: number;
   readonly serviceUrls: Readonly<Record<string, string>>;
 }
 
@@ -261,7 +265,26 @@ export function openShellSandboxLogReader(
   });
 }
 
-export interface OpenShellGatewayClient extends OpenShellSandboxLogReader {
+export interface OpenShellSandboxObserver {
+  getSandbox(
+    request: OpenShellSandboxDeleteRequest,
+    signal: AbortSignal,
+  ): Promise<OpenShellSandboxResponse | undefined>;
+}
+
+/** Narrows a gateway client to its Sandbox record read; the result exposes nothing else. */
+export function openShellSandboxObserver(
+  client: OpenShellSandboxObserver,
+): OpenShellSandboxObserver {
+  const read = client.getSandbox.bind(client);
+  return Object.freeze({
+    getSandbox: (request: OpenShellSandboxDeleteRequest, signal: AbortSignal) =>
+      read(request, signal),
+  });
+}
+
+export interface OpenShellGatewayClient
+  extends OpenShellSandboxLogReader, OpenShellSandboxObserver {
   health(signal: AbortSignal): Promise<void>;
   getWorkspace(name: string, signal: AbortSignal): Promise<OpenShellWorkspaceResponse | undefined>;
   createWorkspace(
@@ -612,8 +635,12 @@ const MAX_SANDBOX_LOG_LINES = 2000;
 function timestampMessage(value: string): { seconds: string; nanos: number } {
   const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/.exec(value);
   const seconds = match === null ? Number.NaN : Date.parse(`${match[1]}Z`);
-  if (match === null || Number.isNaN(seconds)) {
-    throw new OpenShellGatewayFailure("OpenShell log since time must be an RFC 3339 UTC time.");
+  if (
+    match === null ||
+    Number.isNaN(seconds) ||
+    new Date(seconds).toISOString().slice(0, 19) !== match[1]
+  ) {
+    throw new OpenShellGatewayFailure("OpenShell timestamp must be an RFC 3339 UTC time.");
   }
   return {
     seconds: String(Math.floor(seconds / 1000)),
@@ -766,6 +793,10 @@ function sandboxResponse(
     throw new OpenShellGatewayFailure(`OpenShell ${operation} returned no service URL map.`);
   }
   const spec = asRecord(sandbox?.spec);
+  const status = asRecord(sandbox?.status);
+  // Gateway-owned restart state (pinned gateway SandboxStatus fields 9 and 14).
+  const exitCode = status?.exit_code;
+  const restartCount = status?.restart_count;
   return Object.freeze({
     name,
     ...(typeof metadata?.id === "string" && metadata.id.length > 0 ? { id: metadata.id } : {}),
@@ -783,9 +814,11 @@ function sandboxResponse(
         ]),
       ),
     ),
-    ...(asRecord(sandbox?.status)?.phase === undefined
-      ? {}
-      : { phase: asRecord(sandbox?.status)?.phase as string | number }),
+    ...(status?.phase === undefined ? {} : { phase: status.phase as string | number }),
+    ...(typeof exitCode === "number" && Number.isSafeInteger(exitCode) ? { exitCode } : {}),
+    ...(typeof restartCount === "number" && Number.isSafeInteger(restartCount) && restartCount > 0
+      ? { restartCount }
+      : {}),
   });
 }
 

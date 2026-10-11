@@ -93,9 +93,8 @@ own CLI fails with
 [`runtimeFailure`](agents/deployment.md#model-check-failure-cause). Success can include [plugin warnings](agent-plugins.md#lifecycle)
 with a closed code and admitted `pluginId`.
 
-Polling reads persisted state without runtime, provider, or model probes.
-Terminal results survive runtime deletion and controller restart. Later
-deployments have separate records and cannot rewrite earlier results.
+Polling reads only persisted state. Terminal results survive runtime deletion
+and controller restart; later deployments cannot rewrite them.
 
 ### Current runtime diagnostics
 
@@ -106,7 +105,8 @@ plus AgentRevision read. It returns a revision ID, observation time, and at
 most 32 checks. Kubernetes reports held startup failures and probes Slack
 configuration, authentication, and connectivity without sending. Missing Pods
 yield `unknown`; unavailable evidence yields `503`. The call changes no stored
-state and proves no model response. See the [diagnostics flow](../flows/agent-deployment-diagnostics.md).
+state and proves no model response. On OpenShell the `agent` check is always
+`unknown`; use deployment status and [Harness logs](../guides/topics/agent-troubleshoot.md#read-openshell-sandbox-and-supervisor-logs). See the [diagnostics flow](../flows/agent-deployment-diagnostics.md).
 
 ## Backend association
 
@@ -372,9 +372,9 @@ The public API has no revision mutation/deletion or explicit rollback endpoint.
 Controller API authentication for Agent service principals remains unavailable.
 The optional
 [OpenShell SandboxDriver](drivers/openshell-sandbox.md) requires bundled
-Kubernetes Compute and dedicated Codex; other sandbox execution combinations are
-rejected. Stock OpenShell cannot provide all required workload credentials; check
-its compatibility limits before planning deployment.
+Kubernetes Compute and dedicated Codex; other combinations are rejected.
+Stock OpenShell lacks some required workload credentials; check its
+compatibility limits first.
 
 ## Failure semantics
 

@@ -129,7 +129,13 @@ The worker emits fixed operational event classes through the same logger:
   `REFUSED_CANDIDATE_STOP_PENDING` and adds `refusal`, the refusal's code
   (`CONVERGENCE_DEADLINE_EXCEEDED` once a lifted refusal outlived the deadline),
   until the stop succeeds. A stopped Agent's stop or revision pass whose Gateway drain
-  yielded to other work stays pending with `AGENT_STOP_YIELDED` and runs again after it. A provisioning plan that the Compute Driver refuses for a reason the caller
+  yielded to other work stays pending with `AGENT_STOP_YIELDED` and runs again after it;
+  a deployment whose dedicated predecessor's drain yielded stays pending with
+  `PREDECESSOR_STOP_YIELDED`. Such a deployment that then fails (with the full wait), is
+  superseded or ends stopped first finishes that stop. A failed or superseded one adds
+  `predecessorStop`, the stop's `cause`, if it still fails; a stopped one retries it.
+  Only the work's first yield, then at most one a minute, is logged; these lines and the
+  work's next other line add `stopYields`, the yields this worker counted for it. A provisioning plan that the Compute Driver refuses for a reason the caller
   cannot fix adds that `reason`. A failed Namespace pass adds the Compute Driver's
   `reason` when it gives one: bounded printable text that never carries another
   tenant's values. These fields stay in the local log; the Collector

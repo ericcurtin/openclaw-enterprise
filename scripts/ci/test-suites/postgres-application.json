@@ -8,6 +8,7 @@
     "tests/integration/postgres-worker-agent-revision.test.mjs",
     "tests/integration/postgres-worker-agent-revision-refused-wait.test.mjs",
     "tests/integration/postgres-worker-agent-revision-replacement.test.mjs",
+    "tests/integration/postgres-worker-agent-revision-yielded-redeploy.test.mjs",
     "tests/integration/postgres-worker-agent-revision-refused-stop.test.mjs",
     "tests/integration/postgres-worker-agent-revision-teardown.test.mjs",
     "tests/integration/postgres-worker-agent-revision-health.test.mjs",
@@ -56,6 +57,7 @@
         "the revision worker retries transient Backend binding read failures without activating",
         "an older revision retry is superseded without preparing or retiring a newer active revision",
         "real PostgreSQL preserves the failure budget while an Agent runtime converges",
+        "terminal Compute preparation persists failure and resumes exact cleanup after worker restart",
         "an overdue Agent runtime fails closed without activating its incomplete revision",
         "one worker reconciles embedded OpenClaw and dedicated Codex but rejects unapproved pinned Harnesses",
         "a lost retirement claim preserves the activated replacement and cannot complete stolen work",
@@ -81,6 +83,21 @@
       "path": "tests/integration/postgres-worker-agent-revision-replacement.test.mjs",
       "expectedTests": [
         "exclusive replacement blocks overlap, supersedes old maintenance and recovers through a new revision"
+      ]
+    },
+    {
+      "path": "tests/integration/postgres-worker-agent-revision-yielded-redeploy.test.mjs",
+      "expectedTests": [
+        "a redeploy's predecessor stop yields during its Gateway drain and the replacement starts after it",
+        "a newer deployment admitted while a predecessor stop is yielded supersedes it and starts last",
+        "a yielded redeploy superseded by a deployment refused before Compute finishes its predecessor stop",
+        "a redeploy refused while its predecessor stop is yielded finishes that stop before it fails",
+        "a yielded redeploy overtaken by an Agent stop finishes its predecessor stop before it ends stopped",
+        "a yielded redeploy overtaken by an Agent stop retries a failed predecessor stop before it ends stopped",
+        "another Agent's optional wait ends for a yielded redeploy, which starts soon after its drain",
+        "a redeploy refused before stopping its predecessor leaves the serving revision running",
+        "a yielded redeploy whose last claim expires gets one more attempt, which finishes its predecessor stop",
+        "a yielded redeploy refused on the extra attempt after its last claim expired finishes its predecessor stop"
       ]
     },
     {

@@ -19,9 +19,10 @@ import {
 // Exclusive replacement and refused candidates: predecessor stops across pending passes and
 // maintenance, refused and self-failed exclusive candidates, refused deployments on shared
 // Compute, predecessors that come back after the sweep, and a refused wait's failed reads and a
-// refusal lifted past the deadline. Worker health is in the -health sibling, and a refused
-// candidate's stop and its wait in the -refused-stop and -refused-wait siblings; the lane runs
-// the revision files at once. These files name the -replacement, -refused-stop and -refused-wait
+// refusal lifted past the deadline. Worker health is in the -health sibling, a refused
+// candidate's stop and its wait in the -refused-stop and -refused-wait siblings, and redeploys
+// whose predecessor stop yields in the -yielded-redeploy sibling; the lane runs the revision files
+// at once. These files name the -replacement, -refused-stop, -refused-wait and -yielded-redeploy
 // siblings only by suffix: CI Impact sends a test-only change to full CI when another file names
 // that test.
 

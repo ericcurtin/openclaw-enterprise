@@ -6,6 +6,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   rename,
@@ -80,6 +81,18 @@ test("Codex OAuth bootstrap preserves rotated credentials and requires a new sou
         OCE_CODEX_OAUTH_SEED_PATH: seedPath,
       },
     });
+  // Publish fixture credentials through an exclusive temporary inode. Atomic
+  // replacement must not reopen a checked destination or follow a planted link.
+  const writeNativeAuth = async (value) => {
+    const temporaryPath = `${authPath}.native`;
+    const file = await open(temporaryPath, "wx", 0o600);
+    try {
+      await file.writeFile(JSON.stringify(value));
+    } finally {
+      await file.close();
+    }
+    await rename(temporaryPath, authPath);
+  };
   await run();
   assert.deepEqual(JSON.parse(await readFile(authPath, "utf8")), auth);
   assert.equal((await stat(authPath)).mode & 0o777, 0o600);
@@ -89,8 +102,7 @@ test("Codex OAuth bootstrap preserves rotated credentials and requires a new sou
     ...auth,
     tokens: { ...auth.tokens, access_token: "rotated-access", refresh_token: "rotated-refresh" },
   };
-  await writeFile(`${authPath}.native`, JSON.stringify(refreshed), { mode: 0o600 });
-  await rename(`${authPath}.native`, authPath);
+  await writeNativeAuth(refreshed);
   await run();
   assert.deepEqual(JSON.parse(await readFile(authPath, "utf8")), refreshed);
   await assert.rejects(
@@ -100,6 +112,17 @@ test("Codex OAuth bootstrap preserves rotated credentials and requires a new sou
   await rm(authPath);
   await assert.rejects(run(), /could not initialize private credentials/);
   await assert.rejects(readFile(authPath), { code: "ENOENT" });
+
+  // A killed writer may leave auth.json without a receipt. A retry must finish
+  // that generation rather than treating the partial output as completion.
+  await rm(join(codexHome, ".oce-oauth.json"));
+  await writeNativeAuth(auth);
+  await Promise.all(Array.from({ length: 8 }, () => run()));
+  assert.deepEqual(JSON.parse(await readFile(authPath, "utf8")), auth);
+  assert.deepEqual(JSON.parse(await readFile(join(codexHome, ".oce-oauth.json"), "utf8")), {
+    sourceUid: "source-1",
+    volumeUid: "volume-1",
+  });
 
   // A replacement source starts from an empty Codex home. Links planted by the previous
   // process must not redirect the new bundle into the served workspace.
@@ -112,7 +135,11 @@ test("Codex OAuth bootstrap preserves rotated credentials and requires a new sou
   }
   await run("source-2");
   assert.deepEqual(await readdir(workspace), []);
-  assert.deepEqual((await readdir(codexHome)).sort(), [".oce-oauth.json", "auth.json"]);
+  assert.deepEqual((await readdir(codexHome)).sort(), [
+    ".oce-oauth-bootstrap.lock",
+    ".oce-oauth.json",
+    "auth.json",
+  ]);
   assert.ok((await lstat(authPath)).isFile());
   assert.deepEqual(JSON.parse(await readFile(authPath, "utf8")), auth);
   assert.deepEqual(JSON.parse(await readFile(join(codexHome, ".oce-oauth.json"), "utf8")), {
@@ -123,7 +150,7 @@ test("Codex OAuth bootstrap preserves rotated credentials and requires a new sou
   // Restarting with the same source keeps the native generation and its history.
   await mkdir(join(codexHome, "sessions"));
   await writeFile(join(codexHome, "sessions", "current.jsonl"), "current login history");
-  await writeFile(authPath, JSON.stringify(refreshed), { mode: 0o600 });
+  await writeNativeAuth(refreshed);
   await run("source-2");
   assert.deepEqual(JSON.parse(await readFile(authPath, "utf8")), refreshed);
   assert.deepEqual(await readdir(join(codexHome, "sessions")), ["current.jsonl"]);
@@ -132,6 +159,12 @@ test("Codex OAuth bootstrap preserves rotated credentials and requires a new sou
   await rm(authPath);
   await symlink(seedPath, authPath);
   await assert.rejects(run("source-2"), /could not initialize private credentials/);
+
+  // A planted lock link cannot redirect the writer outside its private home.
+  await rm(join(codexHome, ".oce-oauth-bootstrap.lock"));
+  await symlink(seedPath, join(codexHome, ".oce-oauth-bootstrap.lock"));
+  await assert.rejects(run("source-3"), /could not initialize private credentials/);
+  assert.deepEqual(JSON.parse(await readFile(seedPath, "utf8")), auth);
 });
 
 test("runtime image seccomp option requires the CI-prepared profile record", async (t) => {
@@ -1736,7 +1769,9 @@ server.listen(443, "0.0.0.0", () => console.log("broker-forwarder-ready"));
       "disallowed_status=$?",
       "set -e",
       'test "$disallowed_status" -ne 0',
-      "printf '%s\\n' \"$disallowed_output\" | grep -Fq 'repository-push-ref-not-allowed'",
+      // Match in the shell, not with `printf | grep -q`: under pipefail, grep -q
+      // exits at the first match and printf's next line write can fail with EPIPE.
+      "[[ $disallowed_output == *'repository-push-ref-not-allowed'* ]]",
       "git clone https://github.com/fixture/read-only.git read-only",
       "git -C read-only switch -c denied",
       "printf 'denied proof\n' > read-only/denied-proof.txt",
@@ -1748,14 +1783,14 @@ server.listen(443, "0.0.0.0", () => console.log("broker-forwarder-ready"));
       "set -e",
       "printf '%s\\n' \"$readonly_output\"",
       'test "$readonly_status" -ne 0',
-      "printf '%s\\n' \"$readonly_output\" | grep -Fq 'requested URL returned error: 400'",
+      "[[ $readonly_output == *'requested URL returned error: 400'* ]]",
       "set +e",
       "unadmitted_output=$(git ls-remote https://github.com/fixture/unadmitted.git HEAD 2>&1)",
       "unadmitted_status=$?",
       "set -e",
       "printf '%s\\n' \"$unadmitted_output\"",
       'test "$unadmitted_status" -ne 0',
-      "printf '%s\\n' \"$unadmitted_output\" | grep -Fq 'credential-helper-failed'",
+      "[[ $unadmitted_output == *'credential-helper-failed'* ]]",
       "printf 'commit=%s\\n' \"$commit\"",
     ].join("\n");
     // Ask the real broker for its service-owned denial codes without printing
@@ -1961,7 +1996,13 @@ async function expectFailure(name, script, pattern, permissionProfile = brokerPe
     "set -e",
     ${JSON.stringify("printf '%s\n' \"$output\"")},
     ${JSON.stringify('if [ "$status" -eq 0 ]; then exit 42; fi')},
-    ${JSON.stringify("printf '%s\n' \"$output\" | grep -Eiq ")} + JSON.stringify(pattern),
+    // An in-shell match: printf piped to grep -q can fail with EPIPE under pipefail.
+    // Patterns are case-insensitive alternations of literals matched against the
+    // whole output; they go into a double-quoted assignment, so keep $, backticks
+    // and backslashes out of them.
+    ${JSON.stringify("shopt -s nocasematch")},
+    ${JSON.stringify("pattern=")} + JSON.stringify(pattern),
+    ${JSON.stringify("[[ $output =~ $pattern ]]")},
   ].join("\\n");
   const denied = await execShell(failureProbe, permissionProfile);
   assert.equal(denied.exitCode, 0, name + " did not fail for the expected reason: " + denied.stdout + denied.stderr);

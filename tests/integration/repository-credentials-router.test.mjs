@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { availableParallelism, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it as test } from "node:test";
@@ -19,6 +19,7 @@ import {
 import {
   selectGhRepository,
   selectGitPushDestination,
+  selectImplicitGhRepository,
 } from "../../apps/controller/src/drivers/repo/github/credentials/client/targets.ts";
 
 // Children get an allowlisted environment, so they only share the lane's Node
@@ -105,6 +106,17 @@ const fill = (material, extra = {}, path, input = protocol(path)) =>
 const pin = (material, binding) =>
   JSON.stringify([material.manifest.generation, binding.repositoryRef, binding.sessionId]);
 const pushLine = (ref, source = "HEAD") => `${source} ${"1".repeat(40)} ${ref} ${"0".repeat(40)}\n`;
+/** The pre-push guard's refusal when it cannot check a push, with its public reason. */
+const guardFailed = (reason) =>
+  `repository-pre-push-guard-failed${reason === undefined ? "" : `: ${reason}`}\n`;
+/** Run the managed pre-push hook in `work` with `input` written to `name`. */
+const prePush = async (work, env, destination, input, name = "push-input") => {
+  await writeFile(join(work, name), input);
+  return git(
+    ["hook", "run", `--to-stdin=${join(work, name)}`, "pre-push", "--", "origin", destination],
+    { cwd: work, env, allowFailure: true },
+  );
+};
 const writeManifest = (material, manifest) =>
   writeFile(join(material.root, "manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
 /** A manifest over these bindings with their exact generation digest. */
@@ -250,10 +262,9 @@ describe("repository credential router", { concurrency: true }, () => {
       ({ repositoryRef }) => repositoryRef === "permitted",
     );
     const notAllowed = "repository-push-ref-not-allowed\n";
-    const guardFailed = "repository-pre-push-guard-failed\n";
     // [environment, destination, input, exit code (undefined: any failure), stderr]
     const cases = [
-      [{}, undefined, "topic", undefined, guardFailed],
+      [{}, undefined, "topic", undefined, guardFailed("name-one-repository-ref")],
       [ref("restricted"), undefined, "topic", 1, notAllowed],
       [ref("permitted"), undefined, "topic", 0],
       [{}, named, "topic", undefined],
@@ -265,7 +276,13 @@ describe("repository credential router", { concurrency: true }, () => {
       ...[
         named.replace("gateway-session@", "gateway%2Dsession@"),
         named.replace("gateway-session@", "gateway-session:secret@"),
-      ].map((destination) => [ref("restricted"), destination, "topic", 1, guardFailed]),
+      ].map((destination) => [
+        ref("restricted"),
+        destination,
+        "topic",
+        1,
+        guardFailed("unsupported-push-destination"),
+      ]),
       // A repository without a policy keeps its pushes, even beside restricted ones.
       [
         ref("unrestricted"),
@@ -292,7 +309,7 @@ describe("repository credential router", { concurrency: true }, () => {
       [ref("permitted"), undefined, "relativeMain", 1, notAllowed],
       [ref("permitted"), undefined, "forged", 1, notAllowed],
       // Invalid hook input is an inspection failure, not an ordinary policy denial.
-      [ref("permitted"), undefined, "malformed", 1, guardFailed],
+      [ref("permitted"), undefined, "malformed", 1, guardFailed("invalid-pre-push-input")],
     ];
     await settle(
       cases.map(async ([extra, destination = restricted.client.gitRemote, input, code, stderr]) => {
@@ -339,7 +356,90 @@ describe("repository credential router", { concurrency: true }, () => {
       { cwd: work, env: environment(material, ref("permitted")), allowFailure: true },
     );
     assert.equal(replaced.code, 1);
-    assert.equal(replaced.stderr, guardFailed);
+    assert.equal(replaced.stderr, guardFailed("invalid-repository-selection"));
+  });
+
+  test("material errors refuse pushes only to destinations a binding may name", async (t) => {
+    const policy = opened("policy", { pushRefAllowlist: ["refs/heads/agent/*"] });
+    const [material, sessionTarget] = await settle([
+      nativeMaterial(
+        t,
+        ["policy", policy],
+        ["open", opened("open", { repository: "example/open" })],
+      ),
+      temporaryDirectory(t),
+    ]);
+    const work = await temporaryDirectory(t);
+    await git(["init", work]);
+    const unrelated = [
+      "https://unrelated.example.test/example/project.git",
+      "https://someone@unrelated.example.test:8443/x/y",
+      // A trailing-dot host is not the gateway host for Git's credential helper either.
+      "https://credentials.example.test./example/project.git",
+    ];
+    // Gateway and canonical origins of any binding, and spellings whose host Git and
+    // the URL parser could read differently, stay refused.
+    const managed = [
+      policy.client.gitRemote,
+      "https://credentials.example.test/example/open.git",
+      "https://credentials.example.test/elsewhere/repository.git",
+      "https://github.com/unrelated/repository.git",
+      "https://credentials.example.test:443/example/project.git",
+      "https://CREDENTIALS.example.test/example/project.git",
+      "https://credentials%2Eexample%2Etest/example/project.git",
+      "https://user:secret@unrelated.example.test/x/y.git",
+      "https://unrelated.example.test\\@credentials.example.test/example/project.git",
+      "https://unrelated.example.test:443?@credentials.example.test/example/project.git",
+      "https://a@b@credentials.example.test/example/project.git",
+    ];
+    const push = (destination, extra = {}) =>
+      prePush(work, environment(material, extra), destination, pushLine("refs/heads/main"));
+    const expect = async (destinations, code, stderr, extra) =>
+      settle(
+        destinations.map(async (destination) => {
+          const result = await push(destination, extra);
+          assert.equal(result.code, code, JSON.stringify([destination, extra, result.stderr]));
+          if (stderr !== undefined) {
+            assert.equal(result.stderr, stderr, destination);
+          }
+        }),
+      );
+    // The guard is active on valid material.
+    await expect([policy.client.gitRemote], 1, "repository-push-ref-not-allowed\n");
+    // A session setting naming other material is read like an unusable session; its
+    // file-system error names a path and is never printed.
+    const session = { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "oce.repository.session" };
+    await expect(unrelated, 0, "", {
+      ...session,
+      GIT_CONFIG_VALUE_0: join(sessionTarget, "absent"),
+    });
+    await expect(managed, 1, guardFailed(), {
+      ...session,
+      GIT_CONFIG_VALUE_0: join(sessionTarget, "absent"),
+    });
+    // Without the manifest and generation the configuration names, nothing proceeds.
+    await settle(
+      ["manifestRoot", "generation"].map((name) =>
+        expect(unrelated, 1, guardFailed(), {
+          GIT_CONFIG_COUNT: "2",
+          GIT_CONFIG_KEY_0: "oce.repository.session",
+          GIT_CONFIG_VALUE_0: join(sessionTarget, "absent"),
+          GIT_CONFIG_KEY_1: `oce.repository.${name}`,
+          GIT_CONFIG_VALUE_1: name === "generation" ? "0".repeat(64) : "",
+        }),
+      ),
+    );
+    // One session file outside its custody rules fails the whole generation.
+    await chmod(join(material.manifest.bindings[1].directory, "bearer"), 0o640);
+    await expect(unrelated, 0, "");
+    await expect(managed, 1, guardFailed("invalid-repository-material"));
+    // Without readable public origins every destination stays refused.
+    await writeFile(join(material.root, "manifest.json"), "{}", { mode: 0o600 });
+    await expect(
+      [...unrelated, policy.client.gitRemote],
+      1,
+      guardFailed("invalid-repository-material"),
+    );
   });
 
   test("push destination normalization retains exact repository and host boundaries", async (t) => {
@@ -401,7 +501,33 @@ describe("repository credential router", { concurrency: true }, () => {
       { cwd: work, env: environment(material), allowFailure: true, timeout: 3000 },
     );
     assert.equal(result.code, 1);
-    assert.match(result.stderr, /repository-pre-push-guard-failed/);
+    // Forwarding is not the guard: the message names the hook and the reason.
+    assert.equal(result.stderr, "repository-hook-failed: pre-push: recursive-repository-hook\n");
+  });
+
+  test("a forwarded hook killed by a signal keeps Git's status and message", async (t) => {
+    const material = await nativeMaterial(t, [
+      "project",
+      opened("signal", { pushRefAllowlist: ["refs/heads/agent/*"] }),
+    ]);
+    const work = await temporaryDirectory(t);
+    await git(["init", work]);
+    await writeFile(join(work, ".git/hooks/post-checkout"), "#!/bin/sh\nkill -TERM $$\n", {
+      mode: 0o755,
+    });
+    const [native, managed] = await settle(
+      [clean(), environment(material)].map((env) =>
+        git(["hook", "run", "post-checkout", "--", "0", "0", "1"], {
+          cwd: work,
+          env,
+          allowFailure: true,
+        }),
+      ),
+    );
+    assert.equal(native.code, 143, native.stderr);
+    assert.equal(managed.code, native.code, managed.stderr);
+    assert.match(native.stderr, /died of signal 15\n$/);
+    assert.equal(managed.stderr, "error: hooks/post-checkout died of signal 15\n");
   });
 
   test("managed hooks preserve initialization and delegate template transaction hooks", async (t) => {
@@ -463,6 +589,8 @@ describe("repository credential router", { concurrency: true }, () => {
     await native(["-C", source, "commit", "-m", "Initial contents"]);
     await native(["clone", "--no-hardlinks", source, target]);
     await native(["-C", target, "config", "receive.denyCurrentBranch", "updateInstead"]);
+    // The pushes' receive-pack does not inherit GIT_CONFIG_COUNT (see cleanEnvironment).
+    await native(["-C", target, "config", "maintenance.auto", "false"]);
     await writeFile(join(source, "tracked"), "second\n");
     await native(["-C", source, "commit", "-am", "Update contents"]);
     const head = (await native(["-C", source, "rev-parse", "HEAD"])).stdout.trim();
@@ -479,6 +607,9 @@ describe("repository credential router", { concurrency: true }, () => {
       allowFailure: true,
     });
     assert.notEqual(deniedUntouched.code, 0);
+    // The refusal names Git's own reason, as the built-in implementation does.
+    assert.match(deniedUntouched.stderr, /Working directory has unstaged changes\n/);
+    assert.doesNotMatch(deniedUntouched.stderr, /guard-failed|hook-failed/);
     assert.equal(await targetHead(), head);
     assert.equal(await tracked(target), "second\n");
     assert.equal(await readFile(join(target, "untouched"), "utf8"), "local changes\n");
@@ -492,6 +623,12 @@ describe("repository credential router", { concurrency: true }, () => {
         allowFailure: true,
       });
       assert.notEqual(denied.code, 0);
+      assert.match(
+        denied.stderr,
+        staged
+          ? /Working directory has staged changes\n/
+          : /Working directory has unstaged changes\n/,
+      );
       assert.equal(await targetHead(), head);
       assert.equal(await tracked(target), "local changes\n");
     }
@@ -594,9 +731,17 @@ describe("repository credential router", { concurrency: true }, () => {
       () => selectGhRepository(manifest, gh.target.value, manifest.bindings[0]),
       /conflicting-repository-selection/,
     );
-    assert.throws(
-      () => parseGhInvocation(["api", "https://api.github.com/repos/example/project"]),
-      /unsupported-client-command/,
+    for (const endpoint of [
+      "https://api.github.com/repos/example/project",
+      // The gateway refuses any escape in a path, so the client refuses it first.
+      "repos/example/project/%2e%2e/other",
+      "repos/example/project/contents/a%2Fb",
+    ]) {
+      assert.throws(() => parseGhInvocation(["api", endpoint]), /unsupported-client-command/);
+    }
+    assert.equal(
+      parseGhInvocation(["api", "repos/example/project/issues?labels=a%20b"]).target.value,
+      "example/project",
     );
     assert.throws(
       () => parseGhInvocation(["pr", "create", "--title", "missing head"]),
@@ -623,6 +768,22 @@ describe("repository credential router", { concurrency: true }, () => {
     }
     const hosts = await readFile(join(env.GH_CONFIG_DIR, "hosts.yml"), "utf8");
     assert.equal(hosts.includes(second.bearer), true);
+    // Implicit selection reads effective remotes with the helper's path rules, so a
+    // trailing slash selects the same binding.
+    const remotes = await temporaryDirectory(t);
+    const local = gitWith({ cwd: remotes, env: clean() });
+    await local(["init"]);
+    await local(["remote", "add", "origin", "https://github.com/example/other/"]);
+    await local([
+      "remote",
+      "add",
+      "gateway",
+      "https://credentials.example.test/example/other.git/",
+    ]);
+    assert.equal(
+      selectImplicitGhRepository(manifest, clean({ GIT_DIR: join(remotes, ".git") })).sessionId,
+      "second",
+    );
     const viewed = parseGhInvocation(["repo", "view", "github.com/example/other"]);
     assert.equal(selectGhRepository(manifest, viewed.target.value).sessionId, "second");
     assert.throws(

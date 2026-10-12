@@ -711,6 +711,24 @@ test("malformed, non-JSON, invalid, and oversized inputs fail without mutations"
     assert.equal(fixture.controller.pendingOperations().length, before);
   }
 
+  // So must the Configuration write defaults.
+  for (const method of ["POST", "PATCH"]) {
+    const suffix = method === "PATCH" ? "/cfg_00000000-0000-4000-8000-000000000001" : "";
+    const result = await request(
+      fixture.app,
+      `/namespaces/${tenantANamespaceId}/configurations${suffix}`,
+      {
+        method,
+        body: {
+          ...(method === "POST" ? { kind: "agent" } : {}),
+          values: { notes: "Routine notes. ".repeat(40) },
+        },
+      },
+    );
+    assert.equal(result.response.status, 413, method);
+    assert.equal(fixture.controller.pendingOperations().length, before);
+  }
+
   assert.equal(
     fixture.auditSink.events.filter(
       (event) => event.kind === "mutation" && event.resource.kind === "namespace",
@@ -728,9 +746,8 @@ test("NUL characters and unpaired surrogates are refused in bodies and path para
   const configurations = `/namespaces/${namespace.id}/configurations`;
   const nul = ["a NUL character", "INVALID_FORMAT"];
   const surrogate = ["an unpaired UTF-16 surrogate", "INVALID_VALUE"];
-  // A deep body inside the 64 KiB limit; its detail path keeps whole leading segments.
-  const deep = 30_000;
-  const deepPath = `/values/x${"/0".repeat((512 - "/values/x".length) >> 1)}`;
+  // A detail path too long for 512 characters keeps whole leading segments.
+  const longKey = "k".repeat(300);
   const cases = [
     ["/namespaces", '{"name":"lone \\ud800 surrogate"}', "/name", surrogate],
     ["/namespaces", '{"name":"trailing \\udc00"}', "/name", surrogate],
@@ -750,8 +767,8 @@ test("NUL characters and unpaired surrogates are refused in bodies and path para
     [configurations, `{"${"k".repeat(600)}\\u0000":1}`, `/${"k".repeat(511)}`, nul],
     [
       configurations,
-      `{"kind":"agent","values":{"x":${"[".repeat(deep)}"\\u0000"${"]".repeat(deep)}}}`,
-      deepPath,
+      `{"kind":"agent","values":{"x":{"${longKey}":{"${"m".repeat(300)}":"\\u0000"}}}}`,
+      `/values/x/${longKey}`,
       nul,
     ],
   ];
@@ -767,6 +784,15 @@ test("NUL characters and unpaired surrogates are refused in bodies and path para
     const shown = path.length <= room ? path : `${path.slice(0, room - 1)}…`;
     assert.equal(result.payload.error.message, `${before}${shown}${after}`);
   }
+  // A body nested past the depth bound is refused before its text is checked.
+  const deep = 30_000;
+  const tooDeep = await request(fixture.app, configurations, {
+    body: `{"kind":"agent","values":{"x":${"[".repeat(deep)}"\\u0000"${"]".repeat(deep)}}}`,
+  });
+  assert.equal(tooDeep.response.status, 400);
+  assert.deepEqual(tooDeep.payload.error.details, [
+    { path: `/values/x${"/0".repeat(23)}`, code: "TOO_DEEP" },
+  ]);
   // A surrogate pair is one well-formed character.
   const paired = await request(fixture.app, "/namespaces", { body: { name: "Paired \u{1F600}" } });
   assert.equal(paired.response.status, 201);

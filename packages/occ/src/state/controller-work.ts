@@ -1,4 +1,5 @@
 import { immutableCopy, isNonEmptyString, isPositiveSafeInteger } from "@openclaw-enterprise/utils";
+import { isComputePreparationFailureEvidence } from "@openclaw-enterprise/contracts";
 import type { RuntimeFailureEvidence } from "@openclaw-enterprise/contracts";
 
 import { ScopeViolationError } from "../errors.ts";
@@ -33,6 +34,10 @@ export interface DeploymentStatusResult {
       readonly code: string;
       readonly message: string;
     } | null;
+    readonly nextAttemptAt: string | null;
+  } | null;
+  readonly cleanup: {
+    readonly status: DeploymentStatus;
     readonly nextAttemptAt: string | null;
   } | null;
 }
@@ -92,6 +97,19 @@ export function deploymentProgressForWork(
                 : ""
             }; stopping the refused version before recording the failure. The controller will retry.`;
       break;
+    case "PREDECESSOR_STOP_YIELDED":
+      // Exclusive replacement: the serving version's gateway drains before this one starts.
+      code = attempt.code;
+      message =
+        "Waiting for the previous version's gateway to finish its active work before this version starts.";
+      break;
+    case "AGENT_STOP_YIELDED":
+      // The Agent stopped during this deployment: its stop waits for a gateway drain, and the
+      // deployment then ends stopped (finding 1106).
+      code = attempt.code;
+      message =
+        "The Agent was stopped; its gateway is finishing active work before the stop completes.";
+      break;
     case "AGENT_GATEWAY_UNAVAILABLE":
       code = attempt.code;
       message =
@@ -123,6 +141,13 @@ export function deploymentProgressForWork(
       code = attempt.code;
       message =
         "The previous worker claim expired after this version was published. The controller will finish activating it.";
+      break;
+    case "PREDECESSOR_STOP_RECOVERY":
+      // Its predecessor stop had started; failing without a pass would leave it half stopped
+      // (finding 1107).
+      code = attempt.code;
+      message =
+        "The last attempt ended while the previous version was stopping. The controller will try once more.";
       break;
   }
   return Object.freeze({
@@ -343,6 +368,22 @@ export function validateFailureData(
   if (data === undefined) {
     return undefined;
   }
+  if (
+    reasonCode === "HARNESS_CREDENTIAL_BOOTSTRAP_FAILED" ||
+    reasonCode === "HARNESS_CREDENTIAL_BOOTSTRAP_TIMEOUT"
+  ) {
+    if (
+      typeof data !== "object" ||
+      data === null ||
+      Array.isArray(data) ||
+      Object.keys(data).length !== 1 ||
+      !Object.hasOwn(data, "preparation") ||
+      !isComputePreparationFailureEvidence((data as Record<string, unknown>).preparation)
+    ) {
+      throw new ScopeViolationError("Compute preparation failure data has unsupported fields.");
+    }
+    return immutableCopy(data as Record<string, unknown>);
+  }
   if (reasonCode === "CONVERGENCE_DEADLINE_EXCEEDED") {
     if (typeof data !== "object" || data === null || Array.isArray(data)) {
       throw new ScopeViolationError("Convergence deadline failure data must be an object.");
@@ -517,6 +558,10 @@ function deploymentErrorMessage(code: string): string {
   switch (code) {
     case "CONVERGENCE_DEADLINE_EXCEEDED":
       return "Deployment convergence deadline exceeded.";
+    case "HARNESS_CREDENTIAL_BOOTSTRAP_FAILED":
+      return "Harness credential initialization failed. Correct the cause and deploy again.";
+    case "HARNESS_CREDENTIAL_BOOTSTRAP_TIMEOUT":
+      return "Harness credential initialization exceeded its deadline. Correct the cause and deploy again.";
     case "RUNTIME_AUTHENTICATION_FAILED":
       return "Deployment runtime credentials were rejected.";
     case "RUNTIME_CPU_STARVED":

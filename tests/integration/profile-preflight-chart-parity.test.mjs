@@ -212,6 +212,7 @@ function assertParity({
   values,
   accepted,
   chartError,
+  rendererError,
   profile = "openclaw",
   extraInput = {},
 }) {
@@ -220,6 +221,9 @@ function assertParity({
     async ({ directory, renderer }) => {
       assert.equal(renderer.ok, accepted, `${label}: renderer\n${renderer.output}`);
       if (!accepted) {
+        if (rendererError) {
+          assert.match(renderer.output, rendererError, label);
+        }
         assert.equal(existsSync(join(directory, "values.yaml")), false);
         assert.equal(existsSync(join(directory, "installation.yaml")), false);
       }
@@ -979,3 +983,55 @@ fieldParity("log collector exporter CIDRs get the same verdict from preflight an
   chartError:
     /logging\.collector\.exporter\.cidr must identify exactly one approved IPv4 exporter or proxy host with \/32/,
 });
+
+// Findings 1065 and 1066: preflight (resourceNameRule) and the chart
+// (openclaw.validateResourceName) refuse the same operator-set names, with the same rule.
+const resourceNameRefusal = (field) =>
+  new RegExp(`${escape(field)} must be a Kubernetes resource name of at most 253 characters`);
+const resourceNameCases = [
+  ["occ.custom-secret-v2", true],
+  ["a".repeat(253), true],
+  ["Bad_Name", false],
+  ["-secret", false],
+  ["secret.", false],
+  ["a".repeat(254), false],
+];
+for (const [field, chartField, controlPlane, values] of [
+  [
+    "controlPlane.databaseCa.secretName",
+    "database.caSecretName",
+    (secretName) => ({ databaseCa: { secretName } }),
+    (caSecretName) => ({ database: { caSecretName } }),
+  ],
+  [
+    "controlPlane.gatewayApiKeySecretName",
+    "gatewayRouting.apiKeySecretName",
+    (gatewayApiKeySecretName) => ({ gatewayApiKeySecretName }),
+    (apiKeySecretName) => ({ gatewayRouting: { apiKeySecretName } }),
+  ],
+  [
+    "controlPlane.gatewayClassName",
+    "gatewayRouting.gatewayClassName",
+    (gatewayClassName) => ({ gatewayClassName }),
+    (gatewayClassName) => ({ gatewayRouting: { gatewayClassName } }),
+  ],
+  [
+    "controlPlane.github.secretName",
+    "auth.github.secretName",
+    (secretName) => ({ github: { egressCidrs: ["140.82.112.0/20"], secretName } }),
+    (secretName) => ({ auth: { github: { secretName } } }),
+  ],
+]) {
+  test(`${field} and ${chartField} refuse the same malformed names`, { skip: helmSkip }, () =>
+    each(resourceNameCases, ([name, accepted]) =>
+      assertParity({
+        label: short(name),
+        controlPlane: controlPlane(name),
+        values: values(name),
+        accepted,
+        rendererError: resourceNameRefusal(field),
+        chartError: resourceNameRefusal(chartField),
+      }),
+    ),
+  );
+}

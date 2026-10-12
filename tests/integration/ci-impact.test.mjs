@@ -144,9 +144,13 @@ async function fixture(t, change, initial = {}, initialModes = {}, { moveMain } 
     return git("rev-parse", "HEAD");
   };
   await git("init", "-q");
+  // Commit and merge otherwise start `git maintenance run --auto --detach`,
+  // which outlives them and can rewrite .git/objects under the test and
+  // tempDir's removal (ENOTEMPTY); Git 2.55, for one, repacks in the
+  // background once objects/17 holds two loose objects.
   appendFileSync(
     join(repo, ".git/config"),
-    "[user]\n\tname = CI test\n\temail = ci@example.test\n",
+    "[user]\n\tname = CI test\n\temail = ci@example.test\n[maintenance]\n\tauto = false\n",
   );
   put("base.txt");
   for (const [path, content] of Object.entries(initial)) {
@@ -642,6 +646,7 @@ test("submodule changes remain visible even when Git configuration ignores them"
     await nested("init", "-q");
     await nested("config", "user.name", "CI test");
     await nested("config", "user.email", "ci@example.test");
+    await nested("config", "maintenance.auto", "false");
     writeFileSync(join(vendor, "file"), "content");
     await nested("add", "file");
     await nested("commit", "-qm", "nested");

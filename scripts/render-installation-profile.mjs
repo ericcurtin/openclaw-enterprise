@@ -17,13 +17,27 @@ const repoRoot = resolve(scriptDir, "..");
 const profilesDir = resolve(repoRoot, "deploy/profiles");
 const allowedProfiles = new Set(["openclaw", "codex"]);
 const dnsSubdomain = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
-// Kubernetes DNS-subdomain object names cap the whole name, not each segment.
-function isDnsSubdomainName(value) {
-  return value.length <= 253 && dnsSubdomain.test(value);
-}
 // Kubernetes Service names are DNS-1035 labels. The chart refuses any other
 // repositoryCredentials.serviceName.
 const dns1035Label = /^[a-z]([-a-z0-9]*[a-z0-9])?$/;
+const kubernetesSecretKey = /^[-._A-Za-z0-9]+$/;
+function isKubernetesSecretKey(value) {
+  return (
+    value !== "." &&
+    !value.startsWith("..") &&
+    value.length <= 253 &&
+    kubernetesSecretKey.test(value)
+  );
+}
+// The rule for a Kubernetes resource name field, such as a GatewayClass or Secret name.
+const resourceNameRule = {
+  validate: isKubernetesResourceName,
+  description: "a Kubernetes resource name of at most 253 characters",
+};
+const secretKeyRule = {
+  validate: isKubernetesSecretKey,
+  description: "a Kubernetes Secret key of at most 253 characters",
+};
 const digestImage = /^[^@\s]+@sha256:[a-f0-9]{64}$/;
 // The controller reference also feeds prepare-bootstrap-volume and the chart.
 const controllerDigestImage = /^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[a-f0-9]{64}$/;
@@ -482,7 +496,7 @@ function labelSyntax(labels, path, diagnostics, isPrefix) {
 // label values, as in `node-role.kubernetes.io/infra: ""`.
 function nodeSelector(source, path, diagnostics) {
   const labels = labelMap(source, path, diagnostics);
-  return labelSyntax(labels, path, diagnostics, isDnsSubdomainName);
+  return labelSyntax(labels, path, diagnostics, isKubernetesResourceName);
 }
 
 // NetworkPolicy peer selectors (DNS, API clients, metrics scrapers). Compute's validatePeer
@@ -536,6 +550,31 @@ function isIpv4Cidr(value, requiredPrefix) {
     return false;
   }
   return requiredPrefix === undefined || prefix === requiredPrefix;
+}
+
+// Compute refuses a CIDR that covers every address in each list that grants reach (scopedCidr
+// in the Kubernetes Compute Driver), with the same words. These profile lists are IPv4-only,
+// so that range is a /0. Status proxy sources wider than one address also warn there and here.
+function sourceCidrs(controlPlane, key, diagnostics, { warnWide = false } = {}) {
+  const path = ["controlPlane", key];
+  const everyAddress = (value) => value.endsWith("/0") && isIP(value.slice(0, -2)) === 4;
+  const cidrs = stringArray(controlPlane, path, diagnostics, {
+    validate: (value) => everyAddress(value) || isIpv4Cidr(value),
+    description: "an IPv4 CIDR",
+  });
+  cidrs.forEach((value, index) => {
+    if (typeof value !== "string") {
+      return;
+    }
+    if (everyAddress(value)) {
+      diagnostics.errors.push(`${path.join(".")}[${index}] cannot cover every address.`);
+    } else if (warnWide && isIpv4Cidr(value) && !isIpv4Cidr(value, 32)) {
+      diagnostics.warnings.push(
+        `${path.join(".")}[${index}] covers more than one address: every Pod in it can reach the Agent status port. Use the API server /32 source addresses.`,
+      );
+    }
+  });
+  return cidrs;
 }
 
 // The API refuses a public-suffix shared cookie domain at startup (normalizeSharedCookieDomain)
@@ -692,7 +731,12 @@ function signInProvider(source, name, diagnostics) {
   const path = ["controlPlane", name];
   const rendered = { enabled: true };
   for (const key of ["secretName", "clientIdKey", "clientSecretKey"]) {
-    const value = optionalString(source, [...path, key], diagnostics);
+    const value = optionalString(
+      source,
+      [...path, key],
+      diagnostics,
+      key === "secretName" ? resourceNameRule : secretKeyRule,
+    );
     if (value !== undefined) {
       rendered[key] = value;
     }
@@ -1424,7 +1468,7 @@ function buildRendered(profile, parsed, diagnostics) {
           ["controlPlane", "bootstrapPasswordClaimName"],
           diagnostics,
           {
-            validate: isDnsSubdomainName,
+            validate: isKubernetesResourceName,
             description: "a PVC name: a DNS subdomain of at most 253 characters",
           },
         ),
@@ -1442,6 +1486,7 @@ function buildRendered(profile, parsed, diagnostics) {
               databaseCa,
               ["controlPlane", "databaseCa", "secretName"],
               diagnostics,
+              resourceNameRule,
             ),
             caKey:
               optionalString(databaseCa, ["controlPlane", "databaseCa", "key"], diagnostics, {
@@ -1502,18 +1547,17 @@ function buildRendered(profile, parsed, diagnostics) {
     },
     gatewayRouting: {
       enabled: true,
-      gatewayClassName: asString(controlPlane, ["controlPlane", "gatewayClassName"], diagnostics, {
-        validate: isKubernetesResourceName,
-        description: "a Kubernetes resource name of at most 253 characters",
-      }),
+      gatewayClassName: asString(
+        controlPlane,
+        ["controlPlane", "gatewayClassName"],
+        diagnostics,
+        resourceNameRule,
+      ),
       apiKeySecretName: asString(
         controlPlane,
         ["controlPlane", "gatewayApiKeySecretName"],
         diagnostics,
-        {
-          validate: isKubernetesResourceName,
-          description: "a Kubernetes resource name of at most 253 characters",
-        },
+        resourceNameRule,
       ),
       envoyNamespace,
     },
@@ -1625,17 +1669,16 @@ function buildRendered(profile, parsed, diagnostics) {
               podLabels: values.dns.podLabels,
             },
             gatewayPort: 8080,
-            gatewayTrustedProxyCidrs: stringArray(
+            gatewayTrustedProxyCidrs: sourceCidrs(
               controlPlane,
-              ["controlPlane", "gatewayTrustedProxyCidrs"],
+              "gatewayTrustedProxyCidrs",
               diagnostics,
-              { validate: isIpv4Cidr, description: "an IPv4 CIDR" },
             ),
-            pluginStatusProxySourceCidrs: stringArray(
+            pluginStatusProxySourceCidrs: sourceCidrs(
               controlPlane,
-              ["controlPlane", "pluginStatusProxySourceCidrs"],
+              "pluginStatusProxySourceCidrs",
               diagnostics,
-              { validate: isIpv4Cidr, description: "an IPv4 CIDR" },
+              { warnWide: true },
             ),
           },
           gatewayRouting: {
@@ -1653,10 +1696,7 @@ function buildRendered(profile, parsed, diagnostics) {
               runtime,
               ["runtime", "gatewayStorageClassName"],
               diagnostics,
-              {
-                validate: isKubernetesResourceName,
-                description: "a Kubernetes resource name of at most 253 characters",
-              },
+              resourceNameRule,
             ),
             nodeSelector: nodeSelector(runtime, ["runtime", "nodeSelector"], diagnostics),
             gatewayNodeSelector: nodeSelector(
@@ -1737,12 +1777,14 @@ function buildRendered(profile, parsed, diagnostics) {
             managedServiceAccounts,
             ["codex", "managedServiceAccounts", "adminSecretName"],
             diagnostics,
+            resourceNameRule,
           ),
           key:
             optionalString(
               managedServiceAccounts,
               ["codex", "managedServiceAccounts", "adminSecretKey"],
               diagnostics,
+              secretKeyRule,
             ) ?? "admin-key",
           providerCidr: asString(
             managedServiceAccounts,
@@ -1805,32 +1847,32 @@ function buildRendered(profile, parsed, diagnostics) {
         repository,
         ["repository", "registryConfigMapName"],
         diagnostics,
-        {
-          validate: isKubernetesResourceName,
-          description: "a Kubernetes resource name of at most 253 characters",
-        },
+        resourceNameRule,
       ),
       serviceConfigSecretName: asString(
         repository,
         ["repository", "serviceConfigSecretName"],
         diagnostics,
-        {
-          validate: isKubernetesResourceName,
-          description: "a Kubernetes resource name of at most 253 characters",
-        },
+        resourceNameRule,
       ),
-      appKeySecretName: asString(repository, ["repository", "appKeySecretName"], diagnostics, {
-        validate: isKubernetesResourceName,
-        description: "a Kubernetes resource name of at most 253 characters",
-      }),
-      tlsSecretName: asString(repository, ["repository", "tlsSecretName"], diagnostics, {
-        validate: isKubernetesResourceName,
-        description: "a Kubernetes resource name of at most 253 characters",
-      }),
-      publicCaSecretName: asString(repository, ["repository", "publicCaSecretName"], diagnostics, {
-        validate: isKubernetesResourceName,
-        description: "a Kubernetes resource name of at most 253 characters",
-      }),
+      appKeySecretName: asString(
+        repository,
+        ["repository", "appKeySecretName"],
+        diagnostics,
+        resourceNameRule,
+      ),
+      tlsSecretName: asString(
+        repository,
+        ["repository", "tlsSecretName"],
+        diagnostics,
+        resourceNameRule,
+      ),
+      publicCaSecretName: asString(
+        repository,
+        ["repository", "publicCaSecretName"],
+        diagnostics,
+        resourceNameRule,
+      ),
       serviceName: optionalString(repository, ["repository", "serviceName"], diagnostics, {
         validate: (value) => value.length <= 63 && dns1035Label.test(value),
         description: "a Kubernetes Service DNS-1035 label of at most 63 characters",

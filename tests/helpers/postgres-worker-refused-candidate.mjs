@@ -3,9 +3,9 @@ import { randomUUID } from "node:crypto";
 import { SandboxRevisionUnsupportedError } from "../../packages/occ/src/index.ts";
 import { waitFor } from "./wait-for.mjs";
 
-// Refused-candidate fakes shared by the worker revision -replacement, -refused-stop and
-// -refused-wait test files: an exclusive counting Compute, a refused replacement candidate, a
-// failing stop, and waits on the stop's logged refusals. Test file names stay out of comments
+// Refused-candidate fakes shared by the worker revision -replacement, -refused-stop,
+// -refused-wait and -yielded-redeploy test files: an exclusive counting Compute, a refused
+// replacement candidate, a failing stop, and waits on the stop's logged refusals. Test file names stay out of comments
 // here: CI Impact sends a test-only change to full CI when another file names that test.
 
 /**

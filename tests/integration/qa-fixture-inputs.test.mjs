@@ -34,18 +34,25 @@ test(
     t.after(() => rm(directory, { recursive: true, force: true }));
     const output = join(directory, "matrix.json");
     const reportModule = new URL("../helpers/qa-report.mjs", import.meta.url).href;
+    const secretsModule = new URL("../helpers/qa-secrets.mjs", import.meta.url).href;
     // Exercise the real reporter under node:test, including failed subtests.
     // A shared writeFile without a serialized snapshot can lose concurrent rows
     // or leave a trailing fragment of the previous JSON document.
     const source = `
     import test from 'node:test';
     import { createQaReport } from ${JSON.stringify(reportModule)};
+    import { registerQaSecret } from ${JSON.stringify(secretsModule)};
+    // Real runs register fixture secrets, so redaction always has work to do.
+    registerQaSecret('synthetic-stage-secret-value');
     const report = createQaReport(${JSON.stringify(output)}, { scope: 'full', concurrency: 4 });
     test('parallel report', { concurrency: 4 }, async (t) => {
       await Promise.all(Array.from({length: 20}, (_, i) =>
         report.stage(t, 'compose/Codex', 'stage-' + i, async () => {
           if (i === 2) throw new Error('blocked by unavailable test prerequisite');
           if (i === 7) throw new Error('expected assertion failure');
+          // A DOMException's message is getter-only; redaction must keep it.
+          if (i === 11) throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+          if (i === 13) throw undefined;
         }, 'scenario-' + i)
       ));
       await report.save();
@@ -82,7 +89,7 @@ test(
       let expectedOutcome = "passed";
       if (i === 2) {
         expectedOutcome = "blocked";
-      } else if (i === 7) {
+      } else if (i === 7 || i === 11 || i === 13) {
         expectedOutcome = "failed";
       }
       assert.equal(row.outcome, expectedOutcome);
@@ -94,6 +101,11 @@ test(
       report.outcomes.find((row) => row.stage === "stage-7").reason,
       /expected assertion/,
     );
+    assert.equal(
+      report.outcomes.find((row) => row.stage === "stage-11").reason,
+      "The operation was aborted due to timeout",
+    );
+    assert.equal(report.outcomes.find((row) => row.stage === "stage-13").reason, "undefined");
     assert.equal((await stat(output)).mode & 0o777, 0o600);
     assert.deepEqual(await readdir(directory), ["matrix.json"]);
   },
@@ -212,16 +224,20 @@ test("QA waits report the last observation when they time out", async () => {
   const { waitFor } = await import("../helpers/qa-utils.mjs");
   let observations = 0;
   let last;
+  // A fake clock that each observation advances by 100 ms: two observations, no real wait.
+  let clock = 0;
   await assert.rejects(
     waitFor(
       "fake condition",
       async () => {
         observations += 1;
+        assert.ok(observations < 100, "the wait follows the fake clock");
+        clock += 100;
         last = { observation: observations, pods: ["runtime-0"] };
         return false;
       },
       200,
-      { describe: () => JSON.stringify(last), interval: 5 },
+      { describe: () => JSON.stringify(last), interval: 0, now: () => clock },
     ),
     (error) => {
       assert.equal(
@@ -313,6 +329,9 @@ test("a QA Agent stop timeout names the remaining Pods and keeps redacted platfo
   });
   const calls = [];
   const records = new Map();
+  // Each GET advances the fake clock past the 10 ms timeout: one read, then the timeout.
+  let clock = 0;
+  const timing = { timeout: 10, interval: 0, now: () => clock };
   const f = {
     controlPlane: "kubernetes",
     env: {
@@ -326,9 +345,12 @@ test("a QA Agent stop timeout names the remaining Pods and keeps redacted platfo
     state: { platformNamespace: "oce-system" },
     async api(method, path) {
       calls.push(["api", method, path]);
-      return method === "GET"
-        ? { desiredRuntimeState: "stopped", activeRevisionId: "revision-1" }
-        : undefined;
+      if (method !== "GET") {
+        return undefined;
+      }
+      clock += 1_000;
+      assert.ok(clock < 100_000, "the stop wait follows the fake clock");
+      return { desiredRuntimeState: "stopped", activeRevisionId: "revision-1" };
     },
     async kubectl(...args) {
       calls.push(["kubectl", ...args]);
@@ -375,7 +397,7 @@ test("a QA Agent stop timeout names the remaining Pods and keeps redacted platfo
       return `${this.controlPlane}-${name}.json`;
     },
   };
-  await assert.rejects(stopQaAgent(f, agent, { timeout: 10 }), (error) => {
+  await assert.rejects(stopQaAgent(f, agent, timing), (error) => {
     assert.match(error.message, /^Timed out: ordinary Agent stop removes every runtime Pod; /);
     const observation = JSON.parse(
       /; last observation: (\{.*\}); API and worker logs: /.exec(error.message)[1],
@@ -502,16 +524,14 @@ test("a QA Agent stop timeout names the remaining Pods and keeps redacted platfo
   );
   // A single worker Pod is the Deployment read: no per-Pod copies.
   platformPods.splice(0, 1);
-  await assert.rejects(
-    stopQaAgent(f, { id: "agent-3", namespaceId: "namespace-1" }, { timeout: 10 }),
-  );
+  await assert.rejects(stopQaAgent(f, { id: "agent-3", namespaceId: "namespace-1" }, timing));
   assert.equal(records.get("agent-3-stop-timeout-platform-logs").logs.workerPods, undefined);
 
   // A Compose control plane keeps the observation but has no in-cluster platform logs.
   records.clear();
   const composeAgent = { id: "agent-2", namespaceId: "namespace-1" };
   await assert.rejects(
-    stopQaAgent({ ...f, controlPlane: "compose" }, composeAgent, { timeout: 10 }),
+    stopQaAgent({ ...f, controlPlane: "compose" }, composeAgent, timing),
     (error) =>
       /; last observation: \{.*"pods":\[\{/.test(error.message) &&
       !/API and worker logs/.test(error.message),
@@ -539,8 +559,11 @@ test("a QA Agent stop waits for the Gateway stop bound and records a slow stop w
     },
     status: { phase: "Running" },
   };
+  // A fake clock for both the slow-stop threshold and the timeout, and no sleep between
+  // reads: each GET advances the clock by the next step; the last step's read finds
+  // the stop done.
   let clock = 0;
-  // Each GET advances the clock by the next step; the last step's read finds the stop done.
+  const now = () => clock;
   const fixture = (steps, { done = true } = {}) => {
     const records = new Map();
     let reads = 0;
@@ -555,6 +578,7 @@ test("a QA Agent stop waits for the Gateway stop bound and records a slow stop w
         }
         clock += steps[Math.min(reads, steps.length - 1)];
         reads += 1;
+        assert.ok(reads < 100, "the stop wait follows the fake clock");
         return finished()
           ? { desiredRuntimeState: "stopped", activeRevisionId: null }
           : { desiredRuntimeState: "stopped", activeRevisionId: "revision-4" };
@@ -595,7 +619,7 @@ test("a QA Agent stop waits for the Gateway stop bound and records a slow stop w
   // A fast stop leaves no evidence.
   const fast = fixture([0, 5_000]);
   const fastAgent = { id: "agent-4", namespaceId: "namespace-1" };
-  await stopQaAgent(fast.f, fastAgent, { now: () => clock });
+  await stopQaAgent(fast.f, fastAgent, { now, interval: 0 });
   assert.equal(fastAgent.stopped, true);
   assert.equal(fast.records.size, 0);
   assert.deepEqual(written, []);
@@ -605,7 +629,7 @@ test("a QA Agent stop waits for the Gateway stop bound and records a slow stop w
   clock = 0;
   const slow = fixture([61_000, 1_000, 1_000, 200_000]);
   const slowAgent = { id: "agent-4", namespaceId: "namespace-1" };
-  await stopQaAgent(slow.f, slowAgent, { now: () => clock });
+  await stopQaAgent(slow.f, slowAgent, { now, interval: 0 });
   assert.equal(slowAgent.stopped, true);
   assert.deepEqual([...slow.records.keys()].sort(), [
     "agent-4-slow-stop",
@@ -644,7 +668,7 @@ test("a QA Agent stop waits for the Gateway stop bound and records a slow stop w
   // Stopping the same Agent again gets its own evidence names.
   clock = 0;
   const late = fixture([61_000]);
-  await stopQaAgent(late.f, slowAgent, { now: () => clock });
+  await stopQaAgent(late.f, slowAgent, { now, interval: 0 });
   assert.deepEqual(late.records.get("agent-4-2-slow-stop"), {
     thresholdMs: 60_000,
     elapsedMs: 61_000,
@@ -660,7 +684,7 @@ test("a QA Agent stop waits for the Gateway stop bound and records a slow stop w
     throw new Error("EEXIST: launcher-private-value exists");
   };
   const unwritableAgent = { id: "agent-4", namespaceId: "namespace-1" };
-  await stopQaAgent(unwritable.f, unwritableAgent, { now: () => clock });
+  await stopQaAgent(unwritable.f, unwritableAgent, { now, interval: 0 });
   assert.equal(unwritableAgent.stopped, true);
   assert.deepEqual(failures, ["agent-4-slow-stop-platform-logs", "agent-4-slow-stop"]);
   assert.match(written[2], /took 62 s\n$/);
@@ -670,7 +694,7 @@ test("a QA Agent stop waits for the Gateway stop bound and records a slow stop w
   const stuck = fixture([1_000], { done: false });
   const stuckAgent = { id: "agent-5", namespaceId: "namespace-1" };
   await assert.rejects(
-    stopQaAgent(stuck.f, stuckAgent, { slowAfter: 0, timeout: 10, now: () => clock }),
+    stopQaAgent(stuck.f, stuckAgent, { slowAfter: 0, timeout: 10, now, interval: 0 }),
     (error) => {
       assert.match(
         error.message,
@@ -685,6 +709,29 @@ test("a QA Agent stop waits for the Gateway stop bound and records a slow stop w
     "agent-5-stop-timeout-platform-logs",
   ]);
   assert.equal(written.length, 3);
+
+  // The default timeout is that bound on the same clock: a stop that completes once the
+  // Gateway wait plus three minutes has passed still passes; one still running at the
+  // bound fails.
+  const bound = GATEWAY_STOP_TIMEOUT_MS + 10_000 + 3 * 60_000;
+  clock = 0;
+  const atBoundAgent = { id: "agent-6", namespaceId: "namespace-1" };
+  await stopQaAgent(fixture([bound - 1, 1]).f, atBoundAgent, { now, interval: 0 });
+  assert.equal(atBoundAgent.stopped, true);
+  assert.equal(written.length, 4);
+  assert.match(written[3], new RegExp(`Agent agent-6 took ${Math.round(bound / 1000)} s`));
+  clock = 0;
+  const pastBoundAgent = { id: "agent-7", namespaceId: "namespace-1" };
+  await assert.rejects(
+    stopQaAgent(fixture([bound], { done: false }).f, pastBoundAgent, {
+      now,
+      interval: 0,
+    }),
+    { message: /^Timed out: ordinary Agent stop removes every runtime Pod; / },
+  );
+  assert.equal(pastBoundAgent.stopped, undefined);
+  // It timed out on its first read, at the bound: the timeout is no longer than the bound.
+  assert.equal(clock, bound);
 });
 
 test("QA log redaction hides each line of a registered multi-line secret", async () => {
@@ -742,6 +789,374 @@ test("QA log redaction hides JSON-escaped, base64 and percent-encoded copies of 
   const error = redactQaError(new Error(`failed: ${encoded[2]}`));
   assert.equal(error.message, "failed: [REDACTED]");
 });
+
+test("QA error redaction keeps errors whose message cannot be written", async () => {
+  const { inspect } = await import("node:util");
+  const { redactQaError, registerQaSecret } = await import("../helpers/qa-secrets.mjs");
+  const value = "synthetic-qa-error-secret-2026";
+  registerQaSecret(value);
+
+  // An ordinary error is redacted in place, message and stack.
+  const ordinary = new Error(`request failed: ${value}`);
+  assert.equal(redactQaError(ordinary), ordinary);
+  assert.equal(ordinary.message, "request failed: [REDACTED]");
+  assert.ok(!ordinary.stack.includes(value), ordinary.stack);
+  assert.match(ordinary.stack, /request failed: \[REDACTED\]/);
+
+  // AbortSignal.timeout's error: nothing to redact, so it is returned untouched.
+  const timeout = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+  assert.equal(redactQaError(timeout), timeout);
+  assert.equal(timeout.message, "The operation was aborted due to timeout");
+
+  // A DOMException carrying a secret: its message is getter-only, so a plain
+  // Error replaces it, with the name, code and redacted stack, and without the
+  // original as `cause` (inspecting that would print the secret).
+  const dom = new DOMException(`timed out reading ${value}`, "TimeoutError");
+  const replaced = redactQaError(dom);
+  assert.notEqual(replaced, dom);
+  assert.ok(replaced instanceof Error);
+  assert.equal(replaced.message, "timed out reading [REDACTED]");
+  assert.equal(replaced.name, "TimeoutError");
+  assert.equal(replaced.code, dom.code);
+  assert.equal(replaced.cause, undefined);
+  assert.match(replaced.stack, /^TimeoutError: timed out reading \[REDACTED\]/);
+  assert.ok(!inspect(replaced).includes(value), inspect(replaced));
+
+  // A frozen error cannot be updated either.
+  const frozen = Object.freeze(Object.assign(new Error(`denied ${value}`), { code: "EACCES" }));
+  const unfrozen = redactQaError(frozen);
+  assert.notEqual(unfrozen, frozen);
+  assert.equal(unfrozen.message, "denied [REDACTED]");
+  assert.equal(unfrozen.name, "Error");
+  assert.equal(unfrozen.code, "EACCES");
+  assert.match(unfrozen.stack, /^Error: denied \[REDACTED\]\n/);
+  assert.ok(!inspect(unfrozen).includes(value), inspect(unfrozen));
+
+  // A thrown string is redacted; other non-objects pass through.
+  assert.equal(redactQaError(`token ${value}`), "token [REDACTED]");
+  assert.equal(redactQaError(undefined), undefined);
+});
+
+test("QA error redaction covers causes, AggregateError errors and command output", async () => {
+  const { execFile } = await import("node:child_process");
+  const { inspect, promisify } = await import("node:util");
+  const { qaSecretVariants, redactQaError, registerQaSecret } =
+    await import("../helpers/qa-secrets.mjs");
+  const value = "synthetic-qa-nested-secret-2026";
+  registerQaSecret(value);
+  // Everything node:test prints, getters included, at any depth.
+  const printed = (error) => inspect(error, { depth: Infinity, getters: true });
+  const assertClean = (error) => {
+    const text = printed(error);
+    for (const variant of [...qaSecretVariants(value), inspectedBytes(value)]) {
+      assert.ok(!text.includes(variant), `variant survived: ${text}`);
+    }
+  };
+  // A real execFile failure: the secret is in argv (cmd), stdout and stderr.
+  const failingCommand = (encoding) =>
+    promisify(execFile)(
+      process.execPath,
+      [
+        "-e",
+        "process.stdout.write(process.argv[1]); process.stderr.write(process.argv[1]); process.exit(3)",
+        value,
+      ],
+      { encoding },
+    ).then(
+      () => assert.fail("the command must fail"),
+      (error) => error,
+    );
+
+  for (const encoding of ["utf8", "buffer"]) {
+    const error = await failingCommand(encoding);
+    assert.equal(Buffer.isBuffer(error.stdout), encoding === "buffer");
+    assert.ok(printed(error).includes(value), "fixture must carry the secret");
+    assert.equal(redactQaError(error), error);
+    assert.equal(Buffer.isBuffer(error.stdout), encoding === "buffer");
+    assert.equal(Buffer.isBuffer(error.stderr), encoding === "buffer");
+    assert.equal(String(error.stdout), "[REDACTED]");
+    assert.equal(String(error.stderr), "[REDACTED]");
+    assert.match(error.cmd, / \[REDACTED\]$/);
+    assert.equal(error.code, 3);
+    assertClean(error);
+  }
+
+  // A cause chain, a string cause and an AggregateError's errors, with a
+  // Buffer stderr two levels down.
+  const chained = new Error("outer", {
+    cause: new AggregateError(
+      [
+        new Error("first", { cause: new Error(`inner ${value}`) }),
+        Object.assign(new Error("second"), { stderr: Buffer.from(`denied ${value}\n`) }),
+        new Error("third", { cause: `token ${value}` }),
+      ],
+      `aggregate ${value}`,
+    ),
+  });
+  assert.equal(redactQaError(chained), chained);
+  assert.equal(chained.cause.message, "aggregate [REDACTED]");
+  assert.equal(chained.cause.errors[0].cause.message, "inner [REDACTED]");
+  assert.equal(String(chained.cause.errors[1].stderr), "denied [REDACTED]\n");
+  assert.equal(chained.cause.errors[2].cause, "token [REDACTED]");
+  assertClean(chained);
+
+  // A cause that points back at its own error is cut, not followed forever.
+  const cyclic = new Error(`cyclic ${value}`);
+  cyclic.cause = cyclic;
+  assert.equal(redactQaError(cyclic), cyclic);
+  assert.equal(cyclic.cause, "[Circular]");
+  assertClean(cyclic);
+
+  // A two-error cycle whose top error is frozen: the replacement's cause must
+  // not lead back to the unredacted original.
+  const top = new Error(`top ${value}`);
+  const middle = new Error(`middle ${value}`, { cause: top });
+  top.cause = middle;
+  Object.freeze(top);
+  const replaced = redactQaError(top);
+  assert.notEqual(replaced, top);
+  assert.equal(replaced.message, "top [REDACTED]");
+  assert.equal(replaced.cause, middle);
+  assert.equal(middle.message, "middle [REDACTED]");
+  assert.equal(middle.cause, "[Circular]");
+  assertClean(replaced);
+
+  // A frozen cause is replaced inside a writable parent.
+  const frozenCause = Object.freeze(Object.assign(new Error(`frozen ${value}`), { code: "E1" }));
+  const parent = new Error("parent", { cause: frozenCause });
+  assert.equal(redactQaError(parent), parent);
+  assert.notEqual(parent.cause, frozenCause);
+  assert.equal(parent.cause.message, "frozen [REDACTED]");
+  assert.equal(parent.cause.code, "E1");
+  assertClean(parent);
+
+  // A getter-only field (node:test prints getters) forces a replacement that
+  // keeps the other fields, redacted.
+  const getter = Object.assign(new Error(`getter ${value}`), {
+    code: "EGETTER",
+    stderr: `stderr ${value}`,
+    request: { headers: { authorization: value } },
+  });
+  Object.defineProperty(getter, "stdout", { enumerable: true, get: () => `stdout ${value}` });
+  const fromGetter = redactQaError(getter);
+  assert.notEqual(fromGetter, getter);
+  assert.equal(fromGetter.message, "getter [REDACTED]");
+  assert.equal(fromGetter.stdout, "stdout [REDACTED]");
+  assert.equal(fromGetter.stderr, "stderr [REDACTED]");
+  assert.equal(fromGetter.code, "EGETTER");
+  assert.deepEqual(fromGetter.request, { headers: { authorization: "[REDACTED]" } });
+  assertClean(fromGetter);
+
+  // Object-valued fields: a parsed response body, a Map, a Set, a class
+  // instance, a symbol key, a self-containing array. Binary bytes around a
+  // secret in a Buffer survive. Objects the error only refers to are copied,
+  // never written: an assertion's `actual` may be a fixture still in use.
+  class Detail {
+    constructor() {
+      this.raw = Buffer.from(value);
+    }
+  }
+  const shared = { token: value };
+  const symbol = Symbol("detail");
+  const loop = [`loop ${value}`];
+  loop.push(loop);
+  const objects = Object.assign(new Error("objects"), {
+    response: { status: 403, body: { message: `denied ${value}` } },
+    headers: new Map([["authorization", value]]),
+    raw: new Map([["body", Buffer.from(value)]]),
+    seen: new Set([`set ${value}`]),
+    detail: new Detail(),
+    actual: shared,
+    url: new URL(`https://registry.example.test/v2/?token=${value}`),
+    requestHeaders: new Headers({ authorization: `Bearer ${value}` }),
+    labels: Object.assign(new Map([["team", "qa"]]), { extra: `extra ${value}` }),
+    loop,
+    [symbol]: `symbol ${value}`,
+    stdout: Buffer.concat([Buffer.from([0xff, 0x00]), Buffer.from(value), Buffer.from([0xfe])]),
+  });
+  assert.equal(redactQaError(objects), objects);
+  assert.equal(objects.response.body.message, "denied [REDACTED]");
+  assert.equal(objects.response.status, 403);
+  assert.equal(objects.headers.get("authorization"), "[REDACTED]");
+  assert.equal(String(objects.raw.get("body")), "[REDACTED]");
+  assert.deepEqual([...objects.seen], ["set [REDACTED]"]);
+  assert.equal(String(objects.detail.raw), "[REDACTED]");
+  assert.equal(objects.actual.token, "[REDACTED]");
+  assert.equal(shared.token, value);
+  assert.match(objects.url, /token=\[REDACTED\]/);
+  assert.match(objects.requestHeaders, /Bearer \[REDACTED\]/);
+  assert.match(objects.labels, /extra \[REDACTED\]/);
+  assert.equal(objects.loop[0], "loop [REDACTED]");
+  assert.equal(objects.loop[1], "[Circular]");
+  assert.equal(objects[symbol], "symbol [REDACTED]");
+  assert.deepEqual(
+    objects.stdout,
+    Buffer.concat([Buffer.from([0xff, 0x00]), Buffer.from("[REDACTED]"), Buffer.from([0xfe])]),
+  );
+  assertClean(objects);
+
+  // A frozen error reached again through another field of its cause.
+  const frozenTop = new Error(`frozen top ${value}`);
+  const holder = Object.assign(new Error("holder"), { original: frozenTop });
+  frozenTop.cause = holder;
+  Object.freeze(frozenTop);
+  const replacedTop = redactQaError(frozenTop);
+  assert.notEqual(replacedTop, frozenTop);
+  assert.equal(replacedTop.cause, holder);
+  assert.equal(holder.original, "[Circular]");
+  assertClean(replacedTop);
+
+  // A setter that throws makes the field unwritable, not redaction itself fail.
+  const throwing = new Error(`setter ${value}`);
+  Object.defineProperty(throwing, "detail", {
+    enumerable: true,
+    get: () => `detail ${value}`,
+    set: () => {
+      throw new Error("read-only");
+    },
+  });
+  const fromThrowing = redactQaError(throwing);
+  assert.notEqual(fromThrowing, throwing);
+  assert.equal(fromThrowing.detail, "detail [REDACTED]");
+  assertClean(fromThrowing);
+
+  // A proxy whose traps throw falls back to a bare error with the message.
+  const hostile = new Proxy(new Error(`proxy ${value}`), {
+    ownKeys() {
+      throw new Error("no keys");
+    },
+  });
+  const fromHostile = redactQaError(hostile);
+  assert.equal(fromHostile.message, "proxy [REDACTED]");
+  assertClean(fromHostile);
+
+  // A value first reached at the depth bound (its fields cut there) is walked
+  // again when it is reached higher up, so the cut copy is not reused.
+  const reused = { body: { token: value } };
+  let chain = Object.assign(new Error("bottom"), { ref: reused });
+  for (let i = 0; i < 6; i += 1) {
+    chain = new Error(`link ${i}`, { cause: chain });
+  }
+  const reusedTop = Object.assign(new Error("reused", { cause: chain }), { ref: reused });
+  assert.equal(redactQaError(reusedTop), reusedTop);
+  assert.deepEqual(reusedTop.ref, { body: { token: "[REDACTED]" } });
+  assert.equal(reused.body.token, value);
+  assertClean(reusedTop);
+
+  // A multi-line secret (a PEM key) behind hidden state is matched whole.
+  const pem = [
+    "-----BEGIN SYNTHETIC QA KEY-----",
+    "c3ludGhldGljLXFhLWtleS1saW5lLW9uZS0yMDI2LWFhYWFhYWFhYWFhYWFhYWFh",
+    "c3ludGhldGljLXFhLWtleS1saW5lLXR3by0yMDI2LWJiYmJiYmJiYmJiYmJiYmJi",
+    "-----END SYNTHETIC QA KEY-----",
+  ].join("\n");
+  registerQaSecret(pem);
+  const pending = Object.assign(new Error("pending"), { key: Promise.resolve(pem) });
+  assert.equal(redactQaError(pending), pending);
+  assert.ok(!printed(pending).includes("c3ludGhldGljLXFhLWtleS1saW5l"), printed(pending));
+
+  // A multi-line JSON key file: inspect escapes its quotes unlike JSON does.
+  const keyFile = JSON.stringify(
+    { type: "service_account", private_key: "synthetic-qa-key-file-body-2026\u0001" },
+    null,
+    2,
+  );
+  registerQaSecret(keyFile);
+  const keyed = Object.assign(new Error("keyed"), { file: Promise.resolve(keyFile) });
+  assert.equal(redactQaError(keyed), keyed);
+  assert.ok(!printed(keyed).includes("synthetic-qa-key-file-body"), printed(keyed));
+
+  // An error without a secret is left as it is, cycle included.
+  const clean = new Error("clean");
+  clean.cause = clean;
+  Object.freeze(clean);
+  assert.equal(redactQaError(clean), clean);
+  assert.equal(clean.cause, clean);
+  const unprintable = Object.assign(new Error("unprintable"), {
+    handle: { [inspect.custom]: () => assert.fail("not printable") },
+  });
+  Object.setPrototypeOf(unprintable.handle, class Handle {}.prototype);
+  assert.equal(redactQaError(unprintable), unprintable);
+
+  // A cause chain deeper than the bound is cut rather than left unredacted.
+  let deep = new Error(`deepest ${value}`);
+  for (let i = 0; i < 20; i += 1) {
+    deep = Object.freeze(new Error(`level ${i}`, { cause: deep }));
+  }
+  deep = new Error(`top ${value}`, { cause: deep });
+  const shallow = redactQaError(deep);
+  assert.ok(printed(shallow).includes("[Truncated]"), printed(shallow));
+  assertClean(shallow);
+});
+
+test(
+  "node:test failure output carries no QA secret from nested error fields",
+  { timeout: 60_000 },
+  async (t) => {
+    const { qaSecretVariants } = await import("../helpers/qa-secrets.mjs");
+    const value = "synthetic-qa-reporter-secret-2026";
+    const directory = await mkdtemp(join(tmpdir(), "qa-reporter-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const secretsModule = new URL("../helpers/qa-secrets.mjs", import.meta.url).href;
+    const file = join(directory, "redacted.test.mjs");
+    await writeFile(
+      file,
+      `
+    import { execFile } from 'node:child_process';
+    import test from 'node:test';
+    import { promisify } from 'node:util';
+    import { redactQaError, registerQaSecret } from ${JSON.stringify(secretsModule)};
+    const value = ${JSON.stringify(value)};
+    registerQaSecret(value);
+    test('command failure', async () => {
+      const error = await promisify(execFile)(process.execPath, [
+        '-e', 'process.stdout.write(process.argv[1]); process.stderr.write(process.argv[1]); process.exit(3)', value,
+      ], { encoding: 'buffer' }).catch((thrown) => thrown);
+      error.cause = new AggregateError([new Error('nested ' + value)], 'aggregate', { cause: 'string ' + value });
+      error.headers = new Map([['authorization', Buffer.from(value)]]);
+      Object.defineProperty(error, 'detail', { enumerable: true, get: () => 'getter ' + value });
+      throw redactQaError(error);
+    });
+  `,
+    );
+    // NODE_TEST_CONTEXT would make the child report to this runner instead of printing.
+    const { NODE_TEST_CONTEXT: _context, ...env } = process.env;
+    const child = spawn(process.execPath, ["--test", "--test-reporter=spec", file], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    t.after(() => {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+      }
+    });
+    let output = "";
+    for (const stream of [child.stdout, child.stderr]) {
+      stream.on("data", (chunk) => {
+        output += chunk;
+      });
+    }
+    const code = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", resolve);
+    });
+    assert.equal(code, 1, output);
+    // The failure printed the redacted fields, and no form of the secret.
+    assert.match(output, /cmd: '.* \[REDACTED\]'/, output);
+    assert.match(output, /detail: 'getter \[REDACTED\]'/, output);
+    assert.match(output, /stdout: <Buffer 5b 52 45 44 41 43 54 45 44 5d>/, output);
+    for (const variant of [...qaSecretVariants(value), inspectedBytes(value)]) {
+      assert.ok(!output.includes(variant), `variant survived: ${output}`);
+    }
+  },
+);
+
+// How util.inspect prints the start of a Buffer holding `value`: hex bytes.
+function inspectedBytes(value) {
+  return [...Buffer.from(value).subarray(0, 12)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join(" ");
+}
 
 test("QA log tails drop the body of an unregistered key that starts above the tail", async () => {
   const { redactedQaTail } = await import("../helpers/qa-secrets.mjs");

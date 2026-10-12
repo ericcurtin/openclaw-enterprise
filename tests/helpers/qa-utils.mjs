@@ -15,15 +15,16 @@ export function yamlDocuments(text) {
 }
 
 // `describe` reports the last state `observe` saw (kept by the caller), so a
-// timeout says what was still missing instead of only what was awaited.
+// timeout says what was still missing instead of only what was awaited. `now`
+// lets a test drive the deadline with its own clock.
 export async function waitFor(
   description,
   observe,
   timeout = 300_000,
-  { describe, interval = 1000 } = {},
+  { describe, interval = 1000, now = () => Date.now() } = {},
 ) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
+  const deadline = now() + timeout;
+  while (now() < deadline) {
     const result = await observe();
     if (result) {
       return result;

@@ -857,6 +857,23 @@ for (const { name, profile = "openclaw", input = baseInput, cases } of [
     ],
   },
   {
+    name: "profiles refuse ChatGPT admin Secret references Kubernetes refuses",
+    profile: "codex",
+    input: managedCodexInput,
+    cases: [
+      [
+        "codex.managedServiceAccounts.adminSecretName",
+        ["Bad_Name", "-chatgpt-admin", "c".repeat(254)],
+        "must be a Kubernetes resource name of at most 253 characters",
+      ],
+      [
+        "codex.managedServiceAccounts.adminSecretKey",
+        ["bad/key", ".", "..admin-key", "a".repeat(254)],
+        "must be a Kubernetes Secret key of at most 253 characters",
+      ],
+    ],
+  },
+  {
     name: "preflight refuses ChatGPT admin and repository Secrets that hold other credentials",
     profile: "codex",
     input: () => managedCodexInput({ repository: repositoryConfiguration() }),
@@ -1017,6 +1034,16 @@ for (const { name, profile = "openclaw", input = baseInput, cases } of [
       [
         "controlPlane.gatewayApiKeySecretName",
         ["Bad_Name", "-gateway-key", "g".repeat(254)],
+        "must be a Kubernetes resource name",
+      ],
+    ],
+  },
+  {
+    name: "preflight refuses database CA Secret names that Kubernetes refuses",
+    cases: [
+      [
+        "controlPlane.databaseCa.secretName",
+        ["Bad_Name", "-db-ca", "d".repeat(254)],
         "must be a Kubernetes resource name",
       ],
     ],
@@ -1654,6 +1681,33 @@ test("preflight warns, without failing, when no trusted proxy is set", () => {
   );
 });
 
+test("preflight rejects external sign-in Secret names Kubernetes refuses", () => {
+  const oidc = {
+    issuer: "https://tenant.idp.example.test/",
+    authorizationUrl: "https://tenant.idp.example.test/authorize",
+    tokenUrl: "https://tenant.idp.example.test/oauth/token",
+    jwksUrl: "https://tenant.idp.example.test/.well-known/jwks.json",
+  };
+  for (const [provider, signIn] of [
+    ["github", { github: { secretName: "Bad_Name" } }],
+    ["google", { github: undefined, google: { secretName: "Bad_Name" } }],
+    ["oidc", { github: undefined, oidc: { ...oidc, secretName: "Bad_Name" } }],
+  ]) {
+    assertPreflightFailure(
+      "openclaw",
+      externalSignInInput(signIn),
+      new RegExp(`controlPlane\\.${provider}\\.secretName must be a Kubernetes resource name`),
+    );
+  }
+  for (const signIn of [
+    { github: { secretName: "github.login-v2" } },
+    { github: undefined, google: { secretName: "google.login-v2" } },
+    { github: undefined, oidc: { ...oidc, secretName: "oidc.login-v2" } },
+  ]) {
+    assert.equal(render("openclaw", externalSignInInput(signIn)).summary.ok, true);
+  }
+});
+
 test("preflight rejects external sign-in and trusted proxy inputs Helm would reject", () => {
   assertPreflightFailure(
     "openclaw",
@@ -1702,6 +1756,38 @@ test("preflight rejects external sign-in and trusted proxy inputs Helm would rej
     externalSignInInput({ github: { clientSecret: "inline" } }),
     /controlPlane.github.clientSecret is not supported/,
   );
+  for (const [provider, key, value] of [
+    ["github", "clientIdKey", "bad/key"],
+    ["github", "clientSecretKey", "."],
+    ["google", "clientSecretKey", "a".repeat(254)],
+    ["google", "clientIdKey", "..client-id"],
+    ["oidc", "clientIdKey", "bad/key"],
+    ["oidc", "clientSecretKey", "..client-secret"],
+  ]) {
+    assertPreflightFailure(
+      "openclaw",
+      externalSignInInput({
+        github: undefined,
+        [provider]:
+          provider === "oidc"
+            ? {
+                issuer: "https://tenant.idp.example.test/",
+                authorizationUrl: "https://tenant.idp.example.test/authorize",
+                tokenUrl: "https://tenant.idp.example.test/oauth/token",
+                jwksUrl: "https://tenant.idp.example.test/.well-known/jwks.json",
+                [key]: value,
+              }
+            : { [key]: value },
+      }),
+      new RegExp(`controlPlane\\.${provider}\\.${key} must be a Kubernetes Secret key`),
+    );
+  }
+  for (const signIn of [
+    { github: { clientIdKey: ".hidden" } },
+    { github: undefined, google: { clientSecretKey: "a".repeat(253) } },
+  ]) {
+    assert.equal(render("openclaw", externalSignInInput(signIn)).summary.ok, true);
+  }
   const oidc = {
     issuer: "https://tenant.idp.example.test/",
     authorizationUrl: "https://tenant.idp.example.test/authorize",
@@ -1828,6 +1914,36 @@ test("preflight rejects CIDR prefixes with a leading zero", () => {
     }),
   );
   assert.match(accepted.installation, /192\.0\.2\.12\/8/);
+});
+
+// Compute refuses a source range that covers every address (scopedCidr) in the same words;
+// a status proxy source wider than one address only warns there and here (bughunt F2).
+test("preflight refuses source CIDRs that cover every address and warns about wide status sources", () => {
+  const controlPlane = baseInput().controlPlane;
+  for (const key of ["gatewayTrustedProxyCidrs", "pluginStatusProxySourceCidrs"]) {
+    assertPreflightFailure(
+      "openclaw",
+      baseInput({ controlPlane: { ...controlPlane, [key]: ["192.0.2.12/32", "0.0.0.0/0"] } }),
+      new RegExp(`controlPlane\\.${key}\\[1\\] cannot cover every address\\.`),
+    );
+  }
+  const wide = render(
+    "openclaw",
+    baseInput({
+      controlPlane: { ...controlPlane, pluginStatusProxySourceCidrs: ["10.42.0.0/16"] },
+    }),
+  );
+  assert.match(
+    wide.preflight.warnings.join("\n"),
+    /controlPlane\.pluginStatusProxySourceCidrs\[0\] covers more than one address/,
+  );
+  const exact = render("openclaw", baseInput());
+  assert.doesNotMatch(exact.preflight.warnings.join("\n"), /covers more than one address/);
+  const widerTrust = render(
+    "openclaw",
+    baseInput({ controlPlane: { ...controlPlane, gatewayTrustedProxyCidrs: ["10.42.0.0/16"] } }),
+  );
+  assert.doesNotMatch(widerTrust.preflight.warnings.join("\n"), /covers more than one address/);
 });
 
 test("preflight rejects channel proxy URLs with an invalid octet or port", () => {

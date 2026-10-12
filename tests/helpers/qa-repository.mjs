@@ -285,10 +285,12 @@ export const QA_STOP_TIMEOUT_MS = GATEWAY_STOP_TIMEOUT_MS + 10_000 + 3 * 60_000;
 // lines name the work it waits for (finding 1076).
 export const QA_SLOW_STOP_MS = 60_000;
 
+// `now` is the clock for both the slow-stop threshold and the timeout; tests pass a
+// fake one with `interval: 0`, so neither bound costs real time.
 export async function stopQaAgent(
   f,
   agent,
-  { timeout = QA_STOP_TIMEOUT_MS, slowAfter = QA_SLOW_STOP_MS, now = Date.now } = {},
+  { timeout = QA_STOP_TIMEOUT_MS, slowAfter = QA_SLOW_STOP_MS, now = Date.now, interval } = {},
 ) {
   // Evidence files are created exclusively: a repeated stop of one Agent gets its own names.
   agent.stopCalls = (agent.stopCalls ?? 0) + 1;
@@ -324,7 +326,7 @@ export async function stopQaAgent(
         return done;
       },
       timeout,
-      { describe: () => describeStopObservation(last) },
+      { describe: () => describeStopObservation(last), interval, now },
     );
   } catch (error) {
     if (last && /^Timed out: /.test(error.message)) {

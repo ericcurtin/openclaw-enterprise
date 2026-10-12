@@ -7,10 +7,11 @@ OpenClaw Enterprise on your machine, use [Local Setup](quickstart.md).
 
 ## What the install creates
 
-One Helm chart, `deploy/helm/openclaw-enterprise`, installs OCC: API and worker
-Deployments, an initialization Job that runs before each install and upgrade, and
-their RBAC, NetworkPolicies and private-routing objects. OCC uses an external
-PostgreSQL. There is no Kubernetes Operator, and the chart adds no
+On a single cluster, one Helm chart, `deploy/helm/openclaw-enterprise`, installs
+OCC: API and worker Deployments, an initialization Job that runs before each
+install and upgrade, and their RBAC, NetworkPolicies and private-routing objects.
+The log collector and Slack proxy are also in the chart, off by default. OCC uses
+an external PostgreSQL. There is no Kubernetes Operator, and the chart adds no
 CustomResourceDefinitions. In these guides, "operator" means the person who
 installs and runs OpenClaw Enterprise.
 

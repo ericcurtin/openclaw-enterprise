@@ -745,6 +745,144 @@ test("console keeps loaded route families visible while return reads refresh", a
   assert.equal(await page.getByLabel("Agent name", { exact: true }).count(), 0);
 });
 
+test("the account menu stays open and focused while the page under it finishes loading", async (t) => {
+  const fixture = await createConsoleAppFixture(t);
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Open menu", { ready: true });
+  await fixture.createAgent(namespace.id, "Open menu Agent");
+  const { page } = await newPage(t, fixture);
+  await trackSettledFetches(page);
+  await login(page, fixture, "/console/agents?namespace=" + namespace.id);
+  await page.getByText("Open menu Agent", { exact: true }).waitFor();
+  await waitForSettledView(page);
+
+  // Hold the Namespaces read so the shell renders its Loading state first and re-renders
+  // with the fresh view only after the reader has opened the account menu. A retained
+  // preview followed by a fresh render takes the same path through the shell.
+  const namespacesPattern = "**/namespaces";
+  const namespacesHold = await holdRoute(t, page, namespacesPattern, (route, response) =>
+    response ? route.fulfill({ response }) : route.continue(),
+  );
+  t.after(() => namespacesHold.release());
+  await page.getByRole("link", { name: "Namespaces", exact: true }).click();
+  await namespacesHold.waitForRelease();
+  await openShellMenu(page);
+  const settings = page.getByRole("menuitem", { name: "Settings", exact: true });
+  await settings.waitFor();
+  const openedItem = await settings.elementHandle();
+  await releaseHeldRoute(page, namespacesPattern, namespacesHold);
+  await page.getByRole("list", { name: "Namespaces", exact: true }).waitFor();
+  await page.locator('.content [aria-live="polite"][aria-busy="false"]').waitFor();
+
+  assert.equal(
+    await openedItem.evaluate(
+      (node) => node.isConnected && node === globalThis.document.activeElement,
+    ),
+    true,
+    "The re-rendered shell keeps the open menu and its focus",
+  );
+  await settings.click();
+  await page.getByRole("heading", { name: "Settings", exact: true }).waitFor();
+  assert.equal(await settings.isVisible(), false, "Navigating closes the menu");
+});
+
+for (const focus of ["navigation link", "account menu"]) {
+  test(`an open mobile drawer keeps its ${focus} focused while the page under it finishes loading`, async (t) => {
+    const fixture = await createConsoleAppFixture(t);
+    await fixture.bootstrap();
+    const namespace = await fixture.createNamespace("Open drawer", { ready: true });
+    await fixture.createAgent(namespace.id, "Open drawer Agent");
+    const { page } = await newPage(t, fixture, mobile);
+    await trackSettledFetches(page);
+    await login(page, fixture, "/console/agents?namespace=" + namespace.id);
+    await page.getByText("Open drawer Agent", { exact: true }).waitFor();
+    await waitForSettledView(page);
+
+    // Hold the Namespaces read so the shell renders its Loading state first and re-renders
+    // with the fresh view only after the reader has reopened the drawer.
+    const namespacesPattern = "**/namespaces";
+    const namespacesHold = await holdRoute(t, page, namespacesPattern, (route, response) =>
+      response ? route.fulfill({ response }) : route.continue(),
+    );
+    t.after(() => namespacesHold.release());
+    const toggle = page.getByRole("button", { name: "Open navigation", exact: true });
+    await toggle.click();
+    await page.getByRole("link", { name: "Namespaces", exact: true }).click();
+    await namespacesHold.waitForRelease();
+    await toggle.click();
+    const agents = page.getByRole("link", { name: "Agents", exact: true });
+    let focused = agents;
+    if (focus === "account menu") {
+      await openShellMenu(page);
+      focused = page.getByRole("menuitem", { name: "Settings", exact: true });
+    }
+    await focused.waitFor();
+    assert.equal(
+      await focused.evaluate((node) => node === globalThis.document.activeElement),
+      true,
+    );
+    await releaseHeldRoute(page, namespacesPattern, namespacesHold);
+    await page.getByRole("list", { name: "Namespaces", exact: true }).waitFor();
+    await page.locator('.content [aria-live="polite"][aria-busy="false"]').waitFor();
+
+    assert.equal(await toggle.getAttribute("aria-expanded"), "true", "The drawer stays open");
+    assert.equal(await page.locator("main").evaluate((node) => node.inert), true);
+    assert.equal(
+      await focused.evaluate((node) => node === globalThis.document.activeElement),
+      true,
+      `The re-rendered drawer keeps focus on its ${focus}`,
+    );
+    await focused.click();
+    const destination = focus === "account menu" ? "Settings" : "Agents";
+    await page.getByRole("heading", { name: destination, exact: true }).waitFor();
+    assert.equal(await toggle.getAttribute("aria-expanded"), "false", "Navigating closes it");
+    assert.equal(await page.locator("main").evaluate((node) => node.inert), false);
+  });
+}
+
+test("an open mobile drawer keeps its navigation link focused when an address without a Namespace finishes loading", async (t) => {
+  const fixture = await createConsoleAppFixture(t);
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Cold drawer", { ready: true });
+  await fixture.createAgent(namespace.id, "Cold drawer Agent");
+  const { page } = await newPage(t, fixture, mobile);
+  await trackSettledFetches(page);
+  await login(page, fixture, "/console/agents?namespace=" + namespace.id);
+  await page.getByText("Cold drawer Agent", { exact: true }).waitFor();
+  await waitForSettledView(page);
+
+  // A bookmark, a typed address or the post-login return has no ?namespace=: the Loading
+  // render's nav links have none, and the fresh render's links gain it.
+  const namespacesPattern = "**/namespaces";
+  const namespacesHold = await holdRoute(t, page, namespacesPattern, (route, response) =>
+    response ? route.fulfill({ response }) : route.continue(),
+  );
+  t.after(() => namespacesHold.release());
+  await page.goto(new URL("/console/agents", fixture.origin).href);
+  await namespacesHold.waitForRelease();
+  const toggle = page.getByRole("button", { name: "Open navigation", exact: true });
+  await toggle.click();
+  const agents = page.getByRole("link", { name: "Agents", exact: true });
+  await agents.waitFor();
+  assert.equal(await agents.getAttribute("href"), "/console/agents");
+  assert.equal(await agents.evaluate((node) => node === globalThis.document.activeElement), true);
+  await releaseHeldRoute(page, namespacesPattern, namespacesHold);
+  await page.getByText("Cold drawer Agent", { exact: true }).waitFor();
+  await page.locator('.content [aria-live="polite"][aria-busy="false"]').waitFor();
+
+  assert.equal(await toggle.getAttribute("aria-expanded"), "true", "The drawer stays open");
+  assert.equal(await page.locator("main").evaluate((node) => node.inert), true);
+  assert.equal(await agents.getAttribute("href"), `/console/agents?namespace=${namespace.id}`);
+  assert.equal(
+    await agents.evaluate((node) => node === globalThis.document.activeElement),
+    true,
+    "The re-rendered drawer keeps focus on its navigation link",
+  );
+  await page.keyboard.press("Escape");
+  assert.equal(await toggle.getAttribute("aria-expanded"), "false", "Escape closes it");
+  assert.equal(await page.locator("main").evaluate((node) => node.inert), false);
+});
+
 test("an Agent tab chosen while the detail is still loading is the one Back restores", async (t) => {
   const fixture = await createConsoleAppFixture(t);
   await fixture.bootstrap();
@@ -1176,6 +1314,71 @@ test("a disabled account's provider sign-in says the account is disabled", async
   await page.goto(`${fixture.origin}/console/?authReason=account-disabled`);
   await page.getByRole("button", { name: "Login" }).waitFor();
   await expectNoText(page, /disabled/);
+});
+
+test("a provider outage says sign-in is unavailable, not to get attached", async (t) => {
+  const fixture = await createConsoleAppFixture(t);
+  await fixture.bootstrap();
+  const { page } = await newPage(t, fixture);
+  let password = true;
+  await page.route("**/api/auth/providers", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          github: true,
+          google: true,
+          oidc: true,
+          oidcSignIn: {
+            label: "Acme SSO",
+            authorizationUrl: "https://sso.example.test/realms/acme/protocol/openid-connect/auth",
+          },
+          password,
+          sessionBinding: true,
+        },
+        meta: { requestId: "browser-provider-unavailable" },
+      }),
+    }),
+  );
+  // Discovery remembers the OIDC label for the message after the callback redirect.
+  await page.goto(`${fixture.origin}/console/login`);
+  await page.getByRole("button", { name: "Continue with Acme SSO" }).waitFor();
+  for (const [provider, label] of [
+    ["github", "GitHub"],
+    ["google", "Google"],
+    ["oidc", "Acme SSO"],
+  ]) {
+    for (const [available, outage] of [
+      [true, `${label} sign-in is unavailable right now. Try again later or use your password.`],
+      [
+        false,
+        `${label} sign-in is unavailable right now. Try again later. If you are an administrator, use Recovery sign-in.`,
+      ],
+    ]) {
+      password = available;
+      // The provider could not answer, or refused this Installation's client.
+      await page.goto(
+        `${fixture.origin}/console/?authError=${provider}&authReason=provider-unavailable`,
+      );
+      await page.getByText(outage, { exact: true }).waitFor();
+      await expectNoText(page, /attach your/);
+      // The callback failed inside OCE: no fallback finishes a sign-in either.
+      await page.goto(`${fixture.origin}/console/?authError=${provider}&authReason=unavailable`);
+      await page
+        .getByText(
+          `Could not finish signing in with ${label}. Sign-in is unavailable right now; try again later.`,
+          { exact: true },
+        )
+        .waitFor();
+      await expectNoText(page, /attach your|use your password/);
+    }
+  }
+  // Without a provider error the reason means nothing.
+  password = true;
+  await page.goto(`${fixture.origin}/console/?authReason=provider-unavailable`);
+  await page.getByRole("button", { name: "Login" }).waitFor();
+  await expectNoText(page, /unavailable/);
 });
 
 test("recovery-only password sign-in keeps the form behind Recovery sign-in", async (t) => {

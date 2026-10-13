@@ -5,22 +5,23 @@ Kubernetes HTTP fixtures or real-runtime gateway, Codex, model, and Secret tests
 
 ## Local Kubernetes installation
 
-Build the CLI and run the selected real test to create and clean up a separate
-k3d cluster:
+Build the CLI and prepare Chromium ([browser setup](local.md#console-browser-checks)).
+The k3d cases need a disposable Docker engine; Keycloak needs loopback port 443.
 
 ```sh
+pnpm exec playwright install chromium
 pnpm cli:build
 OCC_TEST_DEV_UP_K3D_REAL=1 node --test tests/integration/dev-up-k3d-real.test.mjs
 ```
 
-The Kubernetes-only case checks authenticated readiness, presets, plugin discovery,
-and a dedicated Codex Agent’s sandbox using a synthetic credential. The Compose
-case checks the launcher’s generated image and seccomp profile in a real Pod. Both
-verify workspace writes succeed and outside writes fail; neither proves model
-execution, and the Compose case does not prove Agent routing. Failed cleanup
-preserves state for `occ dev down`.
-
-See [two-cluster validation](two-cluster-local.md).
+The Kubernetes-only case checks readiness, presets, plugins, and a dedicated
+Codex sandbox, with cluster-local `api.openai.com` routed to the Responses fixture
+(deterministic replies, not live inference). The Compose case checks the
+generated seccomp profile in a real Pod. Both check workspace write boundaries.
+Cleanup failure keeps state for `occ dev down`. See
+[Keycloak coverage](keycloak.md#local-launcher-coverage),
+[two-cluster validation](two-cluster-local.md), and
+[hosted qualification](README.md#run-the-hosted-local-installation-lane).
 
 ## Kubernetes HTTP fixture
 
@@ -62,7 +63,7 @@ database skips PostgreSQL-backed cases. Those files share one database here; run
 (`--test-concurrency=1`); CI gives each file its own database.
 
 The OAuth Job case uses authenticated device-login, Agent-create, and Deploy
-routes, Kubernetes Secret storage, and PostgreSQL in `k3d-fixture-configuration`.
+routes, Kubernetes Secret storage, and PostgreSQL in `k3d-fixture-oauth`.
 Only provider HTTP uses synthetic responses. It
 retires an exact-owned legacy bootstrap Deployment before executing the seed
 Job, preserves its PVC and seed, and accepts API-canonicalized resource quantities.

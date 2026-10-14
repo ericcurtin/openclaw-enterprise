@@ -5,6 +5,7 @@ main can refuse or break an Installation that an older build created. Each
 change like that gets an entry here: what breaks, who is affected, how to tell,
 and the steps. Before an upgrade, read every entry dated after the source commit
 you run now, here, in the [earlier notices](breaking-changes-archive.md), in the
+[notices before 2026-10-13](breaking-changes-before-2026-10-13.md), in the
 [notices before 2026-10-12](breaking-changes-before-2026-10-12.md), in the
 [notices before 2026-10-11](breaking-changes-before-2026-10-11.md) and in the
 [notices before 2026-10-10](breaking-changes-before-2026-10-10.md),
@@ -13,6 +14,99 @@ then follow the [upgrade checklist](upgrade-checklist.md) and
 
 Entries are newest first. Steps marked _untested_ have not been run against a
 real Installation.
+
+## 2026-10-14: OAuth2 token_url hosts must be DNS names
+
+**What breaks.** Creating an OpenShell `oauth2-client-credentials` or
+`oauth2-refresh-token` credential source refuses a `token_url` whose host is an
+IP address in any spelling (`10.0.0.5`, `0x7f000001`, `127.1`, `[::1]`), a
+`localhost` name, a name ending in `.localdomain`, `.localdomain4` or
+`.localdomain6`, or a single-label name (`keycloak`, `ip6-localhost`). Those
+are the shapes of the loopback, link-local and own-hostname aliases in the
+gateway Pod's `/etc/hosts`. The OpenShell gateway posts the source's client secret and
+refresh token to that URL from its own network position. A deployment that
+binds an existing source with such a `token_url` fails. Until it is deleted,
+the gateway keeps refreshing that source against the stored `token_url`, and
+rotating it does too. DNS names, including
+in-cluster Service names such as `keycloak.idp.svc.cluster.local`, stay
+accepted. Names that reach the gateway Pod itself are refused too: a Pod DNS
+name (`10-42-0-5.idp.pod.cluster.local`), also with extra leading labels or
+without the cluster domain (`x.10-42-0-5.idp.pod`), and, when the OpenShell Backend's
+`endpoint` or `serviceName` names the gateway's namespace, any name in that
+namespace (`openshell-gateway.openshell-system.svc`,
+`openshell-gateway-0.openshell-gateway-peer`, `grpc.tcp.openshell-gateway`). OCC now stores `token_url` in
+normalized form (`https://Login.Example.test:443/token` becomes
+`https://login.example.test/token`). A `bearer-token` or OAuth2 `host` ending in a
+numeric or `0x` label (`0x7f.0x1`, `example.123`) is refused like an IP address.
+
+**Who is affected.** Installations with OAuth2 credential sources whose issuer
+is addressed by IP address, a `localhost` name, a single-label name, a Pod DNS
+name, or a name in the OpenShell gateway's namespace, and `bearer-token` or
+OAuth2 sources whose `host` ends in a numeric or `0x` label.
+
+**How to tell.** Creation returns `400` for `/config/token_url` with `... token_url
+host must be a DNS name with at least two labels, not an IP address or a
+localhost or localdomain name.` or `... token_url host must not be a Kubernetes
+Pod name or a name in the OpenShell gateway's namespace.` A deployment that binds such a source fails with the same
+message, or with `... token_url port must be 1 to 65535.` for a stored port `0`. `GET` on the source shows
+its stored `config.token_url`. Creation with such a `host` returns `400` for
+`/config/host` with `... host must be an exact DNS name.`, and deploying or
+updating the value of a stored source with such a `host` fails with the same
+message.
+
+To find affected sources before upgrading, print every source's `token_url`
+and `host` with the [CLI](../../reference/cli.md) and `jq`, as an account that
+can read every Namespace and credential source (lists return only readable ones):
+
+```sh
+for ns in $(occ namespace list -o json | jq -r '.[].id'); do
+  occ credential-source list --namespace "$ns" -o json | jq -r '.[]
+    | select(.config.token_url or .config.host)
+    | [.namespaceId, .id, .type, .config.token_url // "-", .config.host // "-"]
+    | @tsv'
+done
+```
+
+Compare each host with the shapes under **What breaks**. This was checked
+against the CLI and the list response shape, not a live Installation.
+
+**Steps.** _untested_ against a live Installation:
+
+1. Give the issuer (or, for a `host`, the protected API) a DNS name its TLS
+   certificate covers, such as its Service name with its Namespace
+   (`keycloak.idp.svc.cluster.local`).
+2. Register a replacement source with that `token_url` or `host`.
+3. For each Agent bound to the old source, grant its service principal
+   `operate` on the replacement, list the replacement in `credentialSources`
+   instead of the old source, and deploy.
+4. Delete the old source. That also stops the gateway refreshing its token
+   against the old URL.
+
+## 2026-10-14: Preset and revision lists return summaries; revisions page
+
+**What breaks.** `GET .../presets` items carry only `id`, `namespaceId`, `name`
+and `createdAt`, without `template`. `GET .../agents/{agentId}/revisions` items
+carry identity, `configurationId`, `configurationGeneration`, `harness` and
+`createdAt`, without the saved settings or `configurationReadError`. Revisions
+list newest first, 50 to a page (`limit` up to 100), and `meta.nextCursor`
+names the next page.
+
+**Who is affected.** API clients and scripts (including
+`occ preset list -o json`) that read templates or saved settings from these
+lists, or expect every revision in one response. Operators who run `occ agent revisions` with an `occ`
+built before this change: it exits `0` but prints only the newest 50 revisions,
+with no hint that older ones exist.
+
+**How to tell.** List items lack `template` or `configuration`, and
+`meta.nextCursor` is set. An older `occ agent revisions --help` lists no
+`--cursor` flag, and a full page ends without the `older revisions may exist`
+notice.
+
+**Steps.** Read one Preset or revision by ID for its document
+(`occ preset get ID -o json`). Pass `meta.nextCursor` back as `cursor` until it is `null`.
+Upgrade `occ` to the release your controller runs
+([CLI setup](../cli.md#connect-to-your-installation)), then pass the
+`--cursor` each full page prints to read older revisions.
 
 ## 2026-10-14: every model selection must use the Harness provider
 
@@ -227,89 +321,3 @@ and the migrator `MIGRATION_FAILED`.
 **Steps.** Reissue the server certificate with `IP:<address>` in its
 subjectAltName, or connect by a DNS name the certificate carries, then restart
 the API and worker.
-
-## 2026-10-13: more model credential header names and provider models lists
-
-**What breaks.** The 2026-10-12 model credential rules (below)
-match more header names: every name ending in `key` or `keys` except an
-idempotency or cache key, a last word of `bearer`, `credential`, `passcode`,
-`passphrase` or `signature`, and plurals, such as `X-Auth-Key`,
-`DD-APPLICATION-KEY` or `X-Hub-Signature-256`. Configuration create and update
-and provisioning, and on Kubernetes Compute also Preset saves, Agent saves and
-deployment, answer `400` for a `models.providers.<provider>.models` that is
-not a list, which OpenClaw refused only when the Gateway started.
-A later change also matches the words `authentication`, `assertion`, `hmac`,
-`jwt`, `license`, `otp`, `pass`, `pin` and `pwd`, suffixes such as `-v2` and
-`.` separators, but saves partition, shard, sort and dedup keys; on every
-Compute, Configuration and Preset saves refuse a header name that is not a
-valid HTTP field name, and Preset saves check `models`, `baseUrl` and `api`
-(a variable without a default is checked once filled). A later change skips
-a trailing algorithm word such as `-sha256` or `-ed25519` and a digit glued
-to `key`, and matches `protection-bypass`. A later change quotes the header in
-the Kubernetes message instead of a word list: `must not set the credential
-header "X-Upstream-Pwd" (its name marks a credential)`; on Kubernetes a Preset
-header name that waits on a variable saves, checked once filled. A later change
-checks an escaped token (`\{{ vars.name }}`), or a default that reads like a
-token, as written: it stays literal once filled, so such a header name,
-`baseUrl` or `api` is refused at save instead of failing every launch. The
-invalid header name refusal now quotes the header up to its first invalid
-character: `must use valid HTTP header names, not "Bad…"`. A later change
-refuses, on every Compute, a provider or model `baseUrl` with a user name or
-password, like `request.proxy.url`, and checks a `baseUrl` or `api` that holds
-only a `$${VAR}` escape as written: it is no reference. Preset saves match a
-header name as the text around its variables (`Authorization{{ vars.suffix }}`)
-and refuse a literal `baseUrl` scheme other than `http` or `https` however many
-variables follow. A later change finds a user name or password in a `baseUrl`
-or `request.proxy.url` whose host or port is a variable or `${VAR}` (or in its
-`:-` fallback), refuses a variable as the whole user name, and names an invalid
-first header character by code point: `not one that starts with U+007B`. A
-Preset saved with one still reads but cannot launch: edit it. A later change
-refuses one in `proxy.proxyUrl`, a channel or channel account `proxy`, an MCP
-server `url` and any URL in an `env` map (skill, hook, sandbox, ...),
-whatever the name (`HTTPS_PROXY`, `GOPROXY`); a `baseUrl` with an empty host
-(`https:///v1`, as an empty variable leaves it);
-and a number or boolean variable as the whole `baseUrl` or `api`. A later
-change refuses a `baseUrl` without exactly `//` after `http:` or `https:`
-(`https:/v1`, `https:${HOST}`, `https:{{ vars.host }}`), and a user name or
-password in Codex's network proxy URLs and speech and Talk provider `proxy`
-settings. A later change applies the header rule to MCP server `headers`
-(also under `nodeHost`), and reads `GIT_CONFIG_VALUE_<n>` and
-`GIT_CONFIG_PARAMETERS` values as proxies when their key names one, such as
-`http.proxy`.
-
-**Who is affected.** Configurations with such a header, such a URL with a
-user name or password, or a `models` record, `null` or string on any provider.
-A stored Configuration with such a user name or password does not deploy until
-it is edited.
-
-**How to tell.** The 2026-10-12 messages,
-`Configuration setting models.providers.<provider>.models must be an array of model entries.`,
-`Configuration field <field> carries a user name or password in the URL.`,
-`... must be an absolute http or https URL.`
-or `... must start with https:// or http:// (the // after the scheme is missing).`
-
-**Steps.** Follow the 2026-10-12 steps for the header. Write `models` as a
-list of model objects, or remove it. Remove the user name and password from
-the URL, or make the whole URL a `${NAME}` reference. Give a `baseUrl` its host
-and write `//` after its scheme, and use a string variable for a whole `baseUrl`
-or `api`.
-
-## 2026-10-13: sign-in and repository CIDRs must be canonical decimals
-
-**What breaks.** `helm upgrade` fails when a saved `auth.github.egressCidrs`,
-`auth.google.egressCidrs`, `auth.oidc.egressCidrs`, or
-`repositoryCredentials.upstreamCidrs` entry has a leading-zero octet, such as
-`140.82.112.08/20`. That value used to render, and the apiserver accepted it
-with a warning. The upgrade now stops before it writes that policy.
-
-**Who is affected.** Saved releases that use a leading-zero octet in one of
-those lists. A canonical decimal such as `140.82.112.0/20` or `140.82.112.8/20`
-still upgrades.
-
-**How to tell.** Helm stops with
-`auth.github.egressCidrs requires explicit IPv4 CIDRs with prefixes 1 through 32`,
-or the same sentence for `auth.google.egressCidrs`, `auth.oidc.egressCidrs`, and
-`repositoryCredentials.upstreamCidrs`.
-
-**Steps.** Write the canonical decimal (`140.82.112.8/20` for
-`140.82.112.08/20`) and upgrade again.

@@ -9,6 +9,7 @@ import {
   isNonEmptyString,
   isPositiveSafeInteger,
   numericErrorStatus,
+  numericLastLabel,
   sha256Hex,
 } from "../../packages/utils/src/index.ts";
 import { hasControlCharacter as clientHasControlCharacter } from "../../apps/controller/src/drivers/repo/credentials/client-contracts.ts";
@@ -132,3 +133,42 @@ for (const [owner, check] of [
     assert.equal(check(""), false);
   });
 }
+
+test("numericLastLabel follows the URL parser's ends-in-a-number rule", () => {
+  for (const host of [
+    "0xa000005",
+    "0xa.0.0.5",
+    "10.0x0.0.5",
+    "0x7f.0x1",
+    "0X7F.0X1",
+    "example.123",
+    "example.123.",
+    // A one-label host keeps the rule: only the trailing dot is dropped.
+    "0x7f.",
+    "5.",
+    "example.0x",
+    "127.0.0.1",
+  ]) {
+    assert.equal(numericLastLabel(host), true, host);
+    // The WHATWG URL parser agrees: the host is an IPv4 address or the URL is invalid.
+    assert.equal(
+      !URL.canParse(`https://${host}/`) || /^[0-9.]+$/.test(new URL(`https://${host}/`).hostname),
+      true,
+      host,
+    );
+  }
+  for (const host of [
+    "api.example.com",
+    "a1.example.com",
+    "0xdead.example.com",
+    "123.example.com",
+    "example.0xg",
+    "example.1a",
+    "example.a1",
+    // Only one trailing dot is dropped: the last label here is empty, as the URL parser reads it.
+    "example.123..",
+    "",
+  ]) {
+    assert.equal(numericLastLabel(host), false, host);
+  }
+});

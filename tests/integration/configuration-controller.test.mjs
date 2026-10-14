@@ -24,6 +24,7 @@ import {
   signInToControllerApp,
 } from "../helpers/auth-session.mjs";
 import { bindRole } from "../helpers/iam-grants.mjs";
+import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
 
 function createConfigurationBackend() {
   // This deliberately simple substrate exercises the real Fastify, IAM, OCC, and audit paths.
@@ -773,6 +774,30 @@ test("Preset save refuses an agents roster every deployment refuses, as Configur
     // An ownership no filling makes "explicit", or that a number variable fills.
     [withAgents({ ownership: "shared-{{ vars.ownership }}", entries: { main: {} } }), onlyExplicit],
     [withAgents({ ownership: "{{ vars.count }}", entries: { main: {} } }), onlyExplicit],
+    // Each written part is matched after the one before it, never overlapping it.
+    [
+      withAgents({ ownership: "expl{{ vars.ownership }}plicit", entries: { main: {} } }),
+      onlyExplicit,
+    ],
+    [
+      withAgents({
+        ownership: "exp{{ vars.ownership }}x{{ vars.ownership }}t",
+        entries: { main: {} },
+      }),
+      onlyExplicit,
+    ],
+    [
+      withAgents({
+        ownership: "ex{{ vars.ownership }}p{{ vars.ownership }}p{{ vars.ownership }}t",
+        entries: { main: {} },
+      }),
+      onlyExplicit,
+    ],
+    // Written text longer than 64 characters makes no valid Agent ID, whatever fills it.
+    [
+      withAgents({ entries: { [`${"a".repeat(65)}{{ vars.id }}`]: {} } }),
+      gatewayId(`agents.entries["${"a".repeat(65)}{{ vars.id }}"]`),
+    ],
     // Finding 1315: many adjacent variables are matched in linear time. Keep this case last.
     [
       withAgents({ ownership: `${"{{ vars.ownership }}".repeat(64)}x`, entries: { main: {} } }),
@@ -804,6 +829,8 @@ test("Preset save refuses an agents roster every deployment refuses, as Configur
       withAgents({ entries: { "agent-{{ vars.id }}": {} } }),
       withAgents({ ownership: "{{ vars.ownership }}", entries: { main: {}, helper: {} } }),
       withAgents({ ownership: "ex{{ vars.ownership }}", entries: { main: {}, helper: {} } }),
+      withAgents({ ownership: "ex{{ vars.ownership }}plicit", entries: { main: {}, helper: {} } }),
+      withAgents({ entries: { [`${"a".repeat(64)}{{ vars.id }}`]: {} } }),
     ];
     for (const [index, values] of accepted.entries()) {
       const saved = await savePreset(`Templated-${index}`, values);
@@ -1290,6 +1317,23 @@ test("Configuration save refuses a model selection or apiKey off the primary mod
       },
       setting("agents.defaults.modelPolicy.allow", openai),
     ],
+    // The provider with no model, a root model setting, and fallbacks that are not a list.
+    [
+      { agents: { defaults: { ...runtimeDefaults, subagents: { model: "openai/" } } } },
+      setting("agents.defaults.subagents.model", openai),
+    ],
+    [{ ...valid, tts: { summaryModel: other } }, setting("tts.summaryModel", openai)],
+    [
+      {
+        agents: {
+          defaults: {
+            ...runtimeDefaults,
+            subagents: { model: { primary: runtimeDefaults.model, fallbacks: other } },
+          },
+        },
+      },
+      setting("agents.defaults.subagents.model.fallbacks", "must be provider/model references"),
+    ],
     [
       {
         ...valid,
@@ -1622,6 +1666,15 @@ test("Preset save refuses a model selection or apiKey off the primary model's pr
       },
       setting("agents.defaults.imageModel", openai),
     ],
+    [
+      {
+        agents: {
+          defaults: { ...templated, imageModel: other },
+          entries: { main: { model: { primary: "{{ vars.provider }}/{{ vars.model }}" } } },
+        },
+      },
+      setting("agents.defaults.imageModel", openai),
+    ],
     // A variable in another secrets source leaves the apiKey reference checked.
     [
       {
@@ -1716,6 +1769,31 @@ test("Preset save refuses a model selection or apiKey off the primary model's pr
           },
         },
       },
+      // An Agent entry's fallback, and an apiKey SecretRef whose default env alias, secrets source
+      // name or source body waits on a variable.
+      {
+        agents: {
+          defaults: templated,
+          entries: {
+            main: {
+              model: { primary: templated.model, fallbacks: ["{{ vars.provider }}/gpt-5-mini"] },
+            },
+          },
+        },
+      },
+      ...[
+        { defaults: { env: "{{ vars.key }}" } },
+        { providers: { "{{ vars.key }}": { source: "env" } } },
+        { providers: { "vault-env": { source: "{{ vars.key }}" } } },
+      ].map((secrets) => ({
+        agents: { defaults: templated },
+        secrets,
+        models: {
+          providers: {
+            openai: { apiKey: { source: "env", provider: "vault-env", id: "OPENAI_API_KEY" } },
+          },
+        },
+      })),
     ];
     for (const [index, values] of accepted.entries()) {
       const template = { variables, configuration: { values } };
@@ -1845,6 +1923,16 @@ test("Configuration and Preset saves check an OpenRouter compatibility selector 
     withModel({ primary: codex.model, fallbacks: ["codex/gpt-5-mini"] }),
     withModel({ primary: "openrouter:auto", fallbacks: ["openrouter:free", "openrouter/meta/m"] }),
     withModel({ primary: "openrouter/meta/m", fallbacks: [" OpenRouter:Auto "] }),
+    // Only the two selectors name openrouter: another bare name is an alias, as written.
+    {
+      agents: {
+        defaults: {
+          ...codex,
+          subagents: { model: "openrouter:auto-1" },
+          heartbeat: { model: "my-openrouter:free" },
+        },
+      },
+    },
   ];
   for (const [index, values] of accepted.entries()) {
     const label = JSON.stringify(values);
@@ -3461,12 +3549,29 @@ test("Configuration save refuses a document too large to store before its conten
   // to shrink it. The real Kubernetes Driver checks the values here; the simple substrate stands
   // in for its ConfigMap storage.
   const kubernetes = new KubernetesConfigurationDriver({ authentication: { mode: "inCluster" } });
+  const backend = createConfigurationBackend();
   const configurationDriver = {
-    ...createConfigurationBackend(),
+    ...backend,
     validate: (configuration) => kubernetes.validate(configuration),
     validateSize: (values) => kubernetes.validateSize(values),
+    // Agent provisioning requires exact create and inspect before it reads the plan; the size
+    // refusal comes first, so neither runs.
+    createExact: (configuration) => backend.create(configuration),
+    inspectExact: async () => undefined,
   };
-  const { namespace, collection, ...context } = await fixture({ configurationDriver });
+  const { namespace, collection, ...context } = await fixture({
+    configurationDriver,
+    computeDriver: createReadyComputeDriver("compute-oversized", {
+      agentProvisioning: { executionModes: ["dedicated"] },
+      validateAgentProvisioning() {},
+      async provisionAgentRuntimeCredentials() {
+        return { transportConfigured: true };
+      },
+      async getAgentRuntimeCredentialStatus() {
+        return { transportConfigured: false };
+      },
+    }),
+  });
   const contentRefusal =
     "Configuration setting models.providers.openai.models must be an array of model entries.";
   // A document that breaks a content rule, padded to `bytes` of JSON.
@@ -3503,6 +3608,27 @@ test("Configuration save refuses a document too large to store before its conten
       namespaceId: namespace.id,
       kind: "agent",
       values: over,
+    }),
+    { name: "ConfigurationSizeError", message: sizeRefusal },
+  );
+  // So is the Configuration Agent provisioning creates.
+  await context.controller.transact((state) =>
+    state.namespaces.transitionNamespaceStatus(namespace.id, "provisioning", "ready"),
+  );
+  const harnessSecret = await context.controller.createSecret(context.principal.id, {
+    namespaceId: namespace.id,
+    name: "oversized-agent-key",
+    value: "synthetic-configuration-key",
+  });
+  // Called directly: the provision route's request body limit refuses a 1 MiB document first.
+  await assert.rejects(
+    context.controller.provisionAgent(context.principal.id, {
+      namespaceId: namespace.id,
+      requestId: "oversized-agent",
+      name: "Oversized",
+      executionMode: "dedicated",
+      configuration: { kind: "agent", values: over },
+      harnessAuth: { method: "api_key", source: harnessSecret.ref },
     }),
     { name: "ConfigurationSizeError", message: sizeRefusal },
   );
@@ -4127,6 +4253,19 @@ test("Configuration and Preset saves refuse a literal key in the other key and h
       { tools: { media: { audio: { providerOptions: { deepgram: { accessToken: sentinel } } } } } },
       option("/tools/media/audio/providerOptions/deepgram/accessToken"),
     ],
+    // A name that only starts like a token count still names a key.
+    [
+      {
+        tools: {
+          media: { models: [{ providerOptions: { google: { max_tokens_key: sentinel } } }] },
+        },
+      },
+      option("/tools/media/models/0/providerOptions/google/max_tokens_key"),
+    ],
+    [
+      { tools: { media: { video: { headers: { Authorization: sentinel } } } } },
+      header("/tools/media/video/headers/Authorization"),
+    ],
     [
       { gateway: { remote: { edgeAuth: { "CF-Access-Client-Secret": sentinel } } } },
       header("/gateway/remote/edgeAuth/CF-Access-Client-Secret"),
@@ -4160,6 +4299,32 @@ test("Configuration and Preset saves refuse a literal key in the other key and h
       }
     });
   }
+  // A Preset option name is matched as the text around its variable, as a header name is.
+  await t.test("refuses a Preset option name around a variable at save", async () => {
+    const field = "/tools/media/models/0/providerOptions/google/api_key{{ vars.suffix }}";
+    const response = await request(context.app, "POST", presets, {
+      body: {
+        name: "Refused",
+        template: {
+          variables: { suffix: { type: "string" } },
+          configuration: {
+            values: {
+              tools: {
+                media: {
+                  models: [
+                    { providerOptions: { google: { "api_key{{ vars.suffix }}": sentinel } } },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+    assert.equal(response.status, 400, JSON.stringify(response.body));
+    assert.equal(response.body.error.message, option(field));
+    assert.equal(JSON.stringify(response.body).includes(sentinel), false);
+  });
   // Nothing refused was stored.
   assert.deepEqual((await request(context.app, "GET", presets)).body.data, []);
   assert.deepEqual(await readdir(join(root, namespace.id)).catch(() => []), []);
@@ -4193,6 +4358,16 @@ test("Configuration and Preset saves refuse a literal key in the other key and h
           providerOptions: {
             deepgram: { model: "nova-3", smart_format: true, key: "${DG_KEY}" },
             openai: { max_tokens: 4096, maxOutputTokens: 512 },
+            // A count in each word the rule lists, singular or plural, names no credential.
+            vllm: {
+              min_tokens: 1,
+              num_tokens: 2,
+              total_tokens: 3,
+              context_tokens: 4,
+              input_tokens: 5,
+              max_completion_tokens: 6,
+              max_token: 7,
+            },
           },
         },
         image: { models: [{ request: { headers } }] },
@@ -4313,6 +4488,36 @@ test("Configuration and Preset saves refuse a literal secret in the other slots 
       },
       key("/channels/synology-chat/accounts/ops/webhookUrl"),
     ],
+    [
+      {
+        channels: {
+          "synology-chat": { webhookUrl: `https://chat.example.test/?token=${sentinel}` },
+        },
+      },
+      key("/channels/synology-chat/webhookUrl"),
+    ],
+    [
+      {
+        channels: {
+          "synology-chat": {
+            accounts: { ops: { incomingUrl: `https://chat.example.test/?token=${sentinel}` } },
+          },
+        },
+      },
+      key("/channels/synology-chat/accounts/ops/incomingUrl"),
+    ],
+    // Each word of the rule: a secret, an encryption key, a service account reference.
+    [{ channels: { line: { channelSecret: sentinel } } }, key("/channels/line/channelSecret")],
+    [{ channels: { feishu: { encryptKey: sentinel } } }, key("/channels/feishu/encryptKey")],
+    [
+      { channels: { googlechat: { serviceAccountRef: sentinel } } },
+      key("/channels/googlechat/serviceAccountRef"),
+    ],
+    // Two literals in one channel: the first in the document is named.
+    [
+      { channels: { telegram: { botToken: sentinel, webhookSecret: sentinel } } },
+      key("/channels/telegram/botToken"),
+    ],
     // Plugin settings: a key, an account's password, a list entry, a field only the manifest
     // marks sensitive and a headers map.
     [
@@ -4335,9 +4540,28 @@ test("Configuration and Preset saves refuse a literal secret in the other slots 
       plugin("codex", { appServer: { headers: { Authorization: `Bearer ${sentinel}` } } }),
       header("/plugins/entries/codex/config/appServer/headers/Authorization"),
     ],
+    // A snake_case API key, a private key, and a token whose name starts with "file".
+    [plugin("tavily", { api_key: sentinel }), key("/plugins/entries/tavily/config/api_key")],
+    [
+      plugin("github", { app: { privateKey: sentinel } }),
+      key("/plugins/entries/github/config/app/privateKey"),
+    ],
+    [
+      plugin("dropbox", { fileAccessToken: sentinel }),
+      key("/plugins/entries/dropbox/config/fileAccessToken"),
+    ],
+    // A Gateway password that is not a whole `${NAME}` reference or an env reference with an id.
+    ...[
+      `\${OPENCLAW_GATEWAY_PASSWORD}${sentinel}`,
+      "${9GATEWAY_PASSWORD}",
+      { source: "env", value: sentinel },
+    ].map((password) => [
+      { gateway: { auth: { password } } },
+      `${inline("/gateway/auth/password")} Use the OPENCLAW_GATEWAY_PASSWORD environment reference, whose value the Compute Driver generates, instead.`,
+    ]),
   ];
-  for (const [values, message] of refused) {
-    await t.test(`refuses ${message.split(" ")[2]}`, async () => {
+  for (const [index, [values, message]] of refused.entries()) {
+    await t.test(`refuses ${index}: ${message.split(" ")[2]}`, async () => {
       for (const [path, body] of [
         [configurations, { kind: "agent", values }],
         [presets, { name: "Refused", template: { configuration: { values } } }],
@@ -4398,7 +4622,11 @@ test("Configuration and Preset saves refuse a literal secret in the other slots 
         accounts: { work: { botToken: secretRef("TELEGRAM_WORK_BOT_TOKEN") } },
       },
       line: { enabled: false, secretFile: "/run/secrets/line-channel-secret" },
-      googlechat: { enabled: false, serviceAccount: secretRef("GOOGLECHAT_SERVICE_ACCOUNT") },
+      googlechat: {
+        enabled: false,
+        serviceAccount: secretRef("GOOGLECHAT_SERVICE_ACCOUNT"),
+        serviceAccountEmail: "chat-bot@example.iam.gserviceaccount.com",
+      },
       slack: { enabled: false, channels: { "secret-launch": { requireMention: true } } },
     },
     plugins: {
@@ -4407,6 +4635,15 @@ test("Configuration and Preset saves refuse a literal secret in the other slots 
         firecrawl: { config: { webFetch: { apiKey: secretRef("FIRECRAWL_API_KEY") } } },
         "voice-call": { config: { telnyx: { publicKey: "${TELNYX_PUBLIC_KEY}" } } },
         "visitor-access": { config: { requireToken: true } },
+        // Where a secret is read from, and a name that only starts with "token".
+        "secret-reader": {
+          config: {
+            secretPath: "/run/secrets/reader",
+            secretsDir: "/run/secrets",
+            apiKeyEnv: "READER_API_KEY",
+            tokenizer: "o200k_base",
+          },
+        },
         acpx: {
           config: {
             mcpServers: { docs: { command: "docs-mcp", env: { DOCS_API_TOKEN: "env-value" } } },
@@ -4448,6 +4685,9 @@ test("Preset and Configuration saves refuse a baseUrl or api that a variable fil
     `Configuration field /models/providers/gateway/${field} must start with https:// or http:// (the // after the scheme is missing).`;
   const api =
     "Configuration field /models/providers/gateway/api must name a model API the runtime supports, such as openai-responses, openai-completions or anthropic-messages.";
+  // Finding 1346: a numeric or 0x last label makes the URL parser read the host as IPv4.
+  const numericHost = (field = "baseUrl") =>
+    `${baseUrl(field)} A numeric or 0x last label parses as IPv4; use four decimal octets from 0 to 255 without leading zeros.`;
 
   // An empty written authority, however it is spelled, is refused on Configuration create, and
   // so is one or no slash after the scheme (finding 1259), which the URL parser accepts. Only the
@@ -4481,6 +4721,35 @@ test("Preset and Configuration saves refuse a baseUrl or api that a variable fil
     [{ baseUrl: "https:${MODEL_SLASHES:-//}models.example.test/v1" }, slashes()],
     [{ baseUrl: "${MODEL_SCHEME:-https://}${MODEL_SLASH:-/}models.example.test/v1" }, baseUrl()],
     [{ baseUrl: "${MODEL_SCHEME:-https:/}${MODEL_PATH:-/models.example.test}/v1" }, baseUrl()],
+    // A host the URL parser reads as IPv4 and refuses names the last label (finding 1346).
+    [{ baseUrl: "https://api.123/v1" }, numericHost()],
+    [{ baseUrl: "https://api.0x10/v1" }, numericHost()],
+    [{ baseUrl: "HTTPS://999.1.2.3:8443" }, numericHost()],
+    [{ models: [{ id: "m", baseUrl: "https://1.2.3.4.5/v1" }] }, numericHost("models/0/baseUrl")],
+    [{ baseUrl: "https://0.0.0.08./v1" }, numericHost()],
+    // The hint finds the host as the URL parser does: any case of 0x and a bare 0x, edge spaces
+    // and C0 controls trimmed, backslashes as slashes, and userinfo skipped.
+    [{ baseUrl: "https://api.0X10/v1" }, numericHost()],
+    [{ baseUrl: "https://api.0x/v1" }, numericHost()],
+    [{ baseUrl: " \u0001https://api.123/v1" }, numericHost()],
+    [{ baseUrl: "https://api.123 \u0001" }, numericHost()],
+    [{ baseUrl: "https:\\\\api.123/v1" }, numericHost()],
+    [
+      {
+        baseUrl: syntheticCredentialUrl({
+          username: "user",
+          password: "secret",
+          host: "api.123",
+          pathname: "/v1",
+        }),
+      },
+      numericHost(),
+    ],
+    // A URL that fails for another reason too keeps the general message, and so does a last
+    // label that only starts or ends with digits.
+    [{ baseUrl: "https://api.123:99999/v1" }, baseUrl()],
+    [{ baseUrl: "https://api.a<1/v1" }, baseUrl()],
+    [{ baseUrl: "https://api.1<a/v1" }, baseUrl()],
   ]) {
     const response = await request(context.app, "POST", configurations, {
       body: { kind: "agent", values: gateway(settings) },
@@ -4502,6 +4771,14 @@ test("Preset and Configuration saves refuse a baseUrl or api that a variable fil
     [{ h: { type: "string" } }, { baseUrl: "HTTPS:/{{ vars.h }}/v1" }, slashes()],
     [{ n: { type: "number" } }, { baseUrl: "{{ vars.n }}" }, baseUrl()],
     [{ b: { type: "boolean" } }, { baseUrl: "{{ vars.b }}" }, baseUrl()],
+    [{ p: { type: "string" } }, { baseUrl: "https://api.123/{{ vars.p }}" }, numericHost()],
+    // The last label can follow the variable: the hint reads the text around it, filled.
+    [{ h: { type: "string" } }, { baseUrl: "https://{{ vars.h }}.1.2.3.4/v1" }, numericHost()],
+    [
+      {},
+      { models: [{ id: "m", baseUrl: "https://api.0x10/v1" }] },
+      numericHost("models/0/baseUrl"),
+    ],
     [{ n: { type: "number" } }, { api: "{{ vars.n }}" }, api],
     [
       { b: { type: "boolean" } },
@@ -4664,4 +4941,54 @@ test("A stored Configuration with request credentials an older release accepted 
   const deployed = await request(context.app, "POST", `${agentPath}/deploy`);
   assert.equal(deployed.status, 202, JSON.stringify(deployed.body));
   assert.equal(JSON.stringify(context.auditSink.events).includes(sentinel), false);
+});
+
+test("A stored Configuration with a literal Gateway password an older release accepted reads and does not deploy", async (t) => {
+  // Deployment does not run the save rules (validateConfigurationSettings); the Configuration
+  // Driver's credential rules refuse the literal there, with the save message, before any
+  // revision exists. Without that check, Kubernetes Compute answers with a gateway.auth.mode
+  // conflict and other Compute Drivers get further still.
+  for (const [label, computeDriver] of [
+    [
+      "Kubernetes Compute",
+      kubernetesRules("compute-stored-gateway-password", ...configurationRules),
+    ],
+    ["ready Compute", createReadyComputeDriver("compute-stored-gateway-password-ready")],
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), "occ-stored-gateway-password-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const configurationDriver = new FilesystemConfigurationDriver(root);
+    const { namespace, ...context } = await fixture({ configurationDriver, computeDriver });
+    const { configurationId, item, agentPath } = await deployableAgent(context, namespace, {
+      values: runtimeSelected,
+      name: "Stored Gateway password consumer",
+      secretName: "stored-gateway-password-key",
+    });
+    const path = join(root, namespace.id, `${configurationId}.json`);
+    const sentinel = `synthetic-gateway-password-${randomUUID()}`;
+    const stale = {
+      ...runtimeSelected,
+      gateway: { auth: { mode: "password", password: sentinel } },
+    };
+    const current = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ ...current, values: stale }));
+
+    const read = await request(context.app, "GET", item);
+    assert.equal(read.status, 200, `${label}: ${JSON.stringify(read.body)}`);
+    assert.deepEqual(read.body.data.values, stale, label);
+    // Saving it unchanged and deploying it are refused with the same message.
+    const message =
+      "Configuration field /gateway/auth/password holds a credential value inline, where a reference is required. Use the OPENCLAW_GATEWAY_PASSWORD environment reference, whose value the Compute Driver generates, instead.";
+    const resaved = await request(context.app, "PATCH", item, { body: { values: stale } });
+    assert.equal(resaved.status, 400, `${label}: ${JSON.stringify(resaved.body)}`);
+    assert.equal(resaved.body.error.message, message, label);
+    const deployed = await request(context.app, "POST", `${agentPath}/deploy`);
+    assert.equal(deployed.status, 400, `${label}: ${JSON.stringify(deployed.body)}`);
+    assert.equal(deployed.body.error.message, message, label);
+    for (const body of [resaved.body, deployed.body]) {
+      assert.equal(JSON.stringify(body).includes(sentinel), false, label);
+    }
+    const revisions = await request(context.app, "GET", `${agentPath}/revisions`);
+    assert.deepEqual(revisions.body.data, [], label);
+  }
 });

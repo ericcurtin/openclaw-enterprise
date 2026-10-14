@@ -734,15 +734,36 @@ test("Harness resolution stays in step with the size of the model selections and
   // Finding 1316: every Configuration and Preset save resolves the Harness synchronously, while
   // holding the Namespace row lock. It matched every catalog row against every selected model,
   // and repeated the defaults' fallbacks for each entry without its own model, so one large
-  // valid document held the controller for seconds to minutes. Each shape below took minutes
-  // before; resolution now takes about 100 ms, under the 1 s bound.
+  // valid document held the controller for seconds to minutes.
   const count = 50_000;
   const fallbacks = Array.from({ length: count }, (_, index) => `openai/m${index + 1}`);
+  // The bound is relative to a structured clone of the same document, so a slow or busy runner
+  // does not fail it (finding 1326). At two CPUs resolution takes 1-6 clones, and up to 20 with
+  // four copies of the test sharing them; before, the first shape took about 2 minutes, about
+  // 5,800 clones (and about 320 with 2,000 models instead of 50,000). The two are timed in turn
+  // up to three times, keeping each one's best, until resolution is under the bound; a miss far
+  // past it is not noise and is not timed again.
   const timed = (values, expected) => {
-    const started = performance.now();
-    assert.equal(resolveConfiguredHarnessId(values), expected);
-    const elapsed = performance.now() - started;
-    assert.ok(elapsed < 1_000, `took ${elapsed.toFixed(0)} ms`);
+    const timings = { resolving: Infinity, cloning: Infinity };
+    for (let round = 0; round < 3; round += 1) {
+      for (const [name, work] of [
+        ["resolving", () => assert.equal(resolveConfiguredHarnessId(values), expected)],
+        ["cloning", () => structuredClone(values)],
+      ]) {
+        const started = performance.now();
+        work();
+        timings[name] = Math.min(timings[name], performance.now() - started);
+      }
+      const { resolving, cloning } = timings;
+      if (resolving < 50 * cloning || resolving > 500 * cloning) {
+        break;
+      }
+    }
+    const { resolving, cloning } = timings;
+    assert.ok(
+      resolving < 50 * cloning,
+      `resolution took ${resolving.toFixed(0)} ms, a clone ${cloning.toFixed(0)} ms`,
+    );
   };
   // 50k fallbacks, each listed in a 50k-row provider catalog that selects its runtime.
   timed(
@@ -991,7 +1012,10 @@ test("deployment names a non-object agents setting before model policy", async (
     ),
     refusal,
   );
-  assert.deepEqual(await controller.listRevisions(administrator, namespace.id, agent.id), []);
+  assert.deepEqual(
+    (await controller.listRevisions(administrator, namespace.id, agent.id)).revisions,
+    [],
+  );
 });
 
 test("one installation admits embedded and dedicated revisions without rewriting historical placement", async () => {
@@ -1413,7 +1437,7 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
       name,
     );
     assert.deepEqual(
-      await controller.listRevisions(administrator, namespace.id, agent.id),
+      (await controller.listRevisions(administrator, namespace.id, agent.id)).revisions,
       [],
       name,
     );
@@ -1496,7 +1520,10 @@ test("Harness admission rejects conflicting selections, mode mismatches, and una
     agentId: agent.id,
     configurationId: openclawConfiguration.id,
   });
-  assert.deepEqual(await controller.listRevisions(administrator, namespace.id, agent.id), []);
+  assert.deepEqual(
+    (await controller.listRevisions(administrator, namespace.id, agent.id)).revisions,
+    [],
+  );
   const embedded = await controller.deployAgent(
     administrator,
     { namespaceId: namespace.id, agentId: agent.id },
@@ -1526,9 +1553,23 @@ test("Harness admission rejects conflicting selections, mode mismatches, and una
       ),
   );
   assert.equal((await controller.getInstallation(administrator)).capabilities, undefined);
-  assert.deepEqual(await controller.listRevisions(administrator, namespace.id, agent.id), [
-    embedded,
-  ]);
+  // Listing returns the revision's summary: no saved settings.
+  assert.deepEqual(
+    (await controller.listRevisions(administrator, namespace.id, agent.id)).revisions,
+    [
+      {
+        id: embedded.id,
+        namespaceId: embedded.namespaceId,
+        agentId: embedded.agentId,
+        revision: embedded.revision,
+        backendId: embedded.backendId,
+        configurationId: embedded.configurationId,
+        configurationGeneration: embedded.configurationGeneration,
+        harness: embedded.harness,
+        createdAt: embedded.createdAt,
+      },
+    ],
+  );
 
   assert.throws(
     () =>
@@ -1587,7 +1628,10 @@ test("Installation native worker support admits dedicated OpenClaw to Sandbox ch
         error.message,
       ),
   );
-  assert.deepEqual(await controller.listRevisions(administrator, namespace.id, agent.id), []);
+  assert.deepEqual(
+    (await controller.listRevisions(administrator, namespace.id, agent.id)).revisions,
+    [],
+  );
   assert.throws(
     () => new OpenClawController(installation, { nativeWorkerSupport: "pinned-runtime" }),
     ScopeViolationError,
@@ -1613,7 +1657,10 @@ test("Agent deployment separately authorizes its exact Configuration", async () 
       return true;
     },
   );
-  assert.deepEqual(await controller.listRevisions(administrator, namespace.id, agent.id), []);
+  assert.deepEqual(
+    (await controller.listRevisions(administrator, namespace.id, agent.id)).revisions,
+    [],
+  );
 });
 
 test("Agent creation and update separately authorize their exact Configuration", async () => {

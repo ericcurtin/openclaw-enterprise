@@ -1854,6 +1854,36 @@ export const scenarios = {
     description:
       "Search a short repository name. Exact names appear first with their owners visible, followed by prefixes and substrings. Press Enter to add the first match; the query stays available for another addition.",
   },
+  createRepositoriesLocaleSearch: {
+    group: "Pages/Create Agent",
+    name: "Locale-stable repository search",
+    path: create,
+    actions: [...repositoryForm, { selector: "#repository-search", value: "ibm" }],
+    repositoryOptions: [
+      {
+        repositoryRef: "IBM-platform",
+        displayName: "acme/platform",
+        allowedProfiles: ["git-read", "git-write", "git-full"],
+      },
+      {
+        repositoryRef: "handbook",
+        displayName: "acme/handbook",
+        allowedProfiles: ["git-read"],
+      },
+      ...["api", "docs", "infrastructure", "mobile"].map((name) => ({
+        repositoryRef: name,
+        displayName: `acme/${name}`,
+        allowedProfiles: ["git-read", "git-write", "git-full"],
+      })),
+    ],
+    description:
+      "Search matching uses stable casing, so ibm finds the approved IBM-platform reference even when its display name does not contain the query.",
+    steps: [
+      "Confirm that searching for ibm leaves acme/platform visible.",
+      "Select acme/platform and confirm IBM-platform appears as the selected repository reference.",
+    ],
+    gap: "Simulated UI proof only; this preview does not verify GitHub App access or repository credential delivery.",
+  },
   createRepositoriesCustom: {
     group: "Pages/Create Agent",
     name: "Custom access survives default changes",

@@ -6,6 +6,7 @@
   "parallelFiles": [
     "tests/integration/dev-up.test.mjs",
     "tests/integration/occ-api.test.mjs",
+    "tests/integration/stored-document-serialization.test.mjs",
     "tests/conformance/plugin-compute.test.mjs",
     "tests/conformance/occ-api-security.test.mjs",
     "tests/integration/configuration-startup.test.mjs",
@@ -82,7 +83,8 @@
     "tests/conformance/slack-configuration.test.mjs",
     "tests/conformance/grafana-overview-dashboard.test.mjs",
     "tests/conformance/split-layout-tenants.test.mjs",
-    "tests/conformance/split-layout-adopt.test.mjs"
+    "tests/conformance/split-layout-adopt.test.mjs",
+    "tests/conformance/url-authority.test.mjs"
   ],
   "files": [
     {
@@ -235,7 +237,10 @@
     },
     {
       "path": "tests/integration/profile-preflight-chart-parity.test.mjs",
-      "expectedTests": ["trusted proxy CIDRs get the same verdict from the preflight and the chart"]
+      "expectedTests": [
+        "trusted proxy CIDRs get the same verdict from the preflight and the chart",
+        "trusted proxy client address headers get the same verdict from the preflight and the chart"
+      ]
     },
     {
       "path": "tests/integration/bootstrap-output.test.mjs"
@@ -274,6 +279,9 @@
       "path": "tests/integration/occ-api.test.mjs"
     },
     {
+      "path": "tests/integration/stored-document-serialization.test.mjs"
+    },
+    {
       "path": "tests/integration/production-controller-security.test.mjs"
     },
     {
@@ -290,6 +298,9 @@
     },
     {
       "path": "tests/integration/secret-api.test.mjs"
+    },
+    {
+      "path": "tests/integration/credential-source-api.test.mjs"
     },
     {
       "path": "tests/integration/plugin-discovery-api.test.mjs"
@@ -341,6 +352,9 @@
     },
     {
       "path": "tests/conformance/split-layout-adopt.test.mjs"
+    },
+    {
+      "path": "tests/conformance/url-authority.test.mjs"
     }
   ]
 }

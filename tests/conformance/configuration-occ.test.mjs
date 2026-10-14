@@ -730,6 +730,64 @@ test("native selected-model policy explicitly chooses Codex or OpenClaw", () => 
   );
 });
 
+test("Harness resolution stays in step with the size of the model selections and catalog", () => {
+  // Finding 1316: every Configuration and Preset save resolves the Harness synchronously, while
+  // holding the Namespace row lock. It matched every catalog row against every selected model,
+  // and repeated the defaults' fallbacks for each entry without its own model, so one large
+  // valid document held the controller for seconds to minutes. Each shape below took minutes
+  // before; resolution now takes about 100 ms, under the 1 s bound.
+  const count = 50_000;
+  const fallbacks = Array.from({ length: count }, (_, index) => `openai/m${index + 1}`);
+  const timed = (values, expected) => {
+    const started = performance.now();
+    assert.equal(resolveConfiguredHarnessId(values), expected);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 1_000, `took ${elapsed.toFixed(0)} ms`);
+  };
+  // 50k fallbacks, each listed in a 50k-row provider catalog that selects its runtime.
+  timed(
+    {
+      agents: { defaults: { model: { primary: "openai/m0", fallbacks } } },
+      models: {
+        providers: {
+          openai: {
+            models: [
+              { id: "m0", agentRuntime: { id: "openclaw" } },
+              ...fallbacks.map((model) => ({ id: model.slice("openai/".length) })),
+            ],
+            agentRuntime: { id: "openclaw" },
+          },
+        },
+      },
+    },
+    "openclaw",
+  );
+  // 50k entries without their own model each select the defaults' 50k fallbacks; the entries'
+  // own `models` policies still apply: the last entry's conflicts with the provider's.
+  const entries = Object.fromEntries(
+    Array.from({ length: count }, (_, index) => [`a${index}`, { models: {} }]),
+  );
+  const values = {
+    agents: {
+      ownership: "explicit",
+      defaults: { model: { primary: "openai/m0", fallbacks } },
+      entries,
+    },
+    models: { providers: { openai: { agentRuntime: { id: "openclaw" } } } },
+  };
+  timed(values, "openclaw");
+  entries[`a${count - 1}`] = {
+    models: {
+      "openai/m0": { agentRuntime: { id: "codex" } },
+      [fallbacks.at(-1)]: { agentRuntime: { id: "codex" } },
+    },
+  };
+  assert.throws(
+    () => resolveConfiguredHarnessId(values),
+    new ConfigurationHarnessError("The selected model has conflicting Harness runtime policies."),
+  );
+});
+
 test("an unambiguous built-in model defaults to embedded OpenClaw", () => {
   assert.equal(resolveConfiguredHarnessId({}), "openclaw");
   assert.equal(
@@ -1077,6 +1135,8 @@ for (const scope of ["primary", "default-fallback", "entry-fallback", "provider-
 }
 
 test("OCC rejects alternate selectable runtimes and unsupported Codex providers before admitting work", async () => {
+  const defaultFallbackRefusal =
+    "Configuration setting agents.defaults.model.fallbacks must use the primary model's provider.";
   const scenarios = [
     ...[null, "openai/gpt-4.1-mini", [42], ["/missing-provider"]].map((fallbacks) => ({
       name: `malformed fallback selection ${JSON.stringify(fallbacks)} cannot be admitted`,
@@ -1093,6 +1153,7 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "fallback cannot change provider even when both models select the same Harness",
       executionMode: "dedicated",
+      saveRefusal: defaultFallbackRefusal,
       values: {
         agents: {
           defaults: {
@@ -1134,6 +1195,7 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "embedded OpenClaw cannot fall back to dedicated Codex",
       executionMode: "embedded",
+      saveRefusal: defaultFallbackRefusal,
       values: {
         agents: {
           defaults: {
@@ -1146,6 +1208,7 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "dedicated Codex cannot fall back to embedded OpenClaw",
       executionMode: "dedicated",
+      saveRefusal: defaultFallbackRefusal,
       values: {
         agents: {
           defaults: {
@@ -1173,6 +1236,8 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "per-agent primary model fallbacks cannot select dedicated Codex",
       executionMode: "embedded",
+      saveRefusal:
+        "Configuration setting agents.entries.primary.model.fallbacks must use the primary model's provider.",
       values: {
         agents: {
           defaults: {
@@ -1308,8 +1373,22 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     },
   ];
 
-  for (const { name, executionMode, values } of scenarios) {
+  for (const { name, executionMode, values, saveRefusal } of scenarios) {
     const { agent, controller, namespace } = await fixture();
+    if (saveRefusal !== undefined) {
+      // Every deployment refuses a fallback on another provider, so Configuration save refuses
+      // it first, naming the setting (finding 1298).
+      await assert.rejects(
+        controller.createConfiguration(administrator, {
+          namespaceId: namespace.id,
+          kind: "agent",
+          values,
+        }),
+        { name: "ConfigurationHarnessError", message: saveRefusal },
+        name,
+      );
+      continue;
+    }
     const configuration = await controller.createConfiguration(administrator, {
       namespaceId: namespace.id,
       kind: "agent",

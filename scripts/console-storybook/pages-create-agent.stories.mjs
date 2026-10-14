@@ -78,6 +78,7 @@ export const RepositorySelection = {
 };
 export const RepositoryDetails = story("createRepositoriesDetails");
 export const RepositoryDescriptionsPending = story("createRepositoriesDescriptionsPending");
+export const RepositoryLocaleSearch = story("createRepositoriesLocaleSearch");
 export const RepositoryContributor = {
   ...story("createRepositoriesContributor"),
   name: "Contributor without issue management",

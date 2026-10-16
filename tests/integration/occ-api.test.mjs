@@ -7574,8 +7574,8 @@ test("Slack environment credentials need OCC bindings unless the Compute Driver 
     return controller.request("POST", `/namespaces/${namespace.id}/agents/${agent.data.id}/deploy`);
   };
 
-  // SSH Compute reads credentials the operator put in the host environment file. OCC never
-  // holds them, so deployment proceeds without a binding or a Slack call.
+  // The SSH Driver leaves these refs for the Agent's operator-provisioned systemd environment.
+  // Admission requires neither an OCC Secret binding nor a Slack call; no host file is read here.
   const ssh = await deployUnbound(createSshComputeDriver());
   assert.equal(ssh.status, 202, JSON.stringify(ssh.body));
   assert.equal(slackCalls, 0);

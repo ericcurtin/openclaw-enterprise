@@ -53,7 +53,9 @@
                 ]
               }
             ],
-            "hidden": ["guides/README"]
+            "hidden": [
+              "guides/README"
+            ]
           },
           {
             "tab": "Topics",
@@ -107,8 +109,16 @@
                     "label": "Console"
                   },
                   {
+                    "page": "guides/console/create-namespace",
+                    "label": "Create a Namespace"
+                  },
+                  {
                     "page": "guides/console/agent-details",
                     "label": "Console Walkthrough"
+                  },
+                  {
+                    "page": "guides/console/configuration-plugins-and-files",
+                    "label": "Configuration, Plugins, and Files"
                   },
                   {
                     "page": "guides/console/channels-and-credentials",
@@ -233,6 +243,8 @@
             "hidden": [
               "reference/console/debug-fields",
               "reference/console/agent-sharing",
+              "reference/console/versions-and-channel-drafts",
+              "reference/console/repository-access",
               "reference/configuration/secrets",
               "reference/security/runtime-isolation",
               "reference/agents",
@@ -385,6 +397,10 @@
                       {
                         "page": "reference/repository-credentials/push-ref-guardrail",
                         "label": "Push Guardrail"
+                      },
+                      {
+                        "page": "reference/public-github-reads",
+                        "label": "Public GitHub Reads"
                       }
                     ]
                   }
@@ -673,6 +689,10 @@
                   {
                     "page": "reference/cheatsheets/environment-variables",
                     "label": "Environment Variables"
+                  },
+                  {
+                    "page": "reference/cheatsheets/github-actions",
+                    "label": "GitHub Actions"
                   }
                 ]
               },
@@ -703,7 +723,9 @@
                 ]
               }
             ],
-            "hidden": ["reference/postgres-auth-binding"]
+            "hidden": [
+              "reference/postgres-auth-binding"
+            ]
           },
           {
             "tab": "Contribute",
@@ -835,6 +857,10 @@
                     "label": "Console Storybook"
                   },
                   {
+                    "page": "contributing/console-storybook-agent-workflows",
+                    "label": "Storybook Agent Workflows"
+                  },
+                  {
                     "page": "flows/docker-compose-development",
                     "label": "Docker and Podman"
                   },
@@ -866,39 +892,26 @@
                         "label": "Module Boundaries"
                       },
                       {
-                        "page": "testing/repository-boundaries",
-                        "label": "Repository Boundaries"
-                      },
-                      {
                         "page": "testing/fixtures-and-scenarios",
                         "label": "Fixtures and Scenarios"
                       },
                       {
                         "page": "testing/ci",
                         "label": "CI"
-                      },
-                      {
-                        "page": "testing/ci-k3d-images",
-                        "label": "k3d Images"
-                      },
-                      {
-                        "page": "testing/first-agent-smoke",
-                        "label": "First Agent Smoke"
-                      },
-                      {
-                        "page": "testing/keycloak",
-                        "label": "Keycloak OIDC Lane"
-                      },
-                      {
-                        "page": "testing/ci-manual-integration",
-                        "label": "Manual Integration Lanes"
-                      },
-                      {
-                        "page": "testing/metrics",
-                        "label": "Metrics Dashboard"
                       }
                     ]
                   }
+                ]
+              },
+              {
+                "group": "Release",
+                "pages": [
+                  { "page": "release/README", "label": "Overview" },
+                  { "page": "release/configuration", "label": "Configuration" },
+                  { "page": "release/containers", "label": "Containers" },
+                  { "page": "release/chart-publication", "label": "Helm Chart" },
+                  { "page": "release/cli-publication", "label": "OCC CLI" },
+                  { "page": "release/container-promotion", "label": "Docker Hub Promotion" }
                 ]
               },
               {
@@ -936,6 +949,7 @@
               "contributing/rfc-template",
               "guides/deploy/local-repository-credentials",
               "guides/deploy/local-compose-kubernetes",
+              "guides/deploy/local-sandbox-network-policy",
               "guides/deploy/openshell-credential-sources",
               "reference/settings/development",
               "design/resources",
@@ -956,8 +970,11 @@
               "flows/agent-deployment-diagnostics",
               "flows/agent-runtime-logs",
               "flows/platform-console",
+              "flows/platform-console/agent-creation",
               "flows/platform-console/agent-editing",
+              "flows/platform-console/agent-stop-and-deletion",
               "flows/platform-console/agent-sharing",
+              "flows/platform-console/sign-in-return",
               "flows/platform-console/observability-link",
               "flows/configuration-driver",
               "flows/configuration-driver/persistence-and-revisions",
@@ -991,31 +1008,23 @@
               "flows/cli-agent-browsing",
               "flows/github-actions-testing/preparation",
               "testing/postgresql",
-              "testing/images",
               "testing/docker",
               "testing/ssh",
               "testing/kubernetes",
-              "testing/production-network-access",
-              "testing/two-cluster-local",
-              "testing/gateway-routing",
-              "testing/production-tui",
               "testing/slack",
-              "testing/qa-matrix",
-              "testing/qa-matrix-results",
-              "testing/service-accounts",
               "testing/plugins",
-              "testing/plugins-proof-notes",
               "testing/openshell",
+              "testing/openshell-oauth",
               "testing/openshell-coverage",
-              "testing/openshell-first-agent",
-              "testing/openshell-pre5-local-experiment",
               "flows/agent-repository-credentials",
+              "flows/public-github-reads",
               "flows/repository-credentials",
               "flows/repository-credential-configuration",
               "testing/repository-credentials",
-              "testing/repository-credentials-artifacts",
-              "testing/repository-credentials-platform",
-              "flows/agent-presets"
+              "flows/agent-presets",
+              "reference/sandbox-policies",
+              "guides/topics/agent-sandbox-policy",
+              "flows/agent-sandbox-policy"
             ]
           }
         ]

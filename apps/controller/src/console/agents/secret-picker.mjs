@@ -1,4 +1,13 @@
-import { element, dismissOnBackdrop } from "../dom.mjs";
+import {
+  dismissOnBackdrop,
+  element,
+  field as formField,
+  revealStatus,
+  setFieldError,
+  setStatusTone,
+  statusBlock,
+  validateFields,
+} from "../dom.mjs";
 import { message, namespacePath } from "./list.mjs";
 
 export function secretIdForBinding(binding) {
@@ -49,6 +58,30 @@ export function isSecretMetadata(secret, namespaceId) {
   );
 }
 
+// Secret names this page session resolved, per signed-in operator. A rebuilt summary shows the
+// name it had while the reread runs, instead of the raw ID and "Loading metadata…" for a moment,
+// which wrapped and moved the cards below (finding 1482).
+const resolvedSecretNames = new Map();
+/** Forgets the resolved names, as sign-out forgets other private state. */
+export function clearResolvedSecretNames() {
+  resolvedSecretNames.clear();
+}
+const secretNameKey = (context, secretId) =>
+  context.operatorId ? JSON.stringify([context.operatorId, context.namespaceId, secretId]) : null;
+
+function secretMetadataLink(href, name) {
+  return element(
+    "a",
+    {
+      href,
+      target: "_blank",
+      rel: "noopener",
+      title: "View Secret metadata (opens in new tab)",
+    },
+    name,
+  );
+}
+
 // Resolve only the referenced resource: list permission is not required to read a binding.
 export function renderSecretReference(context, source) {
   const node = element("span", { className: "secret-reference", role: "status" });
@@ -62,10 +95,16 @@ export function renderSecretReference(context, source) {
     return node;
   }
   const bound = `Bound Secret · ${source.id}`;
-  node.textContent = `${bound} · Loading metadata…`;
   if (typeof context.request !== "function") {
     node.textContent = `${bound} · Metadata unavailable`;
     return node;
+  }
+  const key = secretNameKey(context, source.id);
+  const known = key === null ? undefined : resolvedSecretNames.get(key);
+  if (known === undefined) {
+    node.textContent = `${bound} · Loading metadata…`;
+  } else {
+    node.replaceChildren(secretMetadataLink(href, known));
   }
   context
     .request(href)
@@ -74,26 +113,23 @@ export function renderSecretReference(context, source) {
         return;
       }
       if (!isSecretMetadata(secret, context.namespaceId) || secret.id !== source.id) {
+        resolvedSecretNames.delete(key);
         node.textContent = `${bound} · Metadata unavailable`;
         return;
       }
-      node.replaceChildren(
-        element(
-          "a",
-          {
-            href,
-            target: "_blank",
-            rel: "noopener",
-            title: "View Secret metadata (opens in new tab)",
-          },
-          secretOptionLabel(secret),
-        ),
-      );
+      const name = secretOptionLabel(secret);
+      if (key !== null) {
+        resolvedSecretNames.set(key, name);
+      }
+      if (name !== known) {
+        node.replaceChildren(secretMetadataLink(href, name));
+      }
     })
     .catch((error) => {
       if (context.isCurrent && !context.isCurrent()) {
         return;
       }
+      resolvedSecretNames.delete(key);
       node.textContent = `${bound} · Metadata unavailable${error.status === 403 ? " (access denied)" : ""}`;
       if (error.status === 401) {
         context.onExpired?.();
@@ -170,6 +206,9 @@ export function createSecretReferenceField({
     hidden: "",
   });
   const status = element("p", { id: `${id}-status`, className: "hint", role: "status" });
+  // Forms rename the field by method (API key or Service account token Secret); its required
+  // error names the label the page shows (finding 1987).
+  const labelNode = element("label", { for: id }, label);
   const metadataLink = credentialLink("#", metadataLabel);
   const secrets = [];
   // Set once a binding is staged, so a Secret list that arrives later keeps its hint.
@@ -352,11 +391,17 @@ export function createSecretReferenceField({
   function updateValidity() {
     input.required = requiredWhenEnabled;
     input.disabled = manuallyDisabled;
+    const missing = `${labelNode.textContent.trim() || label} is required.`;
     input.setCustomValidity(
-      requiredWhenEnabled && !manuallyDisabled && currentSecretId() === null
-        ? `${label} is required.`
-        : "",
+      requiredWhenEnabled && !manuallyDisabled && currentSecretId() === null ? missing : "",
     );
+    // A binding is chosen without an input event; its "is required" error goes with it.
+    if (input.validity.valid) {
+      setFieldError(input, "");
+    } else if (input.getAttribute("aria-invalid") === "true") {
+      // A shown error follows a renamed label.
+      setFieldError(input, missing);
+    }
     if (manuallyDisabled) {
       closeListbox({ restoreSelection: true });
     }
@@ -368,7 +413,7 @@ export function createSecretReferenceField({
     }
     input.disabled = true;
     closeListbox({ restoreSelection: false });
-    status.className = "hint";
+    setStatusTone(status, null);
     try {
       await onSecretSelected(secret);
       if (!secrets.some((item) => item.id === secret.id)) {
@@ -406,13 +451,14 @@ export function createSecretReferenceField({
 
   function openCreateSecretDialog() {
     const dialog = element("dialog", {
-      className: "channel-dialog credential-secret-dialog",
+      className: "dialog credential-secret-dialog",
       "aria-label": createDialogTitle ?? `Create ${label} Secret`,
     });
     const name = element("input", {
       id: `create-${id}-name`,
       type: "text",
       required: "",
+      "data-trim": "",
       autocomplete: "off",
       value: createSecretName(),
     });
@@ -422,9 +468,13 @@ export function createSecretReferenceField({
       required: "",
       autocomplete: "off",
     });
-    const feedback = element("p", { className: "error", role: "alert" });
+    const feedback = statusBlock("danger", null, null);
     const cancel = element("button", { type: "button" }, "Cancel");
-    const submit = element("button", { type: "submit", className: "primary" }, "Create Secret");
+    const submit = element(
+      "button",
+      { type: "submit", className: "button button--primary" },
+      "Create Secret",
+    );
     let creating = false;
     let outcomeUnknown = false;
     const fixedKey = createFixedKey
@@ -436,7 +486,7 @@ export function createSecretReferenceField({
       : null;
     const form = element(
       "form",
-      { method: "dialog", className: "channel-drawer-form" },
+      { method: "dialog", className: "channel-drawer-form", novalidate: "" },
       element(
         "div",
         { className: "channel-drawer-head" },
@@ -444,34 +494,27 @@ export function createSecretReferenceField({
         element("button", { type: "button" }, "Close"),
       ),
       fixedKey
-        ? element(
-            "div",
-            { className: "form-field" },
-            element("label", { for: fixedKey.id }, createFixedKey.label),
-            fixedKey,
-            element("p", { className: "hint" }, createFixedKey.hint),
-          )
+        ? formField({
+            label: createFixedKey.label,
+            control: fixedKey,
+            help: createFixedKey.hint,
+            className: "form-field",
+          })
         : null,
-      element(
-        "div",
-        { className: "form-field" },
-        element("label", { for: name.id }, "Name"),
-        name,
-        element("p", { className: "hint" }, "Unique within this Namespace."),
-      ),
-      element(
-        "div",
-        { className: "form-field" },
-        element("label", { for: value.id }, "Value"),
-        value,
-        element(
-          "p",
-          { className: "hint" },
-          "Stored as a Namespace Secret. The value is never read back.",
-        ),
-      ),
+      formField({
+        label: "Name",
+        control: name,
+        help: "Unique within this Namespace.",
+        className: "form-field",
+      }),
+      formField({
+        label: "Value",
+        control: value,
+        help: "Stored as a Namespace Secret. The value is never read back.",
+        className: "form-field",
+      }),
       feedback,
-      element("div", { className: "form-actions" }, cancel, submit),
+      element("div", { className: "dialog-actions" }, cancel, submit),
     );
     const dismiss = () => {
       suppressFocusOpen = true;
@@ -491,18 +534,14 @@ export function createSecretReferenceField({
     };
     form.querySelector(".channel-drawer-head button").addEventListener("click", close);
     cancel.addEventListener("click", close);
-    name.addEventListener("input", () => name.setCustomValidity(""));
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      if (creating || outcomeUnknown || !form.reportValidity()) {
+      // The console checks the fields, so no browser bubble shows; a Name of only spaces is
+      // missing too (UX plan C3).
+      if (creating || outcomeUnknown || !validateFields([...form.elements])) {
         return;
       }
       const secretName = name.value.trim();
-      if (!secretName) {
-        name.setCustomValidity("Name is required.");
-        form.reportValidity();
-        return;
-      }
       creating = true;
       submit.disabled = true;
       cancel.disabled = true;
@@ -547,6 +586,10 @@ export function createSecretReferenceField({
         value.disabled = outcomeUnknown;
         if (error.status === 409 && error.code !== "NAMESPACE_NOT_READY") {
           name.focus();
+        } else {
+          // The disabled submit dropped focus to the page behind the open dialog; the refusal
+          // takes it, in view (finding 1989).
+          revealStatus(feedback, dialog);
         }
       } finally {
         creating = false;
@@ -594,10 +637,14 @@ export function createSecretReferenceField({
         secrets.splice(0, secrets.length, ...listed, ...added);
         setSecretOptions({ preserveSearch: true });
         if (!staged) {
-          status.className = "hint";
+          setStatusTone(status, null);
+          // The list holds only the Secrets this account may read. Someone the session knows is
+          // not an Installation administrator may not see Secrets that exist (finding 2111).
           status.textContent = secrets.length
             ? "Choose an existing Secret or create a new one."
-            : "No readable Secrets yet. Create a new Secret to bind this field.";
+            : context.installationAdmin === false
+              ? "No Secrets you can read in this Namespace. Create a new Secret to bind this field, or ask an administrator for read access to an existing one."
+              : "No readable Secrets yet. Create a new Secret to bind this field.";
         }
         updateValidity();
       })
@@ -605,7 +652,7 @@ export function createSecretReferenceField({
         if (!isCurrent()) {
           return;
         }
-        status.className = "error";
+        setStatusTone(status, "danger");
         status.textContent =
           error.status === 401
             ? "Your session has expired."
@@ -619,11 +666,18 @@ export function createSecretReferenceField({
   input.addEventListener("focus", () => {
     searchQuery = "";
     input.select();
-    if (suppressFocusOpen) {
+    // A field showing its error opens on click, typing or ArrowDown, not on focus: the console's
+    // own check focuses it, and the open list covered the error under it (finding 1988).
+    if (suppressFocusOpen || input.getAttribute("aria-invalid") === "true") {
       suppressFocusOpen = false;
       return;
     }
     openListbox();
+  });
+  input.addEventListener("click", () => {
+    if (!listboxOpen) {
+      openListbox();
+    }
   });
   input.addEventListener("input", () => {
     searchQuery = input.value;
@@ -676,7 +730,7 @@ export function createSecretReferenceField({
   const field = element(
     "div",
     { className: fieldClassName },
-    element("label", { for: input.id }, label),
+    labelNode,
     element("div", { className: "secret-typeahead" }, input, listbox),
     metadataLink,
     status,

@@ -1,3 +1,13 @@
+import {
+  SandboxPolicyParams,
+  SandboxPolicyRevisionParams,
+  SandboxPolicyResponse,
+  SandboxPolicyViewResponse,
+  SandboxPolicyUpdateBody,
+  SandboxPolicyApplyBody,
+  SandboxPolicyEditingBody,
+  SandboxPolicyRecommendationsResponse,
+} from "./sandbox-policy.ts";
 import { Type } from "typebox";
 
 import {
@@ -23,6 +33,7 @@ import {
   CreateConfigurationBody,
   CreateNamespaceBody,
   ProvisionAgentBody,
+  ValidateAgentCreateBody,
   CreateSecretBody,
   AgentCredentialSourceParams,
   CreateCredentialSourceBody,
@@ -69,6 +80,8 @@ import {
   AgentProvisioningStatusResponse,
   AgentRuntimeCredentialResponse,
   AgentRuntimeImagesResponse,
+  AgentCallerPermissionsResponse,
+  NamespaceCallerPermissionsResponse,
   AgentResponse,
   AgentReadResponse,
   AgentRevisionListResponse,
@@ -480,6 +493,23 @@ export const occApiRoutes = [
       querystring: EmptyQuery,
       params: NamespaceParams,
       response: { 200: NamespaceResponse, ...readErrors },
+    },
+  },
+  {
+    operationId: "getNamespaceCallerPermissions",
+    method: "GET",
+    path: "/namespaces/:namespaceId/permissions",
+    action: "openclaw.namespaces.permissions.read",
+    iamAction: "read",
+    resourceKind: "namespace",
+    authorizationTarget: "namespace",
+    summary:
+      "Report advisory primary IAM permissions on a readable Namespace, not authorization for a later operation",
+    tags: ["Namespaces"],
+    schema: {
+      querystring: EmptyQuery,
+      params: NamespaceParams,
+      response: { 200: NamespaceCallerPermissionsResponse, ...readErrors },
     },
   },
   {
@@ -931,7 +961,7 @@ export const occApiRoutes = [
     iamAction: "operate",
     resourceKind: "agent",
     authorizationTarget: "agent",
-    summary: "Revoke one credential source from an Agent's active revision",
+    summary: "Revoke one credential source from the selected Agent revision",
     tags: ["Agents"],
     schema: {
       querystring: EmptyQuery,
@@ -1289,6 +1319,24 @@ export const occApiRoutes = [
     },
   },
   {
+    operationId: "validateAgentCreate",
+    method: "POST",
+    path: "/namespaces/:namespaceId/agents/validate",
+    action: "openclaw.agents.validate",
+    iamAction: "create",
+    resourceKind: "agent",
+    authorizationTarget: "namespace_collection",
+    summary:
+      "Check an unsaved Agent Configuration, plugin selections and initial workspace files as Configuration and Agent create would, without saving anything",
+    tags: ["Agents"],
+    schema: {
+      querystring: EmptyQuery,
+      params: NamespaceParams,
+      body: ValidateAgentCreateBody,
+      response: { 204: Type.Null(), ...createErrors },
+    },
+  },
+  {
     operationId: "updateAgent",
     method: "PATCH",
     path: "/namespaces/:namespaceId/agents/:agentId",
@@ -1319,6 +1367,96 @@ export const occApiRoutes = [
       querystring: EmptyQuery,
       params: NamespaceParams,
       response: { 200: AgentListResponse, ...readErrors },
+    },
+  },
+  {
+    operationId: "getAgentSandboxPolicy",
+    method: "GET",
+    path: "/namespaces/:namespaceId/agents/:agentId/sandbox-policy/:facet",
+    action: "openclaw.agents.sandbox_policy.read",
+    iamAction: "read",
+    resourceKind: "agent",
+    authorizationTarget: "agent",
+    summary: "Read one Agent sandbox policy and delegation ceiling",
+    tags: ["Agents"],
+    schema: {
+      params: SandboxPolicyParams,
+      querystring: EmptyQuery,
+      response: { 200: SandboxPolicyViewResponse, ...mutationErrors, 503: ErrorResponseRef },
+    },
+  },
+  {
+    operationId: "updateAgentSandboxPolicy",
+    method: "PUT",
+    path: "/namespaces/:namespaceId/agents/:agentId/sandbox-policy/:facet",
+    action: "openclaw.agents.sandbox_policy.update",
+    iamAction: "manage_policy",
+    resourceKind: "agent",
+    authorizationTarget: "agent",
+    summary: "Replace one Agent network policy additions",
+    tags: ["Agents"],
+    schema: {
+      params: SandboxPolicyParams,
+      querystring: EmptyQuery,
+      body: SandboxPolicyUpdateBody,
+      response: { 200: SandboxPolicyResponse, ...createErrors },
+    },
+  },
+  {
+    operationId: "applyAgentSandboxPolicy",
+    method: "POST",
+    path: "/namespaces/:namespaceId/agents/:agentId/sandbox-policy/:facet/apply",
+    action: "openclaw.agents.sandbox_policy.apply",
+    iamAction: "manage_policy",
+    resourceKind: "agent",
+    authorizationTarget: "agent",
+    summary: "Apply the saved policy to the running Agent revision",
+    tags: ["Agents"],
+    schema: {
+      params: SandboxPolicyParams,
+      querystring: EmptyQuery,
+      body: SandboxPolicyApplyBody,
+      response: { 202: SandboxPolicyResponse, ...createErrors },
+    },
+  },
+  {
+    operationId: "TEMPORARY_API_WILL_BREAK_IN_FUTURE_setAgentSandboxPolicyEditing",
+    method: "PATCH",
+    path: "/namespaces/:namespaceId/agents/:agentId/sandbox-policy/:facet/editing",
+    action: "openclaw.agents.sandbox_policy.editing.update",
+    iamAction: "administer",
+    resourceKind: "agent",
+    authorizationTarget: "agent",
+    summary: "Temporarily enable or disable future policy edits for one Agent",
+    description:
+      "Temporary API that will be replaced by the platform Guardrails primitive and will break. The editing setting currently applies to the Agent.",
+    tags: ["Agents"],
+    schema: {
+      params: SandboxPolicyParams,
+      querystring: EmptyQuery,
+      body: SandboxPolicyEditingBody,
+      response: { 200: AgentResponse, ...createErrors },
+    },
+  },
+  {
+    operationId: "getAgentSandboxRecommendations",
+    method: "GET",
+    path: "/namespaces/:namespaceId/agents/:agentId/revisions/:revisionId/sandbox-policy/:facet/recommendations",
+    action: "openclaw.agents.sandbox_policy.recommendations.read",
+    iamAction: "read",
+    resourceKind: "agent",
+    authorizationTarget: "agent",
+    summary: "Read policy suggestions for the requested Agent revision",
+    tags: ["Agents"],
+    schema: {
+      params: SandboxPolicyRevisionParams,
+      querystring: EmptyQuery,
+      response: {
+        200: SandboxPolicyRecommendationsResponse,
+        ...mutationErrors,
+        429: ErrorResponseRef,
+        503: ErrorResponseRef,
+      },
     },
   },
   {
@@ -1379,7 +1517,7 @@ export const occApiRoutes = [
     iamAction: "delete",
     resourceKind: "agent",
     authorizationTarget: "agent",
-    summary: "Begin or retry deletion of an exact Namespace-owned Agent and its AgentRevisions",
+    summary: "Begin or retry deletion of the requested Agent and its Agent revisions",
     tags: ["Agents"],
     schema: {
       querystring: EmptyQuery,
@@ -1420,6 +1558,23 @@ export const occApiRoutes = [
     },
   },
   {
+    operationId: "getAgentCallerPermissions",
+    method: "GET",
+    path: "/namespaces/:namespaceId/agents/:agentId/permissions",
+    action: "openclaw.agents.permissions.read",
+    iamAction: "read",
+    resourceKind: "agent",
+    authorizationTarget: "agent",
+    summary:
+      "Report advisory primary IAM permissions on a readable Agent, not authorization for a later operation",
+    tags: ["Agents"],
+    schema: {
+      querystring: EmptyQuery,
+      params: AgentParams,
+      response: { 200: AgentCallerPermissionsResponse, ...readErrors },
+    },
+  },
+  {
     operationId: "provisionAgentRuntimeCredentials",
     method: "POST",
     path: "/namespaces/:namespaceId/agents/:agentId/runtime-credentials",
@@ -1444,7 +1599,7 @@ export const occApiRoutes = [
     iamAction: "deploy",
     resourceKind: "agent",
     authorizationTarget: "agent",
-    summary: "Admit an immutable revision from the Agent's saved draft",
+    summary: "Save an Agent revision from the Agent's saved settings",
     tags: ["Agents"],
     schema: {
       querystring: EmptyQuery,
@@ -1460,7 +1615,7 @@ export const occApiRoutes = [
     iamAction: "operate",
     resourceKind: "agent",
     authorizationTarget: "agent",
-    summary: "Stop one Agent while retaining its revision and persistent state",
+    summary: "Stop one Agent and keep its saved Agent revision and persistent state",
     tags: ["Agents"],
     schema: {
       querystring: EmptyQuery,
@@ -1516,7 +1671,8 @@ export const occApiRoutes = [
     iamAction: "read",
     resourceKind: "agent",
     authorizationTarget: "agent_collection",
-    summary: "List authorized immutable revision summaries for one exact Agent, newest first",
+    summary:
+      "List Agent revision summaries that you can read for the requested Agent, newest first",
     tags: ["Agent revisions"],
     schema: {
       querystring: AgentRevisionListQuery,
@@ -1532,7 +1688,7 @@ export const occApiRoutes = [
     iamAction: "read",
     resourceKind: "agent_revision",
     authorizationTarget: "requested_revision",
-    summary: "Get an exact authorized immutable Agent revision",
+    summary: "Get an Agent revision that you can read",
     tags: ["Agent revisions"],
     schema: {
       querystring: EmptyQuery,
@@ -1548,7 +1704,7 @@ export const occApiRoutes = [
     iamAction: "read",
     resourceKind: "agent_revision",
     authorizationTarget: "requested_revision",
-    summary: "Get the durable deployment status for one admitted Agent revision",
+    summary: "Get the saved deployment status for an Agent revision",
     tags: ["Agent deployments"],
     schema: {
       querystring: EmptyQuery,
@@ -1564,7 +1720,7 @@ export const occApiRoutes = [
     iamAction: "operate",
     resourceKind: "agent",
     authorizationTarget: "agent_deployment_diagnostics",
-    summary: "Run explicit current-runtime diagnostics for one exact Agent revision",
+    summary: "Check the current runtime for an Agent revision",
     tags: ["Agent deployments"],
     schema: {
       querystring: EmptyQuery,
@@ -1580,7 +1736,7 @@ export const occApiRoutes = [
     iamAction: "operate",
     resourceKind: "agent",
     authorizationTarget: "agent_deployment_runtime",
-    summary: "Read Pod status, restarts, Events and log sources for one exact Agent revision",
+    summary: "Read Pod status, restart counts, Events, and log sources for an Agent revision",
     tags: ["Agent deployments"],
     schema: {
       querystring: EmptyQuery,
@@ -1596,7 +1752,7 @@ export const occApiRoutes = [
     iamAction: "read_logs",
     resourceKind: "agent",
     authorizationTarget: "agent_deployment_runtime_logs",
-    summary: "Read one bounded, redacted page of container output for one exact Agent revision",
+    summary: "Read one page of redacted container output for an Agent revision",
     tags: ["Agent deployments"],
     schema: {
       querystring: AgentRuntimeLogsQuery,

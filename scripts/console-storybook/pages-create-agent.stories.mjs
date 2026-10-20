@@ -3,7 +3,19 @@ import { story } from "./story.mjs";
 export default { title: "Pages/Create Agent" };
 
 export const CreateStart = { ...story("createStart"), name: "Choose a starting point" };
+export const NamespaceProvisioning = {
+  ...story("createNamespaceProvisioning"),
+  name: "Namespace still provisioning",
+};
+export const FormNamespaceProvisioning = story("createFormNamespaceProvisioning");
+export const FormNamespaceBecomesReady = story("createFormNamespaceBecomesReady");
+export const FormNamespaceFailed = story("createFormNamespaceFailed");
+export const FormNamespaceMissing = story("createFormNamespaceMissing");
 export const CreateForm = { ...story("createForm"), name: "OpenAI with Codex harness" };
+export const CreateInvalidConfiguration = {
+  ...story("createInvalidConfiguration"),
+  name: "Invalid Configuration JSON",
+};
 export const PluginsUnavailable = {
   ...story("createPluginsUnavailable"),
   name: "Plugin discovery needs a service account credential",
@@ -22,6 +34,7 @@ export const PluginsSelectedSecretDenied = story("createPluginsSelectedSecretDen
 export const PluginsTools = story("createPluginsTools");
 export const PluginsPolicies = story("createPluginsPolicies");
 export const PluginApproversMissingSecret = story("createPluginApproversMissingSecret");
+export const PluginApproversLookup = story("createPluginApproversLookup");
 export const PluginsSetupReminder = story("createPluginsSetupReminder");
 export const PluginsSecondPage = story("createPluginsSecondPage");
 export const PluginsEmpty = story("createPluginsEmpty");
@@ -37,6 +50,12 @@ export const CreateSlackCreateSecretModal = {
   ...story("createSlackCreateSecretModal"),
   name: "Create Slack Secret before Agent exists",
 };
+export const CreateSecretRequiredFields = {
+  ...story("createSecretRequiredFields"),
+  name: "Create Secret required fields",
+};
+export const CreateSecretRefused = story("createSecretRefused");
+export const CreateModelSecretRequired = story("createModelSecretRequired");
 export const CreateSlackSecretStaged = {
   ...story("createSlackSecretStaged"),
   name: "Slack Secret bindings staged",
@@ -54,6 +73,10 @@ export const CreateProvisioningSecrets = {
   name: "Provisioning with saved Secrets",
 };
 export const CreateDeploymentPending = story("createDeploymentPending");
+export const CreatePending = story("createPending");
+export const CreateDeploymentNamedWait = story("createDeploymentNamedWait");
+export const CreateDeploymentPodQuotaFull = story("createDeploymentPodQuotaFull");
+export const CreateDeploymentImagePullFailed = story("createDeploymentImagePullFailed");
 export const CreateDeploymentFailed = story("createDeploymentFailed");
 export const CreateDeploymentStopped = story("createDeploymentStopped");
 export const CreateProvisioningStopped = story("createProvisioningStopped");
@@ -69,7 +92,26 @@ export const CreateWorkspaceFiles = { ...story("createWorkspaceFiles"), name: "W
 export const CreatePresetMultiline = story("createPresetMultiline");
 export const CreatePresetMultilineApplied = story("createPresetMultilineApplied");
 export const CreateDedicatedOpenclaw = story("createDedicatedOpenclaw");
+export const CreateDedicatedCodexCredentialSource = story("createDedicatedCodexCredentialSource");
+export const CreateCredentialRegistrationUnknown = story("createCredentialRegistrationUnknown");
+export const CreateCredentialRegistrationCleanup = story("createCredentialRegistrationCleanup");
 export const CreateEmbedded = { ...story("createEmbedded"), name: "Embedded OpenClaw" };
+export const CreateOpenclawWithoutNativeWorkers = {
+  ...story("createOpenclawWithoutNativeWorkers"),
+  name: "OpenClaw without native worker support",
+};
+export const CreateOpenclawNoExecutionMode = {
+  ...story("createOpenclawNoExecutionMode"),
+  name: "OpenClaw with no usable execution mode",
+};
+export const CreateOpenclawSandboxDriverOutage = {
+  ...story("createOpenclawSandboxDriverOutage"),
+  name: "OpenClaw during a Sandbox Driver outage",
+};
+export const CreateOpenclawSandboxDedicated = {
+  ...story("createOpenclawSandboxDedicated"),
+  name: "OpenClaw on a Sandbox Driver installation",
+};
 export const CreateDedicatedOpenclawExperimental = {
   ...story("createDedicatedOpenclawExperimental"),
   name: "Experimental Dedicated OpenClaw",
@@ -80,6 +122,7 @@ export const RepositorySelection = {
 };
 export const RepositoryDetails = story("createRepositoriesDetails");
 export const RepositoryDescriptionsPending = story("createRepositoriesDescriptionsPending");
+export const RepositoryHiddenCharacters = story("createRepositoriesHiddenCharacters");
 export const RepositoryLocaleSearch = story("createRepositoriesLocaleSearch");
 export const RepositoryContributor = {
   ...story("createRepositoriesContributor"),
@@ -124,7 +167,19 @@ export const CreatePresetInvalidField = {
 };
 export const CreateCapabilitiesDenied = {
   ...story("createCapabilitiesDenied"),
-  name: "Agent creation needs an administrator",
+  name: "Permission check failed",
+};
+export const CreateMember = {
+  ...story("createMember"),
+  name: "Member with Agent create",
+};
+export const CreateMemberGrantRefused = {
+  ...story("createMemberGrantRefused"),
+  name: "Member Agent created, grant needs an administrator",
+};
+export const CreateRestricted = {
+  ...story("createRestricted"),
+  name: "Create Agent unavailable for this caller",
 };
 export const CreateCapabilitiesError = {
   ...story("createCapabilitiesError"),
@@ -167,6 +222,18 @@ export const CreateSecretDenied = {
 export const CreateGrantDenied = { ...story("createGrantDenied"), name: "Credential access retry" };
 export const CreateInvalid = { ...story("createInvalid"), name: "Invalid JSON" };
 export const CreateConflict = { ...story("createConflict"), name: "Provisioning conflict" };
+export const CreateRefusalReason = {
+  ...story("createRefusalReason"),
+  name: "Provisioning refusal with a reason",
+};
+export const CreatePluginPreflightRefusal = {
+  ...story("createPluginPreflightRefusal"),
+  name: "Plugin refusal before anything is saved",
+};
+export const CreatePluginRefusal = {
+  ...story("createPluginRefusal"),
+  name: "Plugin refusal after the Configuration is saved",
+};
 export const CreateUnknown = { ...story("createUnknown"), name: "Provisioning outcome unknown" };
 
 export const CreatePasswordPreset = {
@@ -176,6 +243,10 @@ export const CreatePasswordPreset = {
 export const CreatePasswordPresetMissingModel = {
   ...story("createPasswordPresetMissingModel"),
   name: "Standard Codex missing model",
+};
+export const CreatePresetRequiredFields = {
+  ...story("createPresetRequiredFields"),
+  name: "Preset required fields",
 };
 export const CreatePasswordPresetDraft = {
   ...story("createPasswordPresetDraft"),

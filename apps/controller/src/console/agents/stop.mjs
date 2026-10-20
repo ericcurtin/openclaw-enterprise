@@ -1,57 +1,87 @@
-import { button, element } from "../dom.mjs";
+import { button, element, setHidden, statusBlock } from "../dom.mjs";
 import { message, shortId } from "./list.mjs";
 
-export function createAgentStop(context, path, agent, onDeleting, onAgentChanged = () => {}) {
+export function createAgentStop(
+  context,
+  path,
+  agent,
+  onDeleting,
+  onAgentChanged = () => {},
+  allowed = null,
+) {
+  // One row of the Agent page's danger zone (UX spec 3.9); the confirmation carries the detail.
   const section = element("section", {
-    className: "agent-card stop-note",
+    className: "danger-zone-row stop-note",
     "aria-labelledby": "agent-stop-title",
   });
-  const feedback = element("div");
-  const actions = element("div", { className: "form-actions" });
+  const permissionNotice = "Your access does not include stopping this Agent.";
+  let restrictConfirmation;
+  const feedback = element("div", { className: "danger-zone-feedback" });
+  const actions = element("div", { className: "danger-zone-actions" });
   const stop = button("Stop Agent", openConfirmation, { className: "danger" });
-  const refresh = button("Refresh stop status", () => void refreshStatus());
+  const refresh = button("Refresh stop status", () => void refreshStatus(), {
+    tone: "ghost",
+    size: "sm",
+  });
   const repeat = button("Request Stop again", openConfirmation, { className: "danger" });
   const state = {
     agent,
     pending: false,
+    forbidden: false,
     needsRefresh: false,
     notice: "",
     error: null,
+    // Whether the version list loaded with no version this viewer can read: undefined while it
+    // loads, null when it failed.
+    noReadableVersions: undefined,
+    // The page's "vN" label for a version id, once its version list loads.
+    versionLabel: () => undefined,
+    // Set once this viewer opens Stop or refreshes here, so the row never vanishes under them.
+    used: false,
   };
 
+  // Focus lands here when the control that would take it is not rendered.
+  const title = element("h3", { id: "agent-stop-title", tabindex: "-1" }, "Stop Agent");
   section.append(
-    element("h2", { id: "agent-stop-title" }, "Stop Agent"),
     element(
-      "p",
-      { className: "muted" },
-      "Stop interrupts the current runtime gateway. Configuration, versions, Credentials, and workspace data are retained.",
+      "div",
+      { className: "danger-zone-text" },
+      title,
+      element(
+        "p",
+        { className: "muted" },
+        "Stops the running version. The Agent stays and can be deployed again.",
+      ),
     ),
-    feedback,
     actions,
+    feedback,
   );
 
   function render() {
     const requested = state.agent.desiredRuntimeState === "stopped";
+    // A running Agent's row is the title, its sentence and Stop; the overview already shows the
+    // current version. After a stop request the row reports what Refresh reads back.
     feedback.replaceChildren(
-      element(
-        "dl",
-        { className: "credential-status-list" },
-        element("dt", {}, "Requested runtime state"),
-        element("dd", {}, requested ? "Stopped" : "Running"),
-        element("dt", {}, "Current version"),
-        element(
-          "dd",
-          {},
-          state.agent.activeRevisionId
-            ? `Version ${shortId(state.agent.activeRevisionId)}`
-            : "No current version",
-        ),
-      ),
       ...(requested
         ? [
             element(
-              "p",
-              { className: "notice", role: "status" },
+              "dl",
+              { className: "credential-status-list" },
+              element("dt", {}, "Requested runtime state"),
+              element("dd", {}, "Stopped"),
+              element("dt", {}, "Current version"),
+              element(
+                "dd",
+                {},
+                state.agent.activeRevisionId
+                  ? (state.versionLabel(state.agent.activeRevisionId) ??
+                      `Version ${shortId(state.agent.activeRevisionId)}`)
+                  : "No current version",
+              ),
+            ),
+            statusBlock(
+              "info",
+              null,
               // Initial drafts and completed stops both have no selected revision.
               state.agent.activeRevisionId
                 ? "Stop requested. OCC will not start this Agent again until you deploy a new version. Runtime shutdown completion is not exposed in Console."
@@ -59,15 +89,14 @@ export function createAgentStop(context, path, agent, onDeleting, onAgentChanged
             ),
           ]
         : []),
-      ...(state.notice
-        ? [element("p", { className: "notice", role: "status" }, state.notice)]
-        : []),
+      ...(state.forbidden ? [statusBlock("info", null, permissionNotice)] : []),
+      ...(state.notice ? [statusBlock("info", null, state.notice)] : []),
       ...(state.error
         ? [
             element(
               "div",
-              { className: "error", role: "alert" },
-              element("p", {}, state.error.text),
+              { className: "status", "data-tone": "danger", role: "alert" },
+              element("p", { className: "status-body" }, state.error.text),
               state.error.requestId
                 ? element("p", { className: "request-id" }, `Request ID: ${state.error.requestId}`)
                 : null,
@@ -75,15 +104,41 @@ export function createAgentStop(context, path, agent, onDeleting, onAgentChanged
           ]
         : []),
     );
-    stop.disabled = requested || state.pending || state.needsRefresh;
-    repeat.disabled = state.pending || state.needsRefresh;
+    stop.disabled = requested || state.pending || state.needsRefresh || state.forbidden;
+    repeat.disabled = state.pending || state.needsRefresh || state.forbidden;
     refresh.disabled = state.pending;
     refresh.textContent = state.pending ? "Checking…" : "Refresh stop status";
-    if (requested || state.needsRefresh) {
-      actions.replaceChildren(stop, ...(requested ? [repeat] : []), refresh);
+    // An Agent created through the API starts stopped and has no version until its first
+    // deploy, so there is nothing to stop or to check (finding 1394), and the row is hidden
+    // (finding 1899). Only what this viewer can read decides it: a member who reads no version
+    // of a deployed Agent sees the same. While the version list loads, the row stays hidden.
+    const neverStarted =
+      requested &&
+      !state.agent.activeRevisionId &&
+      (state.noReadableVersions === true || state.noReadableVersions === undefined) &&
+      !state.pending &&
+      !state.needsRefresh;
+    // A viewer whose permission answer denies Agent operate has no row either (UX spec 3.9).
+    // A missing answer keeps it, and the API still decides. An answer that lands while this
+    // viewer has the confirmation open keeps the row, so the reason stays where they were.
+    setHidden(section, (neverStarted || state.forbidden) && !state.used);
+    // After a request, a disabled Stop beside Request Stop again only adds noise, and an
+    // uncertain outcome offers only Refresh (finding 1899).
+    if (neverStarted) {
+      actions.replaceChildren();
+    } else if (state.needsRefresh) {
+      actions.replaceChildren(refresh);
+    } else if (requested) {
+      actions.replaceChildren(repeat, refresh);
     } else {
       actions.replaceChildren(stop);
     }
+  }
+
+  function focusStatusControl() {
+    const target =
+      state.needsRefresh || state.agent.desiredRuntimeState === "stopped" ? refresh : stop;
+    (target.isConnected && !target.disabled ? target : title).focus();
   }
 
   function setAgent(next) {
@@ -103,16 +158,23 @@ export function createAgentStop(context, path, agent, onDeleting, onAgentChanged
     if (state.pending || !context.isCurrent()) {
       return;
     }
+    // Disabling Refresh can drop focus to the page. Return it only if the operator stayed here.
+    let returnFocus = document.activeElement === refresh;
+    const focusMoved = () => {
+      returnFocus = false;
+    };
     state.pending = true;
+    state.used = true;
     state.error = null;
     render();
+    document.addEventListener("focusin", focusMoved, { once: true });
     try {
       const current = await context.request(path);
       if (!context.isCurrent()) {
         return;
       }
       if (current?.status === "deleting") {
-        onDeleting();
+        onDeleting({ focus: returnFocus });
         return;
       }
       if (current?.status === "active") {
@@ -135,27 +197,30 @@ export function createAgentStop(context, path, agent, onDeleting, onAgentChanged
         };
       }
     } finally {
+      document.removeEventListener("focusin", focusMoved);
       if (context.isCurrent()) {
         state.pending = false;
         render();
-        (state.needsRefresh || state.agent.desiredRuntimeState === "stopped"
-          ? refresh
-          : stop
-        ).focus();
+        if (returnFocus) {
+          focusStatusControl();
+        }
       }
     }
   }
 
   async function stopAgent(dialog, cancel, confirm) {
-    if (state.pending || state.needsRefresh) {
+    if (state.forbidden || state.pending || state.needsRefresh) {
       return;
     }
     state.pending = true;
+    state.used = true;
     state.error = null;
     state.notice = "";
     cancel.disabled = true;
     confirm.disabled = true;
     confirm.textContent = "Stopping…";
+    // Busy, not merely disabled: the progress cursor, and "working" for assistive technology.
+    confirm.setAttribute("aria-busy", "true");
     render();
     try {
       const stopped = await context.request(`${path}/stop`, { method: "POST" });
@@ -164,7 +229,7 @@ export function createAgentStop(context, path, agent, onDeleting, onAgentChanged
       }
       if (stopped?.status === "deleting") {
         dialog.close();
-        onDeleting();
+        onDeleting({ focus: true });
         return;
       }
       if (stopped?.status !== "active" || stopped?.desiredRuntimeState !== "stopped") {
@@ -205,42 +270,62 @@ export function createAgentStop(context, path, agent, onDeleting, onAgentChanged
       if (context.isCurrent()) {
         state.pending = false;
         render();
-        (state.needsRefresh || state.agent.desiredRuntimeState === "stopped"
-          ? refresh
-          : stop
-        ).focus();
+        focusStatusControl();
       }
     }
   }
 
   function openConfirmation(event) {
-    if (state.pending || state.needsRefresh) {
+    if (state.forbidden || state.pending || state.needsRefresh) {
       return;
     }
     const invoker = event.currentTarget;
+    // The dialog lives in this card, so the card must not hide while it is open.
+    state.used = true;
     let submitted = false;
     const dialog = element("dialog", {
-      className: "agent-stop-dialog",
+      className: "dialog agent-stop-dialog",
       "aria-labelledby": "agent-stop-confirm-title",
-      "aria-describedby": "agent-stop-confirm-description",
+      "aria-describedby": "agent-stop-confirm-target agent-stop-confirm-description",
     });
     const cancel = button("Cancel", () => dialog.close());
     const confirm = button(
       "Stop Agent",
       () => {
+        if (state.forbidden) {
+          return;
+        }
         submitted = true;
         void stopAgent(dialog, cancel, confirm);
       },
       { className: "danger" },
     );
+    const description = element(
+      "p",
+      { id: "agent-stop-confirm-description", "aria-live": "polite" },
+      "This interrupts the current runtime gateway and ends any reply in progress; open chats can keep showing it as responding. Configuration, versions, Credentials, and workspace data are retained. Deploy a new version to start the Agent again.",
+    );
+    const showRestriction = () => {
+      // A late answer cannot undo a request already sent.
+      if (!dialog.open || state.pending) {
+        return;
+      }
+      confirm.disabled = true;
+      description.textContent = permissionNotice;
+      cancel.focus();
+    };
+    restrictConfirmation = showRestriction;
     dialog.append(
-      element("h2", { id: "agent-stop-confirm-title" }, `Stop ${state.agent.name}?`),
+      element("h2", { id: "agent-stop-confirm-title" }, "Stop this Agent?"),
+      // The short title no longer names the Agent, so the dialog does, as text.
       element(
         "p",
-        { id: "agent-stop-confirm-description" },
-        "This interrupts the current runtime gateway and ends any reply in progress; open chats can keep showing it as responding. Configuration, versions, Credentials, and workspace data are retained. Deploy a new version to start the Agent again.",
+        { id: "agent-stop-confirm-target" },
+        "Agent: ",
+        element("strong", {}, state.agent.name),
       ),
-      element("div", { className: "form-actions" }, cancel, confirm),
+      description,
+      element("div", { className: "dialog-actions" }, cancel, confirm),
     );
     dialog.addEventListener("cancel", (event) => {
       if (state.pending) {
@@ -250,15 +335,15 @@ export function createAgentStop(context, path, agent, onDeleting, onAgentChanged
     dialog.addEventListener(
       "close",
       () => {
+        if (restrictConfirmation === showRestriction) {
+          restrictConfirmation = undefined;
+        }
         dialog.remove();
         if (context.isCurrent() && !state.pending && !submitted) {
           if (invoker.isConnected && !invoker.disabled) {
             invoker.focus();
           } else {
-            (state.needsRefresh || state.agent.desiredRuntimeState === "stopped"
-              ? refresh
-              : stop
-            ).focus();
+            focusStatusControl();
           }
         }
       },
@@ -270,8 +355,34 @@ export function createAgentStop(context, path, agent, onDeleting, onAgentChanged
   }
 
   render();
+  void allowed?.then((permitted) => {
+    if (permitted === false && context.isCurrent()) {
+      state.forbidden = true;
+      restrictConfirmation?.();
+      render();
+    }
+  });
   return {
     section,
+    // The detail page reports whether its version list loaded empty (true), loaded with
+    // versions (false), or failed (null).
+    setNoReadableVersions(value) {
+      if (state.noReadableVersions === value) {
+        return;
+      }
+      state.noReadableVersions = value;
+      render();
+    },
+    // `label(id)` names a version as the page does ("v3"), or is undefined when unlisted. Only a
+    // changed label rerenders, so polls do not rewrite the status region.
+    setVersionLabel(label) {
+      const id = state.agent.activeRevisionId;
+      const before = id ? state.versionLabel(id) : undefined;
+      state.versionLabel = label;
+      if (id && label(id) !== before) {
+        render();
+      }
+    },
     updateAgent(next) {
       if (state.pending) {
         return;

@@ -117,8 +117,8 @@ for supported engines, images, and security restrictions.
 - `OCC_DOCKER_RUNTIME_IMAGE` — Shared image for the Docker gateway and Agent; may replace the two separate images.
 - `OCC_DOCKER_GATEWAY_IMAGE` — Docker gateway image when a shared image is not used.
 - `OCC_DOCKER_AGENT_IMAGE` — Docker Codex Agent image when a shared image is not used.
-- `OCC_KUBERNETES_RUNTIME_IMAGE` — Existing local Kubernetes runtime image; Kubernetes-only startup requires a matching controller digest and checkout revision.
-- `OCC_DEVELOPMENT_CONTROLLER_IMAGE` — Existing local OCE controller digest matching the runtime and checkout revision for the Kubernetes-only profile.
+- `OCC_KUBERNETES_RUNTIME_IMAGE` — Existing local Kubernetes runtime image; Kubernetes-only startup requires a matching controller digest and checkout commit.
+- `OCC_DEVELOPMENT_CONTROLLER_IMAGE` — Existing local OCE controller digest matching the runtime and checkout commit for the Kubernetes-only profile.
 - `OCC_DEVELOPMENT_REPOSITORY_INPUT_DIRECTORY` — Private local repository registry, App key, and approved upstream IPv4 `/32` endpoint inputs.
 - `OCC_DEVELOPMENT_REPOSITORY_IMAGE` — Optional matching immutable repository service image for the Kubernetes-only profile.
 - `OCC_DEVELOPMENT_POSTGRES_IMAGE` — Existing local PostgreSQL image for the Kubernetes-only profile; defaults to the pinned PostgreSQL 18.6 image.
@@ -147,6 +147,7 @@ Use only one of the two credential inputs. In production, use
 credential on the controller.
 
 - `OPENAI_API_KEY` — Authorized credential for local real-model use.
+- `CODEX_ACCESS_TOKEN`, `CODEX_ACCESS_TOKEN_FILE` — Personal access token or private token file for the OpenShell dedicated Codex first-Agent helper. Select one credential input.
 - `OPENAI_API_KEY_FILE` — Absolute path to a private credential file for the first-Agent helper.
 - `OPENCLAW_FIRST_AGENT_MODEL` — Plain OpenAI model ID, without a provider prefix; default for a new Agent: `gpt-6-astra`.
 

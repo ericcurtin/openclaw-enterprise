@@ -54,7 +54,13 @@ SECRET_REF="$(./bin/occ secret create --file model-secret.json -o json | jq -c .
 rm model-secret.json
 ```
 
-Register the Secret as an `openai` credential source:
+For a Codex personal access token, including a service-account token, save that
+token as the Secret above and register `type: "codex-pat"` with
+`secrets: {access_token: $ref}` in the command below. Select dedicated Codex;
+OpenShell keeps the real token outside the Harness. The [Driver reference](../../reference/drivers/openshell-credential-gateway.md#source-type-catalog)
+defines its permitted endpoints and authentication limits.
+
+Register an API-key Secret as an `openai` credential source:
 
 For an OpenAI-compatible service, set `OPENAI_BASE_URL` to its HTTPS `/v1`
 endpoint before creating the source. Codex requires Responses API compatibility,
@@ -134,14 +140,11 @@ JSON
 CONFIGURATION_ID="$(./bin/occ configuration create --file configuration.json -o json | jq -r .id)"
 ```
 
-The Configuration keeps `"sandbox": "read-only"`, but each deployed revision
-freezes `"sandbox": "danger-full-access"` and `"approvalsReviewer": "user"`. The
-OpenShell Sandbox Driver overrides these values for every dedicated Codex
-revision so that Codex's own sandbox does not run inside OpenShell's; OpenShell
-is the containment boundary. Codex's sandbox cannot start there, so keep
-`tools.exec` at its default or `mode: full`: other modes, including those the
-legacy `security` and `ask` fields select, make every shell command fail.
-`approvalPolicy` stays as configured.
+The OpenShell Sandbox Driver freezes `"sandbox": "danger-full-access"` and
+`"approvalsReviewer": "user"` for dedicated Codex versions and removes
+`appServer.networkProxy`. `approvalPolicy` stays configured. The bridge selects the native `:danger-full-access` profile,
+which the Codex account must allow. OpenShell enforces the outer sandbox;
+restricted native profiles require nested bubblewrap namespaces that it blocks.
 See [OpenShell Sandbox configuration](../../reference/drivers/openshell-sandbox.md#configuration).
 
 Create the Agent with the source as its Harness authentication:
@@ -149,7 +152,8 @@ Create the Agent with the source as its Harness authentication:
 ```bash
 jq -n --arg configuration "$CONFIGURATION_ID" --arg source "$SOURCE_ID" \
   '{name: "openshell-codex", configurationId: $configuration, executionMode: "dedicated",
-    harnessAuth: {method: "credential_source", sourceId: $source}}' > agent.json
+    harnessAuth: {method: "credential_source", sourceId: $source},
+    credentialSources: [{sourceId: $source}]}' > agent.json
 ./bin/occ agent create --file agent.json -o json > agent-response.json
 AGENT_ID="$(jq -r .id agent-response.json)"
 ```
@@ -171,13 +175,14 @@ jq -n --arg principal "$(jq -r .servicePrincipalId agent-response.json)" \
 ## Deploy and check the result
 
 ```bash
+./bin/occ agent runtime-credentials provision "$AGENT_ID"
 DEPLOYMENT_ID="$(./bin/occ agent deploy "$AGENT_ID" -o json | jq -r .id)"
 ./bin/occ agent deployment-status "$AGENT_ID" "$DEPLOYMENT_ID"
 ```
 
 Expected result: OCC accepts the deployment and freezes
-`{"method": "credential_source", "sourceId": "cs_…"}` in the revision. Compute
-starts the Agent Gateway, then OpenShell creates the Sandbox, and the revision
+`{"method": "credential_source", "sourceId": "cs_…"}` in the version. Compute
+starts the Agent Gateway, then OpenShell creates the Sandbox, and the version
 becomes active once the Harness workspace node connects to the Gateway. Startup
 can take several minutes. Without the access binding, the deploy request fails
 with `403`.
@@ -238,9 +243,9 @@ the profile instead.
   method. With a Credential Gateway selected, only `credential_source` is
   accepted.
 - **`credential-source delete` returns `409`:** an Agent draft, active
-  revision, or pending deployment still references the source. With
+  version, or pending deployment still references the source. With
   `CREDENTIAL_WITHDRAWAL_IN_PROGRESS`, only withdrawal work still retrying for
-  an earlier revision that held the source blocks it: wait up to about an hour,
+  an earlier version that held the source blocks it: wait up to about an hour,
   or delete the Agent.
 - **`iam role delete` returns `409`:** an access binding still uses the Role.
   Deleting the source removes its bindings; otherwise find the binding with

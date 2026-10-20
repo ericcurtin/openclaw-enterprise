@@ -204,9 +204,9 @@ async function launchBrowser(context, ingress) {
 
 async function login(page, origin, credentials, path) {
   await page.goto(new URL(path, origin).href);
-  await page.getByLabel("Username").fill(credentials.email);
+  await page.getByLabel("Email", { exact: true }).fill(credentials.email);
   await page.getByLabel("Password").fill(credentials.password);
-  await page.getByRole("button", { name: "Login" }).click();
+  await page.getByRole("button", { name: "Sign in" }).click();
   await page.waitForURL(/\/console\//);
 }
 
@@ -703,7 +703,7 @@ async function assertSharedNativeSessions(context, { topology, browser, ingress,
     // Configuration remains denied, but exact Agent administer must still launch
     // the regular native UI. A fixture URL must not stand in for the Console link.
     const popup = page.waitForEvent("popup");
-    await page.getByRole("link", { name: "Open native admin UI" }).click();
+    await page.getByRole("link", { name: "Open admin console" }).click();
     const nativePage = await popup;
     await completeNativeLaunch(nativePage, { nativeOrigin: status.origin });
     const terminalFrame = await submitChatTurnWithAssistantProof(
@@ -880,9 +880,13 @@ test(
     const page = await browserContext.newPage();
     await login(page, ingress.origin, topology.credentials, agentDetailPath(topology));
     await page.getByRole("heading", { name: topology.agent.name }).waitFor();
-    await page.getByText("Native admin access can change this gateway outside OCE.").waitFor();
+    await page
+      .getByText(
+        "Manage configuration in OCE. Changes in the admin console aren’t saved to Agent versions",
+      )
+      .waitFor();
     const popupPromise = page.waitForEvent("popup");
-    await page.getByRole("link", { name: "Open native admin UI" }).click();
+    await page.getByRole("link", { name: "Open admin console" }).click();
     const nativePage = await popupPromise;
     await completeNativeLaunch(nativePage, { nativeOrigin: status.origin });
 

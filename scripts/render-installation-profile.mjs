@@ -4,7 +4,7 @@ import dns from "node:dns/promises";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { isIP } from "node:net";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   isKubernetesNamespaceName,
@@ -478,6 +478,32 @@ function observabilityDestination(value) {
   return url !== undefined && ipv4HostKept(value, url);
 }
 
+// The controller image's top-level symlinks (root Dockerfile runtime stage, node:24-bookworm-slim):
+// Debian base-files links /var/run and /var/lock into /run, and merged /usr links the rest.
+const runtimeImageLinks = new Map([
+  ["/var/run", "/run"],
+  ["/var/lock", "/run/lock"],
+  ["/bin", "/usr/bin"],
+  ["/lib", "/usr/lib"],
+  ["/lib64", "/usr/lib64"],
+  ["/sbin", "/usr/sbin"],
+]);
+
+// Resolves a mount destination as the container runtime does inside that image: one component
+// at a time, following image symlinks (the chart's openclaw.runtimeMountDestination).
+function runtimeMountDestination(path) {
+  let resolved = "/";
+  for (const part of path.split("/")) {
+    if (part === "..") {
+      resolved = posix.dirname(resolved);
+    } else if (part !== "" && part !== ".") {
+      resolved = posix.join(resolved, part);
+      resolved = runtimeImageLinks.get(resolved) ?? resolved;
+    }
+  }
+  return resolved;
+}
+
 function validateDatabaseCaMount(values, diagnostics) {
   if (!values.database.caSecretName) {
     return;
@@ -504,7 +530,8 @@ function validateDatabaseCaMount(values, diagnostics) {
   if (values.backend?.chatgpt.enabled) {
     reserved.add("/etc/openclaw/chatgpt");
   }
-  if (reserved.has(values.database.caMountPath)) {
+  const destination = runtimeMountDestination(values.database.caMountPath);
+  if ([...reserved].some((path) => runtimeMountDestination(path) === destination)) {
     diagnostics.errors.push(
       "controlPlane.databaseCa.mountPath must be distinct from other active mounts in the production database clients.",
     );
@@ -1104,7 +1131,7 @@ function buildInput(rawInput, diagnostics) {
   closed(
     input,
     "input",
-    ["controlPlane", "runtime", "channels", "codex", "repository", "presets"],
+    ["controlPlane", "runtime", "channels", "codex", "repository", "publicGithubRead", "presets"],
     diagnostics,
   );
   const controlPlane = section(input, "controlPlane", diagnostics);
@@ -1112,6 +1139,13 @@ function buildInput(rawInput, diagnostics) {
   const channels = section(input, "channels", diagnostics, false);
   const codex = section(input, "codex", diagnostics, false);
   const repository = section(input, "repository", diagnostics, false);
+  const publicGithubRead = section(input, "publicGithubRead", diagnostics, false);
+  closed(
+    publicGithubRead,
+    "publicGithubRead",
+    ["enabled", "clusterIP", "upstreamCidrs"],
+    diagnostics,
+  );
   const presets = section(input, "presets", diagnostics, false);
   closed(presets, "presets", ["files"], diagnostics);
   closed(
@@ -1255,6 +1289,7 @@ function buildInput(rawInput, diagnostics) {
     channels,
     codex,
     repository,
+    publicGithubRead,
     dns,
     metrics,
     databaseCa,
@@ -1417,6 +1452,7 @@ function buildRendered(profile, parsed, diagnostics) {
     channels,
     codex,
     repository,
+    publicGithubRead,
     dns,
     metrics,
     databaseCa,
@@ -2082,6 +2118,44 @@ function buildRendered(profile, parsed, diagnostics) {
       },
       port: 8443,
     };
+  }
+
+  if (asBoolean(publicGithubRead, ["publicGithubRead", "enabled"], diagnostics)) {
+    if (profile.name !== "codex") {
+      diagnostics.errors.push("publicGithubRead requires the codex profile.");
+    }
+    const clusterIP = asString(publicGithubRead, ["publicGithubRead", "clusterIP"], diagnostics, {
+      validate: (value) => isIP(value) === 4,
+      description: "the reserved IPv4 Service ClusterIP",
+    });
+    const upstreamCidrs = stringArray(
+      publicGithubRead,
+      ["publicGithubRead", "upstreamCidrs"],
+      diagnostics,
+      { validate: isIpv4Cidr, description: "an approved IPv4 CIDR for api.github.com" },
+    );
+    values.publicGithubRead = { enabled: true, clusterIP, upstreamCidrs };
+    installation.drivers.compute.configuration.network.publicGithubRead = {
+      namespace,
+      address: clusterIP,
+      podLabels: {
+        "app.kubernetes.io/name": "openclaw-enterprise",
+        "app.kubernetes.io/instance": releaseName,
+        "app.kubernetes.io/component": "public-github-read",
+      },
+    };
+    diagnostics.prerequisites.push(
+      "Reserve the public GitHub reader ClusterIP until every AgentRevision that allows it has retired; enforce both NetworkPolicies.",
+    );
+    diagnostics.nextSteps.push(
+      "Select public reads in a dedicated Codex Agent Configuration or Preset: enable plugins.entries.codex.config.appServer.networkProxy and allow its exact Service IP " +
+        clusterIP +
+        " in domains, then deploy the Agent.",
+    );
+  } else if (Object.keys(publicGithubRead).some((key) => key !== "enabled")) {
+    diagnostics.errors.push(
+      "publicGithubRead fields are only consumed when publicGithubRead.enabled is true.",
+    );
   }
 
   dedicatedSecrets(values, releaseName, namespace, diagnostics);

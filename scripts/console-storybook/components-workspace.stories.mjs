@@ -8,6 +8,7 @@ export const WorkspaceUnavailable = {
   name: "No deployed revision",
 };
 export const WorkspaceDenied = { ...story("workspaceDenied"), name: "Access denied" };
+export const WorkspaceSaveDenied = { ...story("workspaceSaveDenied"), name: "Save denied" };
 export const WorkspaceMissing = { ...story("workspaceMissing"), name: "Missing file" };
 export const WorkspaceUnknown = { ...story("workspaceUnknown"), name: "Write outcome unknown" };
 
@@ -18,3 +19,15 @@ export const WorkspaceMissingReadback = {
   name: "Missing file after uncertain create",
 };
 export const WorkspaceCleanCRLF = story("workspaceCleanCRLF");
+export const WorkspaceVersionReread = {
+  ...story("workspaceVersionReread"),
+  name: "Reread after a version change",
+};
+export const WorkspaceVersionRereadUnconfirmed = {
+  ...story("workspaceVersionRereadUnconfirmed"),
+  name: "Reread cannot confirm a missing file",
+};
+export const WorkspaceVersionRereadFocused = {
+  ...story("workspaceVersionRereadFocused"),
+  name: "Reread keeps a focused editor's caret",
+};

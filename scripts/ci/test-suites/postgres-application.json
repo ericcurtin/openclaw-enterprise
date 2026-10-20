@@ -13,8 +13,9 @@
     "tests/integration/postgres-worker-agent-revision-refused-stop.test.mjs",
     "tests/integration/postgres-worker-agent-revision-credential-sources.test.mjs",
     "tests/integration/postgres-worker-agent-revision-health.test.mjs",
-    "tests/integration/postgres-worker-agent-revision-teardown.test.mjs",
     "tests/integration/postgres-native-iam-policy-barrier.test.mjs",
+    "tests/integration/postgres-worker-agent-revision-teardown.test.mjs",
+    "tests/integration/postgres-worker-harness-exposure.test.mjs",
     "tests/integration/auth-maintain.test.mjs",
     "tests/integration/occ-metrics.test.mjs"
   ],
@@ -121,13 +122,17 @@
     {
       "path": "tests/integration/postgres-worker-agent-revision-teardown.test.mjs",
       "expectedTests": [
+        "repository service outage during Agent stop still stops Compute and retains durable closing work",
         "worker restart resumes repository maintenance and repairs only Compute's exact missing subset once"
       ]
     },
     {
       "path": "tests/integration/postgres-worker-agent-revision-stop.test.mjs",
       "expectedTests": [
+        "deployment inventory survives retained completed repository cleanup and preserves deployment guards",
+        "Agent deletion completes with unresolved repository sessions retained as evidence",
         "Agent stop clears only the exact active pointer after Compute shutdown and retries safely",
+        "a stop admitted after the last running check waits for the claimed revision work, then stops the Agent",
         "Agent stop cleans a terminal candidate without an active revision",
         "Agent stop reauthorizes the recorded actor before Compute mutation",
         "Agent delete reauthorizes the recorded actor before Compute mutation",
@@ -142,6 +147,13 @@
         "auth:maintain requires an explicit writers-stopped claim for every change",
         "auth:maintain rejects undeclared commands before configuration",
         "stopped maintenance activates, repairs, resets, purges and returns to the legacy profile"
+      ]
+    },
+    {
+      "path": "tests/integration/postgres-worker-harness-exposure.test.mjs",
+      "expectedTests": [
+        "the worker withdraws native Harness exposures of revisions that get no preparation pass",
+        "a native candidate that fails for good has its Harness exposure withdrawn by the sweep"
       ]
     }
   ]

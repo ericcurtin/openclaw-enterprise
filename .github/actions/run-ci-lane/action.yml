@@ -73,7 +73,7 @@ runs:
         sudo apt-get -o Acquire::Retries=3 install --no-install-recommends -y skopeo
         skopeo --version | grep -Fx 'skopeo version 1.13.3'
     - name: Enable Kubernetes bridge packet filtering
-      if: inputs.lane == 'dev-up-k3d' || inputs.lane == 'qa-matrix' || startsWith(inputs.lane, 'k3d-fixture-') || startsWith(inputs.lane, 'k3d-observability')
+      if: inputs.lane == 'dev-up-k3d' || inputs.lane == 'qa-matrix' || inputs.lane == 'openshell' || startsWith(inputs.lane, 'k3d-fixture-') || startsWith(inputs.lane, 'k3d-observability')
       shell: bash
       run: |
         # k3d nodes share the runner kernel; K3s cannot load absent host modules.
@@ -165,6 +165,8 @@ runs:
     - name: Prepare lane
       shell: bash
       env:
+        # Image builds keep a few minutes of it for the lane's tests (prepare.mjs).
+        CI_RUNNER_DEADLINE_MS: ${{ steps.deadline.outputs.ms }}
         OCC_CI_IMAGE_CACHE: ${{ (inputs.lane == 'images-packaging' || inputs.lane == 'images-model-probes' || inputs.lane == 'images-runtime-startup' || inputs.lane == 'images-runtime-startup-2' || inputs.lane == 'images-runtime-startup-3' || inputs.lane == 'repository-credentials-platform') && '1' || '' }}
         ACTIONS_RUNTIME_TOKEN: ${{ steps.image-cache.outputs.token }}
         ACTIONS_RESULTS_URL: ${{ steps.image-cache.outputs.url }}

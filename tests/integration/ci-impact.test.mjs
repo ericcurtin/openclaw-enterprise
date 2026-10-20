@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -13,10 +14,18 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { availableParallelism, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import test from "node:test";
+import test, { after } from "node:test";
+import { runInNewContext } from "node:vm";
+import {
+  captureChild,
+  concurrencyLimit,
+  eachSettled as all,
+  settled,
+} from "../helpers/child-processes.mjs";
+import { expectedFullLanes, passingGateNeeds } from "../helpers/ci-expected-coverage.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const selector = join(repositoryRoot, "scripts/ci/impact.mjs");
@@ -59,54 +68,14 @@ const reasons = [
 
 // Every case spawns Git, the selector or a workflow script, so independent
 // processes run concurrently, about one per CPU (each spawns more of its own).
-const slots = { free: Math.max(2, availableParallelism()), waiting: [] };
-async function run(program, args, { encoding = "utf8", ...options } = {}) {
-  if (slots.free > 0) {
-    slots.free -= 1;
-  } else {
-    await new Promise((resolve) => slots.waiting.push(resolve));
-  }
-  try {
-    return await new Promise((resolve, reject) => {
-      const child = spawn(program, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
-      const stdout = [];
-      const stderr = [];
-      child.stdout.on("data", (chunk) => stdout.push(chunk));
-      child.stderr.on("data", (chunk) => stderr.push(chunk));
-      child.on("error", reject);
-      child.on("close", (status) => {
-        const text = (chunks) =>
-          encoding === null ? Buffer.concat(chunks) : Buffer.concat(chunks).toString(encoding);
-        resolve({ status, stdout: text(stdout), stderr: text(stderr) });
-      });
-    });
-  } finally {
-    const next = slots.waiting.shift();
-    if (next) {
-      next();
-    } else {
-      slots.free += 1;
-    }
-  }
-}
+const limit = concurrencyLimit();
+const run = (program, args, options) => limit(() => captureChild(program, args, options));
 
 async function command(cwd, program, args) {
   const result = await run(program, args, { cwd });
   assert.equal(result.status, 0, `${program} ${args.join(" ")}: ${result.stderr}`);
   return result.stdout.trim();
 }
-
-// Like Promise.all, but waits for every check so no process outlives its
-// test's temporary directories, then rethrows the first failure.
-async function settled(promises) {
-  const results = await Promise.allSettled(promises);
-  const failed = results.find((result) => result.status === "rejected");
-  if (failed) {
-    throw failed.reason;
-  }
-  return results.map((result) => result.value);
-}
-const all = (items, each) => settled(items.map(each));
 
 function tempDir(t, prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -127,13 +96,7 @@ const pr = (base, head) => ({ pull_request: { base: { sha: base }, head: { sha: 
 const untrustedSelector = (marker, output) =>
   `import { writeFileSync, appendFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'ran');\nappendFileSync(process.argv[3], '${output}');\n`;
 
-// `moveMain`, when given, commits to the base branch after the pull request
-// branched, then merges onto that newer base. The event keeps the older
-// base.sha, as GitHub's pull_request payload does when main moves after a push.
-async function fixture(t, change, initial = {}, initialModes = {}, { moveMain } = {}) {
-  const dir = tempDir(t, "ci-impact-");
-  const repo = join(dir, "repo");
-  mkdirSync(repo);
+function repository(repo) {
   const git = (...args) => command(repo, "git", args);
   const put = (path, content = "text\n") => {
     mkdirSync(dirname(join(repo, path)), { recursive: true });
@@ -144,6 +107,29 @@ async function fixture(t, change, initial = {}, initialModes = {}, { moveMain } 
     await git("commit", "-qm", message, ...flags);
     return git("rev-parse", "HEAD");
   };
+  return { git, put, commit };
+}
+
+// A repository holding only the base commit. Fixtures with the same initial
+// files and modes copy one built per file instead of each committing it again.
+const baseRepositories = new Map();
+const baseRoot = mkdtempSync(join(tmpdir(), "ci-impact-bases-"));
+after(() => rmSync(baseRoot, { recursive: true, force: true }));
+function baseRepository(initial, initialModes) {
+  const key = JSON.stringify([initial, initialModes]);
+  if (!baseRepositories.has(key)) {
+    const repo = join(baseRoot, String(baseRepositories.size));
+    mkdirSync(repo);
+    baseRepositories.set(
+      key,
+      initBase(repo, initial, initialModes).then((base) => ({ repo, base })),
+    );
+  }
+  return baseRepositories.get(key);
+}
+
+async function initBase(repo, initial, initialModes) {
+  const { git, put, commit } = repository(repo);
   await git("init", "-q");
   // Commit and merge otherwise start `git maintenance run --auto --detach`,
   // which outlives them and can rewrite .git/objects under the test and
@@ -160,16 +146,30 @@ async function fixture(t, change, initial = {}, initialModes = {}, { moveMain } 
   for (const [path, mode] of Object.entries(initialModes)) {
     chmodSync(join(repo, path), mode);
   }
-  const base = await commit("base");
+  return commit("base");
+}
+
+// `moveMain`, when given, commits to the base branch after the pull request
+// branched, then merges onto that newer base. The event keeps the older
+// base.sha, as GitHub's pull_request payload does when main moves after a push.
+async function fixture(t, change, initial = {}, initialModes = {}, { moveMain } = {}) {
+  const dir = tempDir(t, "ci-impact-");
+  const repo = join(dir, "repo");
+  const template = await baseRepository(initial, initialModes);
+  // The copy's index keeps the template's stat data; Git re-hashes a file whose
+  // stat data differs, so status and diff still see the committed content.
+  cpSync(template.repo, repo, { recursive: true, verbatimSymlinks: true });
+  const { git, put, commit } = repository(repo);
+  const { base } = template;
   await git("checkout", "-qb", "feature");
   await change({ repo, put, git });
   const head = await commit("change", "--allow-empty");
   await git("checkout", "-q", "--detach", base);
+  let mergeBase = base;
   if (moveMain) {
     await moveMain({ repo, put, git });
-    await commit("main moved");
+    mergeBase = await commit("main moved");
   }
-  const mergeBase = await git("rev-parse", "HEAD");
   await git("merge", "--no-ff", "-qm", "merge", head);
   const tested = await git("rev-parse", "HEAD");
   const eventPath = join(dir, "event.json");
@@ -200,7 +200,8 @@ async function fixture(t, change, initial = {}, initialModes = {}, { moveMain } 
     assert.equal(selected.status, 0, selected.stderr);
     return readFileSync(path, "utf8");
   };
-  f.expect = async (mode, overrides = {}) => {
+  // `reason`, when given, is the exact reason the selection must report.
+  f.expect = async (mode, overrides = {}, reason = reasons) => {
     const path = output("prior=value\n");
     const lanes = JSON.stringify(["checks-baseline-1"]);
     const [selected, same, other, tests] = await settled([
@@ -212,7 +213,7 @@ async function fixture(t, change, initial = {}, initialModes = {}, { moveMain } 
     assert.equal(selected.status, 0, selected.stderr);
     assert.match(
       readFileSync(path, "utf8"),
-      new RegExp(`^prior=value\nmode=${mode}\nreason=(?:${reasons})\n$`),
+      new RegExp(`^prior=value\nmode=${mode}\nreason=(?:${reason})\n$`),
       selected.stdout,
     );
     assert.equal(same.status, 0);
@@ -775,7 +776,8 @@ async function shallowBootstrap(f) {
     assert.equal(selected.status, 0, selected.stderr);
     return selected.output;
   };
-  shallow.expect = async (mode, overrides = {}) => {
+  // `reason`, when given, is the exact reason the selection must report.
+  shallow.expect = async (mode, overrides = {}, reason) => {
     const lanes = { EXPECTED_LANES: JSON.stringify(["checks-baseline-1"]), ...overrides };
     const [selected, same, other, tests] = await settled([
       shallow.run("select", "", overrides),
@@ -786,7 +788,11 @@ async function shallowBootstrap(f) {
     assert.equal(selected.status, 0, selected.stderr);
     assert.match(
       selected.output,
-      new RegExp(`^mode=${mode}\n(?:reason=(?:${reasons})\n)?$`),
+      new RegExp(
+        reason === undefined
+          ? `^mode=${mode}\n(?:reason=(?:${reasons})\n)?$`
+          : `^mode=${mode}\nreason=${reason}\n$`,
+      ),
       selected.stdout,
     );
     assert.equal(same.status, 0);
@@ -896,9 +902,7 @@ test("a documentation-only pull request stays documentation-only after main move
     cwd: shallow.checkout,
   });
   assert.notEqual(stale.status, 0);
-  await settled([f.expect("docs"), shallow.expect("docs")]);
-  assert.equal(await f.select(), "mode=docs\nreason=docs_only\n");
-  assert.equal(await shallow.select(), "mode=docs\nreason=docs_only\n");
+  await settled([f.expect("docs", {}, "docs_only"), shallow.expect("docs", {}, "docs_only")]);
 });
 
 test("a non-documentation change still selects full after main moves", async (t) => {
@@ -925,9 +929,10 @@ test("a non-documentation change still selects full after main moves", async (t)
         return shallow.expect("full");
       }
       assert.notEqual(f.base, f.mergeBase);
-      await settled([f.expect("full"), shallow.expect("full")]);
-      assert.equal(await f.select(), "mode=full\nreason=ineligible_change\n");
-      assert.equal(await shallow.select(), "mode=full\nreason=ineligible_change\n");
+      await settled([
+        f.expect("full", {}, "ineligible_change"),
+        shallow.expect("full", {}, "ineligible_change"),
+      ]);
     },
   );
   assert.equal(existsSync(marker), false);
@@ -967,8 +972,7 @@ test("an event base that is present but not behind the tested base selects full"
   const shallow = await shallowBootstrap(f);
   for (const base of [side, f.head]) {
     f.writeEvent(pr(base, f.head));
-    await f.expect("full");
-    assert.equal(await f.select(), "mode=full\nreason=checkout_mismatch\n");
+    await f.expect("full", {}, "checkout_mismatch");
   }
   // A depth-two checkout lacks the side commit, so it is ignored like any
   // stale base: the ancestor rule can only add full selections there.
@@ -976,8 +980,7 @@ test("an event base that is present but not behind the tested base selects full"
   await shallow.expect("docs");
   // The pull request head is in the shallow checkout and is not an ancestor.
   f.writeEvent(pr(f.head, f.head));
-  await shallow.expect("full");
-  assert.equal(await shallow.select(), "mode=full\nreason=bootstrap_checkout_mismatch\n");
+  await shallow.expect("full", {}, "bootstrap_checkout_mismatch");
   // A head that is not the tested merge's second parent still selects full.
   f.writeEvent(pr(f.base, f.mergeBase));
   await settled([f.expect("full"), shallow.expect("full")]);
@@ -1101,6 +1104,31 @@ test("full-integration lanes read NODE_BASE_IMAGE from a variable their environm
   }
 });
 
+test("full-integration runs kernel- and sandbox-sensitive same-SHA lanes on ci.yml's runner", () => {
+  // Hosted ubuntu-24.04 refuses Chromium's sandbox, which PostgreSQL Authentication's
+  // sign-in cases turn on (finding 1383), and the k3d lanes need a kernel that enforces
+  // NetworkPolicy. These lanes must run where ci.yml runs them.
+  const job = loadYaml(".github/workflows/full-integration.yml").jobs["pr-safe-same-sha"];
+  const expression = job["runs-on"].replace(/^\$\{\{\s*|\s*\}\}$/g, "");
+  const runnerFor = (lane) =>
+    runInNewContext(expression, {
+      matrix: { lane },
+      startsWith: (value, prefix) => value.startsWith(prefix),
+    });
+  const ciRunners = new Map(laneTable().map((row) => [row.lane, row.runner]));
+  const lanes = job.strategy.matrix.include.map((entry) => entry.lane);
+  const pinned = lanes.filter(
+    (lane) =>
+      lane === "postgres-auth" || lane.startsWith("k3d-fixture-") || lane === "k3d-observability",
+  );
+  for (const lane of ["postgres-auth", "k3d-observability"]) {
+    assert.ok(pinned.includes(lane), lane);
+  }
+  for (const lane of pinned) {
+    assert.equal(runnerFor(lane), ciRunners.get(lane), lane);
+  }
+});
+
 test("Static Checks runs every check the CI lanes skip", () => {
   const workflow = loadYaml(".github/workflows/ci.yml");
   const action = loadYaml(".github/actions/run-ci-lane/action.yml");
@@ -1188,6 +1216,9 @@ test("every lane job stops its test files before its own timeout", (t) => {
   assert.equal(deadline.id, "deadline", "the deadline counts the lane's setup too");
   const runLane = action.runs.steps.find((step) => step.name === "Run lane");
   assert.equal(runLane.env.CI_RUNNER_DEADLINE_MS, "${{ steps.deadline.outputs.ms }}");
+  // Lane image builds keep part of the same time for the tests (finding 2103).
+  const prepareLane = action.runs.steps.find((step) => step.name === "Prepare lane");
+  assert.equal(prepareLane.env.CI_RUNNER_DEADLINE_MS, "${{ steps.deadline.outputs.ms }}");
 
   const callers = [];
   for (const name of readdirSync(join(repositoryRoot, ".github/workflows"))) {
@@ -1308,48 +1339,23 @@ const hasIssue = (result, code, lane) =>
   );
 
 test("workflow selection flows through the gate and full-mode source-bound aggregate", async (t) => {
-  const lanes = [
-    "checks-baseline-1",
-    "checks-baseline-2",
-    "checks-browser",
-    "checks-browser-2",
-    "postgres",
-    "postgres-application",
-    "postgres-auth",
-    "postgres-platform",
-    "images-packaging",
-    "images-model-probes",
-    "images-runtime-startup",
-    "images-runtime-startup-2",
-    "images-runtime-startup-3",
-    "runtime-image-fixture",
-    "k3d-fixture-configuration",
-    "k3d-fixture-state",
-    "k3d-fixture-plugins",
-    "k3d-fixture-oauth",
-    "k3d-observability",
-    "logging-collector",
-    "repository-credentials-container",
-    "repository-credentials-platform",
-    "keycloak-oidc",
-  ];
   // A declared lane must actually have a runner in both full-coverage paths.
   // This catches a manifest/gate update that accidentally omits a new matrix job.
   const matrixLanes = (source) =>
     [...source.matchAll(/- lane: ([a-z0-9-]+)/g)].map((match) => match[1]);
   const suiteIndex = JSON.parse(read("scripts/ci/test-suites.json"));
-  assert.deepEqual([...suiteIndex.groups.ci].sort(), [...lanes].sort());
+  assert.deepEqual([...suiteIndex.groups.ci].sort(), [...expectedFullLanes].sort());
   assert.deepEqual(matrixLanes(ciWorkflow), []);
   assert.deepEqual(
     ["runtime-image-fixture", ...laneTable().map((row) => row.lane)].sort(),
-    [...lanes].sort(),
+    [...expectedFullLanes].sort(),
   );
   assert.deepEqual(
     [
       "runtime-image-fixture",
       ...matrixLanes(read(".github/workflows/full-integration.yml")),
     ].sort(),
-    [...lanes, "k3d-observability-demo"].sort(),
+    [...expectedFullLanes, "k3d-observability-demo"].sort(),
   );
   await all(["docs", "full"], async (expected) => {
     const [f, bootstrap] = await policyFixture(t, ({ put }) => {
@@ -1366,19 +1372,13 @@ test("workflow selection flows through the gate and full-mode source-bound aggre
     assert.equal((await bootstrap.run("verify", mode)).status, 0);
 
     const root = bootstrap.checkout;
-    const needs = {
-      impact: { result: "success", outputs: { mode } },
-      audit: { result: "success", outputs: {} },
-      "static-checks": { result: "success", outputs: {} },
-      "pr-safe": { result: mode === "docs" ? "skipped" : "success", outputs: {} },
-      "runtime-image-fixture": { result: mode === "docs" ? "skipped" : "success", outputs: {} },
-    };
+    const needs = passingGateNeeds(mode);
     const gateResult = await runGate(root, needs, mode);
     assert.equal(gateResult.status, 0, gateResult.stderr);
     const selectedNeeds = JSON.parse(readFileSync(join(root, "needs.json"), "utf8"));
     if (mode === "docs") {
       // An omitted product lane must not be represented by a successful receipt.
-      for (const lane of lanes) {
+      for (const lane of expectedFullLanes) {
         assert.notEqual(selectedNeeds[lane]?.result, "success", lane);
       }
       needs["static-checks"].result = "failure";
@@ -1390,8 +1390,11 @@ test("workflow selection flows through the gate and full-mode source-bound aggre
     }
     // Three synthetic lanes cover cross-lane aggregation and failures.
     // The inventory checks above still require every production CI lane.
-    assert.deepEqual(Object.keys(selectedNeeds).sort(), ["impact", "audit", ...lanes].sort());
-    for (const lane of lanes) {
+    assert.deepEqual(
+      Object.keys(selectedNeeds).sort(),
+      ["impact", "audit", ...expectedFullLanes].sort(),
+    );
+    for (const lane of expectedFullLanes) {
       assert.equal(selectedNeeds[lane].result, "success", lane);
     }
     const fixtureLanes = ["checks-baseline-1", "checks-baseline-2", "postgres"];
@@ -1680,8 +1683,7 @@ test("real Git empty, type-change and non-UTF-8 diffs have accurate conservative
       const raw = await rawDiff(f);
       assert.equal(raw.status, 0);
       checkRaw(raw.stdout);
-      assert.equal(await f.select(), `mode=full\nreason=${reason}\n`);
-      await f.expect("full");
+      await f.expect("full", {}, reason);
       await assertFullSummary(t, reason, /SECRET|type\.md/);
     },
   );
@@ -1906,8 +1908,11 @@ test("helper, fixture and other test-tree changes select full", async (t) => {
         t,
         postgresEdit(({ put }) => put(path, "// changed\n")),
       );
-      await settled([f.expect("full"), shallow.expect("full")]);
-      assert.equal(await shallow.select(), "mode=full\nreason=ineligible_change\n", path);
+      await settled([f.expect("full"), shallow.expect("full", {}, "ineligible_change")]).catch(
+        (error) => {
+          throw new Error(`${path}: ${error.message}`, { cause: error });
+        },
+      );
     },
   );
 });
@@ -2050,14 +2055,12 @@ test("the pull request's own selector never decides test-only mode", async (t) =
     ],
     async ([change, initial]) => shallowBootstrap(await fixture(t, change, initial)),
   );
-  await shallow.expect("full");
-  assert.equal(await shallow.select(), "mode=full\nreason=ineligible_change\n");
+  await shallow.expect("full", {}, "ineligible_change");
   // Checked before the legacy base policy below runs, since it writes the same marker.
   assert.equal(existsSync(marker), false);
   const verify = await legacy.run("verify", "tests", { EXPECTED_LANES: '["checks-baseline-1"]' });
   assert.notEqual(verify.status, 0);
-  await fallback.expect("full");
-  assert.equal(await fallback.select(), "mode=full\nreason=bootstrap_policy_unavailable\n");
+  await fallback.expect("full", {}, "bootstrap_policy_unavailable");
 });
 
 test("test-only selection is limited to pull request events", async (t) => {

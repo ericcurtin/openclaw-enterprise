@@ -15,6 +15,29 @@ then follow the [upgrade checklist](upgrade-checklist.md) and
 Entries are newest first. Steps marked _untested_ have not been run against a
 real Installation.
 
+## 2026-10-16: stored model provider settings are checked at deploy
+
+**What breaks.** On every Compute, deploying or redeploying an Agent runs the
+Configuration save's model provider rules on the stored Configuration. A
+Configuration an older build stored with a provider or model `baseUrl` that is
+not an absolute `http` or `https` URL (`ftp://models.example/v1`, `/v1`,
+`https:/v1`), an `api` the runtime does not support, or a header name that is
+not a valid HTTP field name used to deploy, and then failed at the model probe
+or not at all. Deployment now answers `400` and creates no version, even for a
+provider the Agent does not use. A provisioning attempt queued before the
+upgrade is rejected without retry.
+
+**Who is affected.** Agents whose stored Configuration holds such a value.
+Header names were already checked at deploy on Kubernetes Compute.
+
+**How to tell.** The deploy `400` carries the save's message, such as
+`Configuration field /models/providers/<provider>/baseUrl must be an absolute http or https URL.`
+or `... must name a model API the runtime supports, ...`. A rejected queued
+attempt records `PROVISIONING_REJECTED` with the same message.
+
+**Steps.** Edit the Configuration: fix or remove the field the message names,
+save, and deploy again.
+
 ## 2026-10-14: OAuth2 token_url hosts must be DNS names
 
 **What breaks.** Creating an OpenShell `oauth2-client-credentials` or
@@ -82,19 +105,21 @@ against the CLI and the list response shape, not a live Installation.
 4. Delete the old source. That also stops the gateway refreshing its token
    against the old URL.
 
-## 2026-10-14: Preset and revision lists return summaries; revisions page
+<span id="2026-10-14-preset-and-revision-lists-return-summaries-revisions-page" class="anchor-alias"></span>
+
+## 2026-10-14: Preset and Agent revision lists return summaries and use pages
 
 **What breaks.** `GET .../presets` items carry only `id`, `namespaceId`, `name`
 and `createdAt`, without `template`. `GET .../agents/{agentId}/revisions` items
 carry identity, `configurationId`, `configurationGeneration`, `harness` and
-`createdAt`, without the saved settings or `configurationReadError`. Revisions
+`createdAt`, without the saved settings or `configurationReadError`. Versions
 list newest first, 50 to a page (`limit` up to 100), and `meta.nextCursor`
 names the next page.
 
 **Who is affected.** API clients and scripts (including
 `occ preset list -o json`) that read templates or saved settings from these
-lists, or expect every revision in one response. Operators who run `occ agent revisions` with an `occ`
-built before this change: it exits `0` but prints only the newest 50 revisions,
+lists, or expect every version in one response. Operators who run `occ agent revisions` with an `occ`
+built before this change: it exits `0` but prints only the newest 50 versions,
 with no hint that older ones exist.
 
 **How to tell.** List items lack `template` or `configuration`, and
@@ -102,11 +127,11 @@ with no hint that older ones exist.
 `--cursor` flag, and a full page ends without the `older revisions may exist`
 notice.
 
-**Steps.** Read one Preset or revision by ID for its document
+**Steps.** Read one Preset or version by ID for its document
 (`occ preset get ID -o json`). Pass `meta.nextCursor` back as `cursor` until it is `null`.
 Upgrade `occ` to the release your controller runs
 ([CLI setup](../cli.md#connect-to-your-installation)), then pass the
-`--cursor` each full page prints to read older revisions.
+`--cursor` each full page prints to read older versions.
 
 ## 2026-10-14: every model selection must use the Harness provider
 
@@ -228,6 +253,24 @@ decimal octets`.
 
 **Steps.** Write those four octets, then start again.
 
+## 2026-10-14: gateway hostnames must not be rewritten IPv4
+
+**What breaks.** Helm and Compute refuse rewritten or URL-parser-invalid IPv4 in
+`gatewayRouting.hostname` and harness `routing.hostname`. Sandbox suffix
+`gatewayRouting.sandbox.domain` also refuses canonical IPv4: an Agent label
+cannot precede an address. Nonfinal hex labels remain accepted.
+
+**Who is affected.** Helm values or Installation YAML using those spellings.
+
+**How to tell.** Diagnostics name the invalid field and suggest its correction.
+
+**Steps.** Use a DNS name resolving to the Gateway that its certificate covers;
+the `openclaw-enterprise` chart requests a DNS SAN, not an IP SAN. For harness
+`routing.hostname`, use a name covered by the operator's `routing.tlsSecretName`
+certificate. Use a DNS suffix such as
+`previews.example.test` for sandbox. Correct Helm/Installation values, then upgrade.
+_untested_ against a live Installation.
+
 ## 2026-10-13: image repository paths must be lowercase; no @ before URL hosts
 
 **What breaks.** Profile preflight refuses an uppercase letter in the repository
@@ -280,44 +323,3 @@ or `Channel proxy URL host must not be an unspecified or IPv4-mapped IPv6 addres
 **Steps.** Write the proxy's own address, an IPv4 host as four decimal octets
 (`127.0.0.1` for `0177.0.0.1`, `10.42.0.15` for `[::ffff:10.42.0.15]`), and
 restart.
-
-## 2026-10-13: shorthand observability IPv4 hosts are refused
-
-**What breaks.** An observability URL whose IPv4 host is not four decimal
-octets from 0 to 255, with no leading zeros, is refused. Shorthand, hex, a
-single integer, and leading zeros used to be stored as a different address
-(`192.168.1` became `192.168.0.1`; `2130706433` became `127.0.0.1`).
-
-**Who is affected.** Profiles with `controlPlane.observabilityUrl`, and
-Installations whose startup `observability.url` uses one of those spellings.
-A canonical host such as `192.168.1.1`, and any DNS name, still loads.
-
-**How to tell.** The profile reports `controlPlane.observabilityUrl IPv4 host
-must be four decimal octets from 0 to 255 with no leading zeros; other
-spellings parse as a different address.` API and worker startup log
-`OBSERVABILITY_URL_INVALID`.
-
-**Steps.** Write the four decimal octets you mean, then render or restart.
-
-## 2026-10-13: IP database hosts are verified against the certificate
-
-**What breaks.** A PostgreSQL URL whose host is an IP literal and whose TLS
-mode verifies the server (`sslmode=verify-full`; without `uselibpqcompat=true`
-also `prefer`, `require` and `verify-ca`; or `PGSSLMODE` set to one of those)
-now requires the server certificate to list that IP as an IP subjectAltName, as
-libpq does. Before, the check ran against the name `localhost`, so any
-certificate for `localhost` signed by the database CA was accepted.
-
-**Who is affected.** Installations that reach PostgreSQL by IP with a
-certificate issued only for DNS names. DNS hosts, Unix sockets,
-`sslmode=disable`, `no-verify`, and libpq-compatible `prefer`, `require` and
-`verify-ca` are unchanged.
-
-**How to tell.** The API logs `startup-error` and the worker logs
-`worker.startup-error`, both with code `DATABASE_TLS_CERTIFICATE_INVALID` and
-reason `ERR_TLS_CERT_ALTNAME_INVALID`. Bootstrap logs `PERSISTENCE_UNAVAILABLE`
-and the migrator `MIGRATION_FAILED`.
-
-**Steps.** Reissue the server certificate with `IP:<address>` in its
-subjectAltName, or connect by a DNS name the certificate carries, then restart
-the API and worker.

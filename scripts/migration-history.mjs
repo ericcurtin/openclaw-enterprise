@@ -175,8 +175,26 @@ function classifyReceipts(receipts, manifest) {
       if (receipts.length === 51) {
         return "preProvisioningDeploymentOutcome";
       }
+      if (receipts.length === 58) {
+        return "preSandboxPolicyAdministrator";
+      }
+      if (receipts.length === 57) {
+        return "preSandboxPolicies";
+      }
       if (receipts.length === 52) {
         return "preComputePreparationFailureEvidence";
+      }
+      if (receipts.length === 53) {
+        return "preCredentialSourcePat";
+      }
+      if (receipts.length === 54) {
+        return "preComputeRevisionAdmission";
+      }
+      if (receipts.length === 55) {
+        return "preHeldAuthenticationSession";
+      }
+      if (receipts.length === 56) {
+        return "preCanonicalHarnessAuth";
       }
       return "providerCompleted";
     }
@@ -185,6 +203,12 @@ function classifyReceipts(receipts, manifest) {
     }
   } else {
     requireReceiptsMatchEntries(receipts, manifest.entries);
+  }
+  if (receipts.length === 58) {
+    return "preSandboxPolicyAdministrator";
+  }
+  if (receipts.length === 57) {
+    return "preSandboxPolicies";
   }
   if (receipts.length === 0) {
     return "empty";
@@ -275,6 +299,18 @@ function classifyReceipts(receipts, manifest) {
   }
   if (receipts.length === 52) {
     return "preComputePreparationFailureEvidence";
+  }
+  if (receipts.length === 53) {
+    return "preCredentialSourcePat";
+  }
+  if (receipts.length === 54) {
+    return "preComputeRevisionAdmission";
+  }
+  if (receipts.length === 55) {
+    return "preHeldAuthenticationSession";
+  }
+  if (receipts.length === 56) {
+    return "preCanonicalHarnessAuth";
   }
   refuse("an incomplete or unsupported development history is installed");
 }

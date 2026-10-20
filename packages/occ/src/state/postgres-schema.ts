@@ -262,6 +262,7 @@ export const agents = occSchema.table(
     configurationId: text("configuration_id").notNull(),
     backendId: text("backend_id"),
     executionMode: text("execution_mode").$type<HarnessExecutionMode>().notNull(),
+    sandboxPolicyEditing: boolean("sandbox_policy_editing").notNull().default(false),
     plugins: jsonb("plugins").$type<PluginDesiredState>(),
     pluginApprovers: jsonb("plugin_approvers").$type<PluginApprovers>(),
     repositoryBindings: jsonb("repository_bindings").$type<readonly RepositoryBindingSelection[]>(),
@@ -662,7 +663,7 @@ export const agentRevisions = occSchema.table(
         ])
         AND (${table.admittedSpec}
           - 'configuration_id' - 'configuration_kind' - 'configuration_generation'
-          - 'draft_spec' - 'harness' - 'compute' - 'sandbox_driver_id'
+          - 'draft_spec' - 'harness' - 'compute' - 'sandbox_driver_id' - 'sandbox_policy'
           - 'secret_driver_id' - 'secret_bindings' - 'harness_auth' - 'credential_sources' - 'plugins'
           - 'repository_credentials') = '{}'::jsonb
         AND jsonb_typeof(${table.admittedSpec}->'configuration_id') = 'string'
@@ -685,11 +686,17 @@ export const agentRevisions = occSchema.table(
         AND (${table.admittedSpec} #>> '{harness,mode}') IN ('embedded', 'dedicated')
         AND jsonb_typeof(${table.admittedSpec}->'compute') = 'object'
         AND ((${table.admittedSpec}->'compute') ?& ARRAY['id', 'implementation'])
-        AND ((${table.admittedSpec}->'compute') - 'id' - 'implementation') = '{}'::jsonb
+        AND ((${table.admittedSpec}->'compute') - 'id' - 'implementation' - 'admission') = '{}'::jsonb
         AND jsonb_typeof(${table.admittedSpec} #> '{compute,id}') = 'string'
         AND COALESCE(btrim(${table.admittedSpec} #>> '{compute,id}'), '') <> ''
         AND jsonb_typeof(${table.admittedSpec} #> '{compute,implementation}') = 'string'
         AND COALESCE(btrim(${table.admittedSpec} #>> '{compute,implementation}'), '') <> ''
+        AND (
+          NOT ((${table.admittedSpec}->'compute') ? 'admission')
+          OR (jsonb_typeof(${table.admittedSpec} #> '{compute,admission}') = 'string'
+              AND char_length(${table.admittedSpec} #>> '{compute,admission}') BETWEEN 1 AND 1024
+              AND (${table.admittedSpec} #>> '{compute,admission}') ~ '^[ -~]+$')
+        )
         AND (
           NOT (${table.admittedSpec} ? 'sandbox_driver_id')
           OR (
@@ -997,11 +1004,11 @@ export const iamRestrictions = occSchema.table(
   (table) => [
     check(
       "iam_restrictions_action_valid",
-      sql`${table.action} IN ('create', 'read', 'update', 'delete', 'deploy', 'operate', 'administer', 'read_logs')`,
+      sql`${table.action} IN ('create', 'read', 'update', 'delete', 'deploy', 'operate', 'administer', 'read_logs', 'manage_policy')`,
     ),
     check(
       "iam_restrictions_resource_kind_valid",
-      sql`${table.resourceKind} IN ('installation', 'namespace', 'configuration', 'preset', 'service_account', 'secret', 'credential_source', 'agent', 'agent_revision')`,
+      sql`${table.resourceKind} IN ('installation', 'namespace', 'configuration', 'preset', 'service_account', 'secret', 'credential_source', 'sandbox_policy', 'agent', 'agent_revision')`,
     ),
     check("iam_restrictions_effect_deny", sql`${table.effect} = 'deny'`),
     check(
@@ -1105,7 +1112,7 @@ export const controllerWork = occSchema.table(
         OR (${table.workKind} = 'lifecycle' AND ${table.agentId} IS NOT NULL AND ${table.revisionId} IS NULL
           AND ${table.namespaceTarget} IS NULL
           AND ${table.agentTarget} IS NOT NULL
-          AND ${table.agentTarget} IN ('stopped', 'deleted'))
+          AND ${table.agentTarget} IN ('stopped', 'deleted', 'sandbox_policy'))
         OR (${table.workKind} = 'lifecycle' AND ${table.agentId} IS NOT NULL AND ${table.revisionId} IS NOT NULL
           AND ${table.namespaceTarget} IS NULL
           AND (${table.agentTarget} IS NULL OR ${table.agentTarget} = 'credentials_withdrawn'))
@@ -1579,5 +1586,32 @@ export const apikey = occSchema.table(
   (table) => [
     index("apikey_config_id_idx").on(table.configId),
     index("apikey_reference_id_idx").on(table.referenceId),
+  ],
+);
+
+export const sandboxPolicies = occSchema.table(
+  "sandbox_policies",
+  {
+    id: text("id").primaryKey(),
+    namespaceId: text("namespace_id").notNull(),
+    agentId: text("agent_id").notNull(),
+    version: integer("version").notNull(),
+    document: jsonb("document")
+      .$type<import("@openclaw-enterprise/contracts").SandboxPolicy>()
+      .notNull(),
+  },
+  (table) => [
+    unique("sandbox_policies_agent_unique").on(table.namespaceId, table.agentId),
+    foreignKey({
+      name: "sandbox_policies_agent_owner",
+      columns: [table.namespaceId, table.agentId],
+      foreignColumns: [agents.namespaceId, agents.id],
+    })
+      .onDelete("cascade")
+      .onUpdate("restrict"),
+    check(
+      "sandbox_policies_document_valid",
+      sql`occ.sandbox_policy_is_valid(${table.document}, ${table.id}, ${table.namespaceId}, ${table.agentId}, ${table.version})`,
+    ),
   ],
 );

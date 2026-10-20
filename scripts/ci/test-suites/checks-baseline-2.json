@@ -24,6 +24,7 @@
     "tests/integration/password-sign-in-audit.test.mjs",
     "tests/integration/ci-impact-gate.test.mjs",
     "tests/integration/workspace-setup-api.test.mjs",
+    "tests/integration/agent-create-validate-api.test.mjs",
     "tests/integration/repository-credentials-service-loss.test.mjs",
     "tests/integration/ci-runner.test.mjs",
     "tests/integration/k3d-launcher.test.mjs",
@@ -42,6 +43,7 @@
     "tests/conformance/repository-runtime-material.test.mjs",
     "tests/integration/repository-credentials-server-timeout.test.mjs",
     "tests/integration/repository-credentials-http.test.mjs",
+    "tests/integration/public-github-read-http.test.mjs",
     "tests/conformance/repository-credentials-fixture-ownership.test.mjs",
     "tests/integration/repository-credentials-projected-inputs.test.mjs",
     "tests/integration/ci-image-pull.test.mjs",
@@ -299,6 +301,9 @@
       "path": "tests/integration/workspace-setup-api.test.mjs"
     },
     {
+      "path": "tests/integration/agent-create-validate-api.test.mjs"
+    },
+    {
       "path": "tests/conformance/repository-credentials-source-boundary.test.mjs"
     },
     {
@@ -344,6 +349,9 @@
     },
     {
       "path": "tests/integration/repository-credentials-http.test.mjs"
+    },
+    {
+      "path": "tests/integration/public-github-read-http.test.mjs"
     },
     {
       "path": "tests/integration/repository-credentials-transport-bounds.test.mjs"

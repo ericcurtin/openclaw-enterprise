@@ -36,7 +36,7 @@ Tracks platform Namespaces, their lifecycle status, and any existing Kubernetes 
 
 ### `agents`
 
-Stores Agent drafts, their desired runtime state, and the active revision reference.
+Stores Agent drafts, their desired runtime state, and the selected version reference.
 
 - `id`
 - `namespace_id`
@@ -56,8 +56,20 @@ Stores Agent drafts, their desired runtime state, and the active revision refere
 - `credential_sources` (every bound credential source)
 - `active_revision_id`
 - `desired_runtime_state`
+- `sandbox_policy_editing`
 - `status`
 - `created_at`
+
+### `sandbox_policies`
+
+Stores one Agent-owned desired network policy with versioned application evidence.
+See [per-Agent policies](../sandbox-policies.md).
+
+- `id`
+- `namespace_id`
+- `agent_id`
+- `version`
+- `document` (additions, pending/latest application, last confirmed live version)
 
 ### `agent_revisions`
 
@@ -296,7 +308,7 @@ Keeps an append-only record of bootstrap, changes to resources, and authorizatio
 
 ### `controller_work`
 
-Queues and tracks controller work for Namespace and Agent lifecycle changes, Agent provisioning, and revision deployments.
+Queues and tracks controller work for Namespace and Agent lifecycle changes, Agent provisioning, and version deployments.
 
 - `work_kind`
 - `idempotency_key`

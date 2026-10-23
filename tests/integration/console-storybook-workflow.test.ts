@@ -7,12 +7,14 @@ const controller = createRequire(new URL("../../apps/controller/package.json", i
 const { loadYaml } = controller("@kubernetes/client-node");
 const workflowFile = new URL("../../.github/workflows/console-storybook.yml", import.meta.url);
 
-// GitHub's documented filter rules: "*" stops at "/", "**" does not, and a later "!"
-// pattern removes files an earlier pattern selected.
+// GitHub's documented filter rules: "*" stops at "/", "**" does not, "**/" may match no
+// directory, and a later "!" pattern removes files an earlier pattern selected.
 function matches(file: string, pattern: string): boolean {
   const source = pattern
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*|\*/g, (star) => (star === "*" ? "[^/]*" : ".*"));
+    .replace(/\*\*\/|\*\*|\*/g, (star) =>
+      star === "**/" ? "(?:.*/)?" : star === "*" ? "[^/]*" : ".*",
+    );
   return new RegExp(`^${source}$`).test(file);
 }
 
@@ -37,7 +39,11 @@ const scenarios = [
   // Recordings are outside the published Storybook assets, so they need no build.
   {
     name: "recorded media only",
-    changed: [`${evidence}/repository-outage.png`, `${evidence}/repository-outage.mp4`],
+    changed: [
+      `${evidence}/repository-outage.png`,
+      `${evidence}/repository-outage.mp4`,
+      "scripts/console-storybook/evidence/overview.png",
+    ],
     builds: false,
   },
   // A frame under public/ is published, so media in the same change cannot hide it.
